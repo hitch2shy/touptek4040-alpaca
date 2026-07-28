@@ -113,6 +113,7 @@ class ToupTekCamera:
         self._idle_native_active = False
         self._disconnecting = False
         self._unusable = False
+        self._acquisition_configuring = False
         self._acquiring = False
         self._frame_committed = False
         self._camera_started = False
@@ -127,18 +128,23 @@ class ToupTekCamera:
 
     def connect(self) -> None:
         with self._condition:
-            if self._handle is None:
-                try:
-                    handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
-                except Exception as error:
-                    raise _translate_sdk_error(error, "connect camera") from error
-                if handle is None:
+            if self._handle is not None:
+                if self._disconnecting or self._unusable:
                     raise CameraNotConnectedError(
-                        f"could not open camera with serial {self.serial!r}"
+                        "camera owner is quarantined until disconnect succeeds"
                     )
-                self._handle = handle
-                self._unusable = False
-                self._disconnecting = False
+                return
+            try:
+                handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
+            except Exception as error:
+                raise _translate_sdk_error(error, "connect camera") from error
+            if handle is None:
+                raise CameraNotConnectedError(
+                    f"could not open camera with serial {self.serial!r}"
+                )
+            self._handle = handle
+            self._unusable = False
+            self._disconnecting = False
 
     def disconnect(self) -> None:
         with self._condition:
@@ -156,13 +162,21 @@ class ToupTekCamera:
             while self._acquiring or self._native_calls or self._stop_in_flight:
                 self._condition.wait()
             handle = self._handle
-            self._handle = None
         close_error: CameraError | None = None
         if handle is not None:
             try:
                 handle.Close()
             except Exception as error:
                 close_error = _translate_sdk_error(error, "disconnect camera")
+        with self._condition:
+            if close_error is None and self._handle is handle:
+                self._handle = None
+                self._disconnecting = False
+                self._unusable = False
+            elif close_error is not None:
+                self._disconnecting = True
+                self._unusable = True
+            self._condition.notify_all()
         disconnect_errors = tuple(
             error for error in (abort_error, close_error) if error is not None
         )
@@ -211,6 +225,7 @@ class ToupTekCamera:
                     with self._condition:
                         self._require_connected_locked()
                         claim_state["generation"] = self._abort_generation
+                        self._acquisition_configuring = False
                         self._acquiring = True
                         self._frame_committed = False
                         self._cancel_requested = False
@@ -369,15 +384,19 @@ class ToupTekCamera:
     @contextmanager
     def _native_lease(self, *, during_acquisition: bool = False):
         owns_idle_slot = False
+        owns_configuration_slot = False
         with self._condition:
             while self._stop_in_flight or self._idle_native_active:
                 self._condition.wait()
             handle = self._require_connected_locked()
             if self._disconnecting:
                 raise CameraNotConnectedError("camera is disconnecting")
-            if self._acquiring and not during_acquisition:
-                raise CameraBusyError("camera acquisition is running")
-            if not during_acquisition:
+            if during_acquisition:
+                self._acquisition_configuring = True
+                owns_configuration_slot = True
+            else:
+                if self._acquisition_configuring or self._acquiring:
+                    raise CameraBusyError("camera acquisition is running")
                 self._idle_native_active = True
                 owns_idle_slot = True
             self._native_calls += 1
@@ -388,6 +407,8 @@ class ToupTekCamera:
                 self._native_calls -= 1
                 if owns_idle_slot:
                     self._idle_native_active = False
+                if owns_configuration_slot:
+                    self._acquisition_configuring = False
                 self._condition.notify_all()
 
     def _raise_if_aborted(self, generation: int) -> None:

@@ -118,6 +118,42 @@ def test_timeout_hresult_diagnostic_has_stable_code_and_safe_summary(
     assert "recovery=Check the USB link, reconnect the camera, then retry." in message
 
 
+def test_async_diagnostic_bounds_and_allowlists_all_untrusted_metadata(
+    client, coordinator, api_camera
+):
+    untrusted_type = type("SecretCause" + "A" * 2000, (RuntimeError,), {})
+    api_camera.failure = untrusted_type(
+        "A" * 2000
+        + " event 0x"
+        + "A" * 2000
+        + " event 0xDEADBEEF"
+        + " token 0xCAFEBABE"
+        + " HRESULT 0x123456789"
+        + " HRESULT 0x8001011f"
+        + " USB transfer event 0x0083"
+    )
+
+    started = _put(client, "startexposure", Duration="0.5", Light="true")
+
+    assert started.json["ErrorNumber"] == 0
+    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
+    message = _failure_messages(client)[0]
+    assert len(message) <= 700
+    assert "cause=Exception" in message
+    assert "hresult=0x8001011F" in message
+    assert "event=0x0083" in message
+    assert "summary=camera no-packet timeout event 0x0083" in message
+    assert "recovery=Check the USB link, reconnect the camera, then retry." in message
+    for untrusted in (
+        "SecretCause",
+        "A" * 100,
+        "0xDEADBEEF",
+        "0xCAFEBABE",
+        "0x123456789",
+    ):
+        assert untrusted not in message
+
+
 def test_new_exposure_clears_previous_image_and_async_failure(
     client, coordinator, api_camera
 ):

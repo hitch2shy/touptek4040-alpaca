@@ -371,6 +371,28 @@ def test_disconnect_closes_handle_even_when_abort_reports_cleanup_error(
     assert ("Close",) in camera._sdk.calls
 
 
+def test_close_failure_quarantines_handle_until_a_retry_succeeds(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.close_error = FakeHResultError(E_FAIL)
+
+    with pytest.raises(CameraError, match="disconnect camera"):
+        camera.disconnect()
+
+    assert camera._handle is handle
+    assert handle.closed is False
+    with pytest.raises(CameraNotConnectedError):
+        _ = camera.temperature_c
+
+    handle.close_error = None
+    camera.disconnect()
+
+    assert camera._handle is None
+    assert handle.closed is True
+    assert camera._sdk.calls.count(("Close",)) == 2
+
+
 def test_abort_dominates_post_trigger_python_failure(
     camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
 ) -> None:

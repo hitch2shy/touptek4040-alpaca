@@ -32,6 +32,13 @@ from .errors import (
 from .event_broker import EventBroker
 
 _ResultT = TypeVar("_ResultT")
+_ASYNC_DIAGNOSTIC_LIMIT = 700
+_KNOWN_ASYNC_EVENTS = {
+    "0x0080": "camera error event 0x0080",
+    "0x0081": "USB transfer event 0x0081 failure",
+    "0x0082": "camera no-frame timeout event 0x0082",
+    "0x0083": "camera no-packet timeout event 0x0083",
+}
 
 
 class CameraState(IntEnum):
@@ -123,15 +130,17 @@ class CameraCoordinator:
                 return
             if self._connecting and self._connection_target is True:
                 return
-            if not self._connecting:
+            quarantined = self._camera is not None and not self._connected
+            if not self._connecting and not quarantined:
                 self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
             self._connection_target = True
             self._connecting = True
-            self._error = None
-            if self._state is CameraState.ERROR:
-                self._state = CameraState.IDLE
+            if not quarantined:
+                self._error = None
+                if self._state is CameraState.ERROR:
+                    self._state = CameraState.IDLE
             self._publish_changed_locked()
         self._start_thread(
             target=self._connect_worker,
@@ -149,7 +158,8 @@ class CameraCoordinator:
                 return
             if self._connecting and self._connection_target is False:
                 return
-            if not self._connecting:
+            quarantined = self._camera is not None and not self._connected
+            if not self._connecting and not quarantined:
                 self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
@@ -157,8 +167,9 @@ class CameraCoordinator:
             self._connecting = True
             self._session_id += 1
             self._invalidate_preview_locked()
-            self._state = CameraState.IDLE
-            self._error = None
+            if not quarantined:
+                self._state = CameraState.IDLE
+                self._error = None
             self._clear_formal_image_locked()
             self._publish_changed_locked()
         self._start_thread(
@@ -436,6 +447,8 @@ class CameraCoordinator:
             if stale_camera is not None:
                 try:
                     stale_camera.abort()
+                except CameraNotConnectedError:
+                    pass
                 except Exception as caught:
                     _append_error(
                         cleanup_errors,
@@ -455,18 +468,33 @@ class CameraCoordinator:
                         ),
                     )
                 with self._condition:
-                    if self._camera is stale_camera:
-                        self._camera = None
                     current = (
                         generation == self._connection_generation
                         and self._connection_target is True
                     )
-                    if not current:
-                        self._lifecycle_errors.extend(
-                            [*pending_errors, *cleanup_errors]
+                    all_cleanup_errors = _unique_errors(
+                        [*pending_errors, *cleanup_errors]
+                    )
+                    if cleanup_errors:
+                        if not current:
+                            self._lifecycle_errors[:] = all_cleanup_errors
+                            return
+                        self._connected = False
+                        self._connecting = False
+                        self._state = CameraState.ERROR
+                        self._error = _combined_error(
+                            "previous camera owner cleanup failed",
+                            all_cleanup_errors,
                         )
+                        self._publish_changed_locked()
                         return
-            prior_cleanup_errors = [*pending_errors, *cleanup_errors]
+                    if self._camera is stale_camera:
+                        self._camera = None
+                    self._lifecycle_errors.clear()
+                    if not current:
+                        return
+                pending_errors = ()
+            prior_cleanup_errors = list(pending_errors)
             if prior_cleanup_errors:
                 with self._condition:
                     self._connected = False
@@ -518,7 +546,11 @@ class CameraCoordinator:
                     )
                 if cleanup_errors:
                     with self._condition:
-                        self._lifecycle_errors.extend(cleanup_errors)
+                        self._camera = camera
+                        self._connected = False
+                        self._lifecycle_errors[:] = _unique_errors(
+                            [*self._lifecycle_errors, *cleanup_errors]
+                        )
 
     def _disconnect_worker(self, generation: int) -> None:
         errors: list[CameraError] = []
@@ -528,6 +560,8 @@ class CameraCoordinator:
             if camera is not None:
                 try:
                     camera.abort()
+                except CameraNotConnectedError:
+                    pass
                 except Exception as error:
                     _append_error(
                         errors,
@@ -541,14 +575,14 @@ class CameraCoordinator:
                         _camera_error(error, "disconnect camera"),
                     )
             with self._condition:
-                if self._camera is camera:
+                if not errors and self._camera is camera:
                     self._camera = None
                 current = (
                     generation == self._connection_generation
                     and self._connection_target is False
                 )
                 if current:
-                    all_errors = [*self._lifecycle_errors, *errors]
+                    all_errors = _unique_errors([*self._lifecycle_errors, *errors])
                     self._lifecycle_errors.clear()
                     self._connected = False
                     self._connecting = False
@@ -563,7 +597,12 @@ class CameraCoordinator:
                         self._error = None
                     self._publish_changed_locked()
                 else:
-                    self._lifecycle_errors.extend(errors)
+                    if errors:
+                        self._lifecycle_errors[:] = _unique_errors(
+                            [*self._lifecycle_errors, *errors]
+                        )
+                    else:
+                        self._lifecycle_errors.clear()
 
     def _exposure_worker(
         self,
@@ -867,32 +906,21 @@ def _async_exposure_error(
     duration_s: float,
     settings: ExposureSettings,
 ) -> CameraError:
-    cause = type(error).__name__
+    cause = _safe_async_cause(error)
     error_text = str(error)
-    hresult_match = re.search(
-        r"\bHRESULT\s+(0x[0-9a-fA-F]{8})\b",
-        error_text,
-        re.IGNORECASE,
-    )
-    event_match = re.search(
-        r"\bevent\s*[:=]?\s*(0x[0-9a-fA-F]+|\d+)\b",
-        error_text,
-        re.IGNORECASE,
-    )
-    hresult = _normalized_hex(hresult_match.group(1)) if hresult_match else None
-    event = _normalized_hex(event_match.group(1)) if event_match else None
+    hresult = _safe_hresult(error_text)
+    event = _safe_event(error_text)
 
     if isinstance(error, CameraNotConnectedError):
         summary = "camera disconnected"
         recovery = "Disconnect, reconnect the camera, then retry."
+    elif event is not None:
+        summary = _KNOWN_ASYNC_EVENTS[event]
+        recovery = "Check the USB link, reconnect the camera, then retry."
     elif isinstance(error, CameraTimeoutError) or (
         hresult is not None and hresult == "0x8001011F"
     ):
         summary = "camera acquisition timed out"
-        recovery = "Check the USB link, reconnect the camera, then retry."
-    elif event is not None:
-        prefix = "USB transfer" if "usb" in error_text.casefold() else "camera"
-        summary = f"{prefix} event {event} failure"
         recovery = "Check the USB link, reconnect the camera, then retry."
     elif isinstance(error, CameraOperationCancelledError):
         summary = "camera acquisition was cancelled"
@@ -911,18 +939,18 @@ def _async_exposure_error(
         "AsyncExposureFailure",
         f"operation={operation}",
         "CameraState=Error(5)",
-        f"duration={duration_s:.6f}s",
+        f"duration={_safe_duration(duration_s)}s",
         (
             "roi=("
-            f"x={settings.roi.x},"
-            f"y={settings.roi.y},"
-            f"width={settings.roi.width},"
-            f"height={settings.roi.height}"
+            f"x={_safe_diagnostic_integer(settings.roi.x)},"
+            f"y={_safe_diagnostic_integer(settings.roi.y)},"
+            f"width={_safe_diagnostic_integer(settings.roi.width)},"
+            f"height={_safe_diagnostic_integer(settings.roi.height)}"
             ")"
         ),
-        f"binning={settings.binning}",
+        f"binning={_safe_diagnostic_integer(settings.binning)}",
         f"readout={settings.readout_mode.name}",
-        f"gain={settings.gain}",
+        f"gain={_safe_diagnostic_integer(settings.gain)}",
         f"cause={cause}",
     ]
     if hresult is not None:
@@ -930,13 +958,73 @@ def _async_exposure_error(
     if event is not None:
         fields.append(f"event={event}")
     fields.extend((f"summary={summary}", f"recovery={recovery}"))
-    return CameraError("; ".join(fields))
+    diagnostic = "; ".join(fields)
+    if len(diagnostic) > _ASYNC_DIAGNOSTIC_LIMIT:
+        diagnostic = (
+            "AsyncExposureFailure; operation=acquire frame; "
+            "CameraState=Error(5); duration=bounded; "
+            "roi=(x=bounded,y=bounded,width=bounded,height=bounded); "
+            "binning=bounded; readout=bounded; gain=bounded; "
+            "cause=Exception; summary=unexpected camera backend failure; "
+            "recovery=Disconnect, reconnect the camera, then retry."
+        )
+    return CameraError(diagnostic)
 
 
 def _normalized_hex(value: str) -> str:
     if value.casefold().startswith("0x"):
         return f"0x{value[2:].upper()}"
     return value
+
+
+def _safe_hresult(error_text: str) -> str | None:
+    for match in re.finditer(
+        r"\bHRESULT\s+(0x[0-9a-fA-F]{8})\b",
+        error_text,
+        re.IGNORECASE,
+    ):
+        value = int(match.group(1), 16)
+        if 0 <= value <= 0xFFFFFFFF:
+            return f"0x{value:08X}"
+    return None
+
+
+def _safe_event(error_text: str) -> str | None:
+    for match in re.finditer(
+        r"\bevent\s*[:=]?\s*(0x[0-9a-fA-F]{4})\b",
+        error_text,
+        re.IGNORECASE,
+    ):
+        event = _normalized_hex(match.group(1))
+        if event in _KNOWN_ASYNC_EVENTS:
+            return event
+    return None
+
+
+def _safe_async_cause(error: Exception) -> str:
+    exact_causes = {
+        CameraNotConnectedError: "CameraNotConnectedError",
+        CameraTimeoutError: "CameraTimeoutError",
+        CameraOperationCancelledError: "CameraOperationCancelledError",
+        CameraBusyError: "CameraBusyError",
+        CameraInvalidValueError: "CameraInvalidValueError",
+        CameraCleanupError: "CameraCleanupError",
+        CameraError: "CameraError",
+        RuntimeError: "RuntimeError",
+        ValueError: "ValueError",
+        OSError: "OSError",
+    }
+    return exact_causes.get(type(error), "Exception")
+
+
+def _safe_duration(duration_s: float) -> str:
+    value = f"{duration_s:.6f}"
+    return value if len(value) <= 24 else "bounded"
+
+
+def _safe_diagnostic_integer(value: int) -> str:
+    text = str(value)
+    return text if re.fullmatch(r"-?\d{1,12}", text) else "bounded"
 
 
 def _combined_error(message: str, errors: list[CameraError]) -> CameraError:
@@ -951,6 +1039,20 @@ def _append_error(errors: list[CameraError], error: CameraError) -> None:
             _append_error(errors, nested)
     else:
         errors.append(error)
+
+
+def _unique_errors(errors: list[CameraError]) -> list[CameraError]:
+    unique: list[CameraError] = []
+    seen: set[tuple[type[CameraError], str]] = set()
+    for error in errors:
+        flattened: list[CameraError] = []
+        _append_error(flattened, error)
+        for nested in flattened:
+            key = (type(nested), str(nested))
+            if key not in seen:
+                seen.add(key)
+                unique.append(nested)
+    return unique
 
 
 def _contains_not_connected(error: CameraError) -> bool:

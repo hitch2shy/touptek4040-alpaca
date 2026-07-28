@@ -55,6 +55,7 @@ class ControlledCamera:
         self.disconnect_started = threading.Event()
         self.disconnect_release = threading.Event()
         self.disconnect_release.set()
+        self.disconnect_count = 0
         self._releases = threading.Semaphore(0)
         self._acquisition_condition = threading.Condition()
         self.acquire_count = 0
@@ -86,6 +87,7 @@ class ControlledCamera:
         self.connected = True
 
     def disconnect(self) -> None:
+        self.disconnect_count += 1
         self.disconnect_started.set()
         self.disconnect_release.wait()
         self.connected = False
@@ -494,6 +496,56 @@ def test_stale_owner_cleanup_failure_prevents_new_factory_and_is_diagnostic():
     assert "old owner close failed" in str(snapshot.error)
     assert new_camera.connect_started.is_set() is False
     assert factory_calls == ["controlled"]
+
+
+def test_failed_owner_stays_quarantined_across_retries_until_cleanup_succeeds():
+    old_camera = ControlledCamera()
+    new_camera = ControlledCamera()
+    cameras = iter((old_camera, new_camera))
+    factory_calls = []
+    coordinator = CameraCoordinator(
+        lambda source: factory_calls.append(source) or next(cameras),
+        "controlled",
+    )
+    coordinator.set_connected_sync(True)
+    old_camera.gain_error = CameraNotConnectedError("gain lost camera")
+    cleanup_error = CameraError("persistent close failure")
+    old_camera.disconnect_error = cleanup_error
+
+    coordinator.start_exposure(0.1, True)
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+
+    old_camera.disconnect_release.clear()
+    coordinator.connect_async()
+    assert old_camera.disconnect_started.wait(1.0)
+    coordinator.connect_async()
+    coordinator.connect_async()
+    assert old_camera.disconnect_count == 1
+    assert factory_calls == ["controlled"]
+    old_camera.disconnect_release.set()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+    for expected_attempts in (1, 2, 3):
+        if expected_attempts > 1:
+            with pytest.raises(CameraError, match="persistent close failure"):
+                coordinator.set_connected_sync(True)
+        snapshot = coordinator.snapshot()
+        assert snapshot.connected is False
+        assert snapshot.camera_state is CameraState.ERROR
+        assert snapshot.error is not None
+        assert "persistent close failure" in str(snapshot.error)
+        assert str(snapshot.error).count("persistent close failure") == 1
+        assert old_camera.disconnect_count == expected_attempts
+        assert new_camera.connect_started.is_set() is False
+        assert factory_calls == ["controlled"]
+
+    old_camera.disconnect_error = None
+    coordinator.set_connected_sync(True)
+
+    assert old_camera.disconnect_count == 4
+    assert coordinator.snapshot().connected is True
+    assert new_camera.connect_started.is_set()
+    assert factory_calls == ["controlled", "controlled"]
 
 
 def test_exposure_requires_connection():

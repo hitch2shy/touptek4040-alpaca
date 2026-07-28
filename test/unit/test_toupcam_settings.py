@@ -121,6 +121,128 @@ def test_percent_stays_zero_during_native_capture_configuration(
     thread.join(1.0)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "temperature",
+        "tec_voltage",
+        "cooler_power",
+        "cooler_get",
+        "cooler_set",
+        "target_get",
+        "target_set",
+        "gain_get",
+        "gain_set",
+        "settings",
+    ],
+)
+def test_idle_native_operations_are_busy_during_acquisition_configuration(
+    camera: ToupTekCamera,
+    operation: str,
+) -> None:
+    coordinator = CameraCoordinator(lambda _source: camera, "fake-toupcam")
+    coordinator.set_connected_sync(True)
+    handle = camera._handle
+    handle.block_put_option = True
+    coordinator.start_exposure(
+        0.012,
+        True,
+        settings=lambda _capabilities: ExposureSettings(
+            roi=Roi(0, 0, 32, 32),
+            binning=1,
+            readout_mode=ReadoutMode.RAW12,
+            gain=100,
+        ),
+    )
+    assert handle.put_option_entered.wait(1.0)
+    call_count = len(camera._sdk.calls)
+    operations = {
+        "temperature": lambda: camera.temperature_c,
+        "tec_voltage": camera.tec_voltage,
+        "cooler_power": lambda: camera.cooler_power_percent,
+        "cooler_get": lambda: camera.cooler_on,
+        "cooler_set": lambda: setattr(camera, "cooler_on", False),
+        "target_get": lambda: camera.target_temperature_c,
+        "target_set": lambda: setattr(camera, "target_temperature_c", -8.0),
+        "gain_get": lambda: camera.gain,
+        "gain_set": lambda: setattr(camera, "gain", 200),
+        "settings": lambda: camera.apply_settings(
+            CaptureSettings(
+                0.02,
+                Roi(0, 0, 32, 32),
+                1,
+                ReadoutMode.RAW8,
+            )
+        ),
+    }
+
+    observed: Exception | None = None
+    calls_before_release = -1
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(operations[operation])
+        try:
+            pending.result(0.05)
+        except Exception as error:
+            observed = error
+        finally:
+            calls_before_release = len(camera._sdk.calls)
+            coordinator.abort_exposure()
+            handle.block_put_option = False
+            handle.put_option_release.set()
+            thread = coordinator._exposure_thread
+            assert thread is not None
+            thread.join(1.0)
+            if not pending.done():
+                pending.result(1.0)
+
+    assert isinstance(observed, CameraBusyError)
+    assert calls_before_release == call_count
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in camera._sdk.calls
+    )
+
+
+def test_disconnect_waits_for_cancelled_acquisition_configuration(
+    camera: ToupTekCamera,
+) -> None:
+    coordinator = CameraCoordinator(lambda _source: camera, "fake-toupcam")
+    coordinator.set_connected_sync(True)
+    handle = camera._handle
+    handle.block_put_option = True
+    coordinator.start_exposure(
+        0.012,
+        True,
+        settings=lambda _capabilities: ExposureSettings(
+            roi=Roi(0, 0, 32, 32),
+            binning=1,
+            readout_mode=ReadoutMode.RAW12,
+            gain=100,
+        ),
+    )
+    assert handle.put_option_entered.wait(1.0)
+
+    coordinator.disconnect_async()
+    time.sleep(0.03)
+    assert coordinator.snapshot().connecting is True
+    assert ("Close",) not in camera._sdk.calls
+
+    handle.block_put_option = False
+    handle.put_option_release.set()
+    deadline = time.monotonic() + 1.0
+    while coordinator.snapshot().connecting and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connecting is False
+    assert snapshot.connected is False
+    assert camera._sdk.calls[-1] == ("Close",)
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in camera._sdk.calls
+    )
+
+
 def test_apply_settings_returns_final_sdk_dimensions(camera: ToupTekCamera) -> None:
     """Calculating dimensions locally can disagree with SDK rounding rules."""
     applied = camera.apply_settings(

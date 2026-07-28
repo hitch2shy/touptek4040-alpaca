@@ -256,3 +256,87 @@ git diff --check
 ```
 
 No ledger, approved plan, or approved design file was modified.
+
+## Review fix round 2/5
+
+Three remaining Important findings were closed with focused RED/GREEN coverage.
+
+### Bounded, allow-listed asynchronous diagnostics
+
+- HRESULT metadata now accepts only a labeled, canonical eight-digit
+  hexadecimal value in the unsigned 32-bit range.
+- Event metadata accepts only the fixed ToupCam error tokens `0x0080` through
+  `0x0083`; arbitrary decimal, long hexadecimal, and secret-like tokens are
+  discarded.
+- Exception causes are normalized through an exact allow-list. Dynamic or
+  attacker-controlled class names become `Exception`.
+- Every numeric exposure field uses bounded serialization, and the final
+  diagnostic has an unconditional 700-character ceiling with a safe structured
+  fallback.
+- A combined adversarial case uses a 2,000-character class name, multiple
+  2,000-character strings, oversized and secret-like event values, an invalid
+  nine-digit HRESULT, and one valid HRESULT/event pair. CameraState,
+  ImageReady, and PercentCompleted return the same safe text without reflecting
+  the untrusted content.
+- Initial RED result: `1 failed`; the diagnostic was 4,312 characters and
+  reflected the dynamic cause and event content. The complete async-failure
+  file passed after the fix (`6 passed`).
+
+### Persistent failed-owner quarantine
+
+- The coordinator retains a failed owner and its cleanup diagnostic across
+  every Connect or Disconnect retry. Lifecycle cleanup remains serialized;
+  concurrent Connect requests collapse into the active attempt.
+- Repeated abort/disconnect failures are de-duplicated by error type and text.
+  No replacement factory is called until one complete retry succeeds.
+- ToupCam no longer clears its handle before `Close` succeeds. A failed close
+  leaves the handle disconnecting and unusable, so no native operation or
+  reconnect can reuse it. A later serialized disconnect retries `Close`;
+  success then releases the handle. This treats a Close exception as
+  indeterminate and quarantines indefinitely rather than assuming the
+  non-idempotent operation succeeded.
+- Initial RED result: `2 failed`; a second Connect opened a replacement and a
+  failed Close had already discarded the handle. The focused owner lifecycle
+  set passed after the fix (`5 passed`).
+
+### Pre-claim native configuration exclusivity
+
+- ToupCam now publishes an explicit acquisition-configuring state before the
+  first capture-setting native call.
+- The state remains active through ROI/bin/readout/exposure/trigger
+  configuration and ends atomically when the acquisition claim begins or when
+  configuration/cancellation fails.
+- Idle native settings and telemetry operations return CameraBusyError during
+  this interval. Tests cover CCD temperature, TEC voltage and cooler power,
+  cooler state, target temperature, gain, and explicit capture settings; none
+  enters the handle while configuration is blocked.
+- Disconnect continues to wait on the native lease. Abort invalidates the
+  coordinator control without taking the configuration handle, so releasing
+  the blocked configuration exits without StartPull or Trigger and without
+  deadlock. PercentCompleted remains zero throughout.
+- Initial RED result: all ten idle-operation cases failed because they entered
+  or waited inside the handle; the existing disconnect wait case already
+  passed. The completed focused configuration set passed (`12 passed`).
+
+### Round-2 verification
+
+Focused coordinator, ToupCam acquisition/settings, and async API files:
+`107 passed`.
+
+Unit suite: `154 passed`.
+
+Alpaca suite: `384 passed`.
+
+Complete test tree: `538 passed, 4 skipped`. The four existing hardware tests
+remain opt-in; `TOUPTEK_HARDWARE_TEST` was unset, so no hardware access was
+attempted.
+
+Compilation and whitespace checks both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+No Minor review item, ledger, approved plan, or approved design file was
+modified.
