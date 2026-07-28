@@ -39,6 +39,7 @@ _BYTE_ELEMENT_TYPE = 6
 _UINT16_ELEMENT_TYPE = 8
 _DRIVER_ERROR = 0x500
 _UINT32_MAX = 0xFFFFFFFF
+_PIXEL_ASCII = tuple(str(value).encode("ascii") for value in range(4096))
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +90,10 @@ def stream_image_json(
         encoded_columns: list[bytes] = []
         for relative_x in range(block.shape[1]):
             column = block[:, relative_x]
-            encoded_values = ",".join(str(int(value)) for value in column)
-            encoded_columns.append(("[" + encoded_values + "]").encode("ascii"))
+            encoded_values = b",".join(
+                _PIXEL_ASCII[int(value)] for value in column
+            )
+            encoded_columns.append(b"[" + encoded_values + b"]")
         if encoded_columns:
             if not first_column:
                 yield b","
@@ -209,26 +212,20 @@ class ImageApiResource:
             }
 
     def _formal_generation(self) -> ImageGeneration:
-        snapshot = self._coordinator.snapshot()
-        if snapshot.error is not None:
+        result = self._coordinator.formal_image_read()
+        if not result.connected:
+            raise AlpacaError(NOT_CONNECTED, "Camera is not connected")
+        if result.error is not None:
             raise AlpacaError(
                 _DRIVER_ERROR,
-                safe_exception_text(snapshot.error),
+                safe_exception_text(result.error),
             )
-        if not snapshot.connected:
-            raise AlpacaError(NOT_CONNECTED, "Camera is not connected")
-        if snapshot.connecting:
-            raise AlpacaError(
-                INVALID_OPERATION,
-                "Camera connection is changing",
-            )
-        generation = self._coordinator.image_generation
-        if generation is None:
+        if not result.image_ready or result.generation is None:
             raise AlpacaError(
                 INVALID_OPERATION,
                 "No completed exposure image is available",
             )
-        return generation
+        return result.generation
 
 
 def _metadata(

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import struct
+import threading
 import time
+
+import pytest
 
 from test.fixtures.reference_pixels import reference_frame, x_first_values
 from touptek4040.alpaca.image_api import ImageTransactions, stream_image_json
@@ -139,3 +143,138 @@ def test_imagearrayvariant_is_a_transactional_not_implemented_error(client):
     assert response.json["ClientTransactionID"] == 73
     assert response.json["ServerTransactionID"] > 0
     assert response.json["ErrorNumber"] == 0x400
+
+
+def _image_error_number(response, imagebytes: bool) -> int:
+    if imagebytes:
+        return struct.unpack_from("<i", response.content, 4)[0]
+    return response.json["ErrorNumber"]
+
+
+class _ObservableCondition:
+    def __init__(self, condition, transition_attempted: threading.Event) -> None:
+        self._condition = condition
+        self._transition_attempted = transition_attempted
+
+    def __enter__(self):
+        if threading.current_thread().name == "formal-transition":
+            self._transition_attempted.set()
+        return self._condition.__enter__()
+
+    def __exit__(self, *args):
+        return self._condition.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._condition, name)
+
+
+@pytest.mark.parametrize("imagebytes", [False, True], ids=("json", "imagebytes"))
+@pytest.mark.parametrize(
+    ("transition", "final_error"),
+    [
+        ("disconnect", 0x407),
+        ("async-failure", 0x500),
+        ("new-exposure", 0x40B),
+    ],
+)
+def test_formal_image_read_is_one_linearized_generation_decision(
+    client,
+    coordinator,
+    api_camera,
+    monkeypatch,
+    imagebytes,
+    transition,
+    final_error,
+):
+    _complete_small_exposure(client, coordinator)
+    original_generation = coordinator.image_generation
+    assert original_generation is not None
+
+    current_entered = threading.Event()
+    current_release = threading.Event()
+    workspace = coordinator._image_workspace
+    original_current = workspace.current
+
+    def blocked_current():
+        current_entered.set()
+        assert current_release.wait(1.0)
+        return original_current()
+
+    monkeypatch.setattr(workspace, "current", blocked_current)
+    transition_attempted = threading.Event()
+    original_condition = coordinator._condition
+    coordinator._condition = _ObservableCondition(
+        original_condition,
+        transition_attempted,
+    )
+    headers = {"Accept": "application/imagebytes"} if imagebytes else None
+    response_holder = {}
+
+    def read_image() -> None:
+        response_holder["response"] = client.simulate_get(
+            "/api/v1/camera/0/imagearray",
+            headers=headers,
+        )
+
+    read_thread = threading.Thread(target=read_image)
+    read_thread.start()
+    assert current_entered.wait(1.0)
+
+    transition_started = threading.Event()
+
+    def change_formal_state() -> None:
+        transition_started.set()
+        if transition == "disconnect":
+            coordinator.set_connected_sync(False)
+        elif transition == "async-failure":
+            api_camera.failure = CameraError("formal read race failure")
+            coordinator.start_exposure(0.1, True)
+        else:
+            api_camera.release_acquisition.clear()
+            coordinator.start_exposure(0.1, True)
+
+    transition_thread = threading.Thread(
+        target=change_formal_state,
+        name="formal-transition",
+    )
+    transition_thread.start()
+    assert transition_started.wait(1.0)
+    assert transition_attempted.wait(1.0)
+    current_release.set()
+    read_thread.join(1.0)
+    transition_thread.join(1.0)
+    assert read_thread.is_alive() is False
+    assert transition_thread.is_alive() is False
+    monkeypatch.setattr(workspace, "current", original_current)
+    coordinator._condition = original_condition
+
+    first = response_holder["response"]
+    assert _image_error_number(first, imagebytes) == 0
+    if imagebytes:
+        assert struct.unpack_from("<ii", first.content) == (1, 0)
+    else:
+        assert first.json["Value"] == [[0] * 16 for _ in range(16)]
+
+    if transition == "async-failure":
+        _wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+    elif transition == "new-exposure":
+        _wait_until(
+            lambda: coordinator.snapshot().camera_state is CameraState.EXPOSING
+        )
+
+    final = client.simulate_get(
+        "/api/v1/camera/0/imagearray",
+        headers=headers,
+    )
+    assert _image_error_number(final, imagebytes) == final_error
+    if transition == "async-failure":
+        diagnostic = client.simulate_get(
+            "/api/v1/camera/0/camerastate"
+        ).json["ErrorMessage"]
+        if imagebytes:
+            assert final.content[44:].decode("utf-8") == diagnostic
+        else:
+            assert final.json["ErrorMessage"] == diagnostic
+    if transition == "new-exposure":
+        coordinator.abort_exposure()
+        api_camera.release_acquisition.set()

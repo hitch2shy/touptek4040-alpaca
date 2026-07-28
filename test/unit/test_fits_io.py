@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import struct
 import tracemalloc
+from collections.abc import Callable, Iterable
 
 import numpy as np
+import pytest
 
 from test.fixtures.reference_pixels import reference_frame
 from touptek4040.alpaca.image_api import (
@@ -99,25 +101,93 @@ def test_full_frame_streams_do_not_materialize_a_transpose_or_python_pixel_list(
         server_transaction_id=2,
     )
 
-    for stream_factory in (
-        lambda: stream_image_json(generation, transactions),
-        lambda: stream_imagebytes(generation, transactions),
-        lambda: stream_fits(generation),
+    for stream_factory, minimum_size in (
+        (
+            lambda: stream_image_json(generation, transactions),
+            4096 * 4096,
+        ),
+        (
+            lambda: stream_imagebytes(generation, transactions),
+            44 + 4096 * 4096 * 2,
+        ),
+        (
+            lambda: stream_fits(generation),
+            2880 + 4096 * 4096 * 2,
+        ),
     ):
-        tracemalloc.start()
         stream = stream_factory()
-        iterator = iter(stream)
-        largest_chunk = 0
-        try:
-            for _ in range(2):
-                chunk = next(iterator)
-                largest_chunk = max(largest_chunk, len(chunk))
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-            close = getattr(stream, "close", None)
-            if close is not None:
-                close()
-        assert largest_chunk > 0
+        total, largest_chunk, peak = _consume_with_memory_guard(stream)
+        assert total >= minimum_size
         assert largest_chunk < 2 * 1024 * 1024
         assert peak < 16 * 1024 * 1024
+
+
+def _consume_with_memory_guard(
+    stream: Iterable[bytes],
+    *,
+    peak_limit: int = 16 * 1024 * 1024,
+) -> tuple[int, int, int]:
+    tracemalloc.start()
+    largest_chunk = 0
+    total = 0
+    try:
+        for chunk in stream:
+            largest_chunk = max(largest_chunk, len(chunk))
+            total += len(chunk)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
+    assert peak < peak_limit, (
+        f"stream peak {peak} exceeded bounded-memory limit {peak_limit}"
+    )
+    return total, largest_chunk, peak
+
+
+def _mutate_after_half(
+    stream: Iterable[bytes],
+    *,
+    halfway_bytes: int,
+    mutation: Callable[[], object],
+) -> Iterable[bytes]:
+    consumed = 0
+    mutated = False
+    for chunk in stream:
+        consumed += len(chunk)
+        if not mutated and consumed >= halfway_bytes:
+            mutation()
+            mutated = True
+        yield chunk
+    assert mutated
+
+
+@pytest.mark.parametrize("mutation_name", ["transpose-copy", "tolist"])
+def test_memory_guard_detects_full_frame_materialization_in_second_half(
+    mutation_name,
+):
+    frame = Frame(
+        pixels=np.zeros((4096, 4096), dtype=np.uint16),
+        started_utc=reference_frame().started_utc,
+        duration_s=1.0,
+        binning=1,
+        roi=Roi(0, 0, 4096, 4096),
+        readout_mode=ReadoutMode.RAW12,
+        gain=100,
+    )
+    generation = ImageWorkspace().publish(frame)
+    transactions = ImageTransactions(1, 2)
+    retained = []
+    if mutation_name == "transpose-copy":
+        mutation = lambda: retained.append(generation.pixels.T.copy())
+    else:
+        mutation = lambda: retained.append(generation.pixels.tolist())
+    mutated_stream = _mutate_after_half(
+        stream_imagebytes(generation, transactions),
+        halfway_bytes=44 + generation.pixels.nbytes // 2,
+        mutation=mutation,
+    )
+
+    with pytest.raises(AssertionError, match="exceeded bounded-memory limit"):
+        _consume_with_memory_guard(mutated_stream)

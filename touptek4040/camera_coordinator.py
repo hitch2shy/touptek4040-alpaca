@@ -67,6 +67,16 @@ class CameraSnapshot:
     error: CameraError | None
 
 
+@dataclass(frozen=True)
+class FormalImageRead:
+    """One condition-linearized decision for a formal image download."""
+
+    connected: bool
+    error: CameraError | None
+    image_ready: bool
+    generation: ImageGeneration | None
+
+
 class _CoordinatorAcquisitionControl(AcquisitionControl):
     def __init__(
         self,
@@ -336,6 +346,7 @@ class CameraCoordinator:
             self._require_idle_locked()
             if self._preview_thread is not None and self._preview_thread.is_alive():
                 raise CameraBusyError("preview is already running")
+            self._clear_preview_image_locked()
             self._preview_session += 1
             session = self._preview_session
             stop = threading.Event()
@@ -401,12 +412,30 @@ class CameraCoordinator:
 
     @property
     def image_generation(self) -> ImageGeneration | None:
-        return self._image_workspace.current()
+        with self._condition:
+            return self._image_workspace.current()
 
     @property
     def preview_frame(self) -> Frame | None:
         with self._condition:
             return self._preview_frame
+
+    @property
+    def preview_generation(self) -> ImageGeneration | None:
+        with self._condition:
+            return self._image_workspace.current_preview()
+
+    def formal_image_read(self) -> FormalImageRead:
+        """Capture connection, failure, readiness, and generation atomically."""
+
+        with self._condition:
+            generation = self._image_workspace.current()
+            return FormalImageRead(
+                connected=self._connected and not self._connecting,
+                error=self._error,
+                image_ready=self._image_ready,
+                generation=generation,
+            )
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -759,14 +788,17 @@ class CameraCoordinator:
                     with self._condition:
                         if not self._is_current_preview_locked(session, camera):
                             return
-                        self._preview_frame = frame
-                callback(frame)
+                        generation = self._image_workspace.publish_preview(frame)
+                        published_frame = generation.frame
+                        self._preview_frame = published_frame
+                callback(published_frame)
         except BaseException as error:
             with self._condition:
                 if not self._is_current_preview_locked(session, camera):
                     return
                 self._state = CameraState.ERROR
                 self._error = _camera_error(error, "acquire preview frame")
+                self._clear_preview_image_locked()
                 if _contains_not_connected(self._error):
                     self._connected = False
                     self._connection_target = False
@@ -777,6 +809,7 @@ class CameraCoordinator:
                     self._preview_session == session
                     and self._preview_thread is threading.current_thread()
                 ):
+                    self._clear_preview_image_locked()
                     self._preview_thread = None
                     self._preview_stop = None
                     self._condition.notify_all()
@@ -868,6 +901,11 @@ class CameraCoordinator:
         self._preview_session += 1
         if self._preview_stop is not None:
             self._preview_stop.set()
+        self._clear_preview_image_locked()
+
+    def _clear_preview_image_locked(self) -> None:
+        self._preview_frame = None
+        self._image_workspace.clear_preview()
 
     def _clear_formal_image_locked(self) -> None:
         self._frame = None

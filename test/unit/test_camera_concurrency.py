@@ -58,6 +58,8 @@ class SequencedCamera:
         self.disconnect_started = threading.Event()
         self.disconnect_release = threading.Event()
         self.disconnect_release.set()
+        self.reuse_buffer = False
+        self._reused_pixels = np.zeros((4, 4), dtype=np.uint16)
 
     def connect(self) -> None:
         self.connected = True
@@ -100,8 +102,14 @@ class SequencedCamera:
             self._condition.notify_all()
         if self.failure is not None:
             raise self.failure
+        if self.reuse_buffer:
+            assert self._reused_pixels.shape == (roi.height, roi.width)
+            self._reused_pixels.fill(sequence)
+            pixels = self._reused_pixels
+        else:
+            pixels = np.full((roi.height, roi.width), sequence, dtype=np.uint16)
         return Frame(
-            pixels=np.full((roi.height, roi.width), sequence, dtype=np.uint16),
+            pixels=pixels,
             started_utc=datetime.now(timezone.utc),
             duration_s=duration_s,
             binning=binning,
@@ -207,12 +215,132 @@ def test_formal_exposure_stops_preview_without_overlapping_camera_calls():
 
     assert camera.max_active == 1
     assert len(preview_frames) == 1
-    assert coordinator.preview_frame is preview_frames[0]
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
     assert coordinator.frame is None
     camera.release()
     wait_until(lambda: coordinator.snapshot().image_ready)
     assert int(coordinator.frame.pixels[0, 0]) == 3
-    assert coordinator.preview_frame is preview_frames[0]
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+
+
+def test_preview_publication_is_immutable_across_backend_buffer_reuse():
+    camera = SequencedCamera()
+    camera.reuse_buffer = True
+    coordinator = connected_coordinator(camera)
+
+    coordinator.start_exposure(0.1, True)
+    camera.wait_for_count(1)
+    camera.release()
+    wait_until(lambda: coordinator.snapshot().image_ready)
+    formal_generation = coordinator.image_generation
+    assert formal_generation is not None
+    assert int(formal_generation.pixels[0, 0]) == 1
+
+    previews: list[Frame] = []
+    mutation_results: list[str] = []
+    received_two = threading.Event()
+
+    def receive(frame: Frame) -> None:
+        try:
+            frame.pixels[0, 0] = 4095
+        except ValueError:
+            mutation_results.append("rejected")
+        else:
+            mutation_results.append("allowed")
+        previews.append(frame)
+        if len(previews) == 2:
+            received_two.set()
+
+    coordinator.start_preview(receive)
+    camera.wait_for_count(2)
+    camera.release()
+    camera.wait_for_count(3)
+    camera.release()
+    assert received_two.wait(1.0)
+
+    assert mutation_results == ["rejected", "rejected"]
+    assert [int(frame.pixels[0, 0]) for frame in previews] == [2, 3]
+    assert all(frame.pixels.flags.writeable is False for frame in previews)
+    assert coordinator.preview_frame is previews[-1]
+    assert coordinator.preview_generation is not None
+    assert coordinator.preview_generation.frame is previews[-1]
+    assert coordinator.image_generation is formal_generation
+    assert int(formal_generation.pixels[0, 0]) == 1
+
+    camera.wait_for_count(4)
+    stop_thread = threading.Thread(target=coordinator.stop_preview)
+    stop_thread.start()
+    camera.release()
+    stop_thread.join(1.0)
+    assert stop_thread.is_alive() is False
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+
+
+def _publish_one_preview(
+    coordinator: CameraCoordinator,
+    camera: SequencedCamera,
+) -> None:
+    received = threading.Event()
+    coordinator.start_preview(lambda frame: received.set())
+    camera.wait_for_count(1)
+    camera.release()
+    assert received.wait(1.0)
+    camera.wait_for_count(2)
+    assert coordinator.preview_frame is not None
+    assert coordinator.preview_generation is not None
+
+
+def test_disconnect_clears_preview_before_backend_close_finishes():
+    camera = SequencedCamera()
+    coordinator = connected_coordinator(camera)
+    _publish_one_preview(coordinator, camera)
+    camera.disconnect_release.clear()
+
+    coordinator.disconnect_async()
+
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+    camera.release()
+    camera.disconnect_release.set()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+
+def test_preview_failure_clears_the_last_published_preview():
+    camera = SequencedCamera()
+    coordinator = connected_coordinator(camera)
+    _publish_one_preview(coordinator, camera)
+    camera.failure = CameraError("preview failed")
+
+    camera.release()
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+
+
+def test_new_preview_starts_with_an_empty_preview_slot():
+    camera = SequencedCamera()
+    coordinator = connected_coordinator(camera)
+    _publish_one_preview(coordinator, camera)
+
+    stop_thread = threading.Thread(target=coordinator.stop_preview)
+    stop_thread.start()
+    camera.release()
+    stop_thread.join(1.0)
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+
+    coordinator.start_preview(lambda frame: None)
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+    camera.wait_for_count(3)
+    stop_thread = threading.Thread(target=coordinator.stop_preview)
+    stop_thread.start()
+    camera.release()
+    stop_thread.join(1.0)
 
 
 def test_disconnect_invalidates_in_flight_frame_before_close_finishes():
