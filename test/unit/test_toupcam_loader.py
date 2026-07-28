@@ -79,7 +79,7 @@ def test_loader_keeps_dll_directory_alive_for_delayed_wrapper_load(
 def test_default_loader_finds_project_sdk_from_linked_worktree(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A venv's Scripts directory must not hide the worktree's shared SDK."""
+    """The interpreter location, rather than CWD, locates a linked worktree SDK."""
     repository = tmp_path / "repository"
     worktree = repository / ".worktrees" / "camera"
     worktree.mkdir(parents=True)
@@ -89,9 +89,33 @@ def test_default_loader_finds_project_sdk_from_linked_worktree(
     dll = repository / "toupcamsdk.20250623" / "win" / "x64" / "toupcam.dll"
     dll.parent.mkdir(parents=True)
     dll.touch()
-    monkeypatch.chdir(worktree)
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
     monkeypatch.setattr("touptek4040.toupcam_loader.sys.executable", str(worktree / ".venv64" / "Scripts" / "python.exe"))
 
     sdk = load_default_toupcam_module()
 
     assert sdk.SOURCE == "linked-worktree-sdk"
+
+
+def test_default_loader_propagates_runtime_wrapper_failure_without_fallback(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A located runtime SDK is authoritative even when its wrapper fails to import."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "toupcam.py").write_text("raise RuntimeError('runtime wrapper failed')\n", encoding="utf-8")
+    (runtime / "toupcam.dll").touch()
+    fallback = tmp_path / "fallback"
+    wrapper = fallback / "toupcamsdk.20250623" / "python" / "toupcam.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("SOURCE = 'fallback'\n", encoding="utf-8")
+    dll = fallback / "toupcamsdk.20250623" / "win" / "x64" / "toupcam.dll"
+    dll.parent.mkdir(parents=True)
+    dll.touch()
+    monkeypatch.chdir(fallback)
+    monkeypatch.setattr("touptek4040.toupcam_loader.sys.executable", str(runtime / "python.exe"))
+
+    with pytest.raises(RuntimeError, match="runtime wrapper failed"):
+        load_default_toupcam_module()

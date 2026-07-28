@@ -11,6 +11,10 @@ from pathlib import Path
 from types import ModuleType
 
 
+class ToupTekSdkNotFoundError(RuntimeError):
+    """Raised only when no complete SDK wrapper/DLL layout is present."""
+
+
 def validate_runtime_architecture() -> None:
     """Ensure the interpreter can load the required x64 native library."""
     if struct.calcsize("P") != 8 or platform.architecture()[0] != "64bit":
@@ -31,19 +35,30 @@ def load_toupcam_module(base_dir: Path) -> ModuleType:
         sdk_wrapper = sdk_root / "python" / "toupcam.py"
         if sdk_wrapper.is_file() and sdk_dll.is_file():
             return _load_wrapper(sdk_wrapper, sdk_dll.parent)
-    raise RuntimeError("could not locate toupcam.py and 64-bit toupcam.dll")
+    raise ToupTekSdkNotFoundError("could not locate toupcam.py and 64-bit toupcam.dll")
 
 
 def load_default_toupcam_module() -> ModuleType:
     """Load from the runtime first, then from an active development worktree."""
     runtime_dir = Path(sys.executable).resolve().parent
-    try:
-        return load_toupcam_module(runtime_dir)
-    except RuntimeError as runtime_error:
+    candidates = (runtime_dir, *_enclosing_linked_worktrees(runtime_dir), Path.cwd())
+    missing_error: ToupTekSdkNotFoundError | None = None
+    for candidate in dict.fromkeys(candidates):
         try:
-            return load_toupcam_module(Path.cwd())
-        except RuntimeError:
-            raise runtime_error
+            return load_toupcam_module(candidate)
+        except ToupTekSdkNotFoundError as error:
+            missing_error = error
+    if missing_error is not None:
+        raise missing_error
+    raise AssertionError("SDK loader received no search candidates")
+
+
+def _enclosing_linked_worktrees(start: Path) -> tuple[Path, ...]:
+    """Return a linked worktree ancestor inferred from an executable path."""
+    for candidate in (start, *start.parents):
+        if candidate.parent.name == ".worktrees":
+            return (candidate,)
+    return ()
 
 
 def _search_roots(base_dir: Path) -> tuple[Path, ...]:
