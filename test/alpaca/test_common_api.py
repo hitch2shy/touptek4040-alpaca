@@ -78,6 +78,26 @@ def test_unsupported_commands_are_explicit(command, client):
     assert response.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
 
 
+@pytest.mark.parametrize(
+    ("command", "fields"),
+    [
+        ("action", {"Action": 1, "Parameters": ""}),
+        ("commandblind", {"Command": "x", "Raw": "yes"}),
+        ("commandbool", {"Command": None, "Raw": "true"}),
+        ("commandstring", {"Command": "x", "Raw": 1}),
+    ],
+)
+def test_unsupported_common_puts_parse_parameters_before_business_error(
+    command, fields, disconnected_client
+):
+    response = disconnected_client.simulate_put(
+        f"/api/v1/camera/0/{command}",
+        json=fields,
+    )
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == 0x401
+
+
 def test_connected_put_is_synchronous_and_case_insensitive(disconnected_client):
     response = disconnected_client.simulate_put(
         "/api/v1/camera/0/connected",
@@ -175,19 +195,20 @@ def test_lexically_invalid_value_is_http_400_but_domain_range_is_http_200(client
 
 
 @pytest.mark.parametrize(
-    ("command", "method", "expected_error"),
+    ("command", "method", "fields", "expected_error"),
     [
-        ("ccdtemperature", "GET", 0x407),
-        ("pulseguide", "PUT", 0x400),
-        ("percentcompleted", "GET", 0x40B),
+        ("ccdtemperature", "GET", None, 0x407),
+        ("pulseguide", "PUT", {"Direction": "0", "Duration": "100"}, 0x400),
+        ("percentcompleted", "GET", None, 0x40B),
     ],
 )
 def test_device_errors_remain_http_200(
-    command, method, expected_error, disconnected_client
+    command, method, fields, expected_error, disconnected_client
 ):
     response = disconnected_client.simulate_request(
         method=method,
         path=f"/api/v1/camera/0/{command}",
+        json=fields,
     )
     assert response.status_code == 200
     assert response.json["ErrorNumber"] == expected_error

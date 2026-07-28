@@ -61,11 +61,15 @@ class CommonApi:
 
     def put(self, command: str, request: Any) -> None:
         if command == "action":
+            _alpaca_string(get_parameter(request, "Action"), "Action")
+            _alpaca_string(get_parameter(request, "Parameters"), "Parameters")
             raise AlpacaError(
                 ACTION_NOT_IMPLEMENTED,
                 "No driver-specific actions are supported",
             )
         if command in {"commandblind", "commandbool", "commandstring"}:
+            _alpaca_string(get_parameter(request, "Command"), "Command")
+            _alpaca_bool(get_parameter(request, "Raw"), "Raw")
             raise AlpacaError(
                 METHOD_NOT_IMPLEMENTED,
                 f"{command} is not implemented",
@@ -101,3 +105,11 @@ def _alpaca_bool(value: object, name: str) -> bool:
     from .responses import INVALID_VALUE
 
     raise RequestParseError(INVALID_VALUE, f"{name} must be true or false")
+
+
+def _alpaca_string(value: object, name: str) -> str:
+    if isinstance(value, str):
+        return value
+    from .responses import INVALID_VALUE
+
+    raise RequestParseError(INVALID_VALUE, f"{name} must be a string")

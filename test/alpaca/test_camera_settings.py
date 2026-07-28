@@ -26,6 +26,181 @@ def put_value(client, command: str, parameter: str, value: object):
     )
 
 
+_LEXICALLY_INVALID_PUTS = [
+    pytest.param("binx", {"BinX": "bad"}, "binx", 1, id="bin-x"),
+    pytest.param("biny", {"BinY": "bad"}, "biny", 1, id="bin-y"),
+    pytest.param("startx", {"StartX": "bad"}, "startx", 0, id="start-x"),
+    pytest.param("starty", {"StartY": "bad"}, "starty", 0, id="start-y"),
+    pytest.param("numx", {"NumX": "bad"}, "numx", 4096, id="num-x"),
+    pytest.param("numy", {"NumY": "bad"}, "numy", 4096, id="num-y"),
+    pytest.param("gain", {"Gain": "bad"}, "gain", 100, id="gain"),
+    pytest.param(
+        "readoutmode",
+        {"ReadoutMode": "bad"},
+        "readoutmode",
+        0,
+        id="readout-mode",
+    ),
+    pytest.param(
+        "setccdtemperature",
+        {"SetCCDTemperature": "１２.５"},
+        "setccdtemperature",
+        -10.0,
+        id="temperature-fullwidth",
+    ),
+    pytest.param(
+        "setccdtemperature",
+        {"SetCCDTemperature": "1_0"},
+        "setccdtemperature",
+        -10.0,
+        id="temperature-underscore",
+    ),
+    pytest.param(
+        "cooleron",
+        {"CoolerOn": "yes"},
+        "cooleron",
+        False,
+        id="cooler-on",
+    ),
+    pytest.param(
+        "startexposure",
+        {"Duration": "1_0", "Light": "true"},
+        None,
+        None,
+        id="exposure-duration",
+    ),
+    pytest.param(
+        "startexposure",
+        {"Duration": "0.1", "Light": "yes"},
+        None,
+        None,
+        id="exposure-light",
+    ),
+]
+
+_DOMAIN_INVALID_OR_VALID_PUTS = [
+    pytest.param("binx", {"BinX": "9"}, id="bin"),
+    pytest.param("startx", {"StartX": "4096"}, id="roi-origin"),
+    pytest.param("numx", {"NumX": "0"}, id="roi-size"),
+    pytest.param("gain", {"Gain": "99"}, id="gain"),
+    pytest.param("readoutmode", {"ReadoutMode": "2"}, id="readout-mode"),
+    pytest.param(
+        "setccdtemperature",
+        {"SetCCDTemperature": "-51"},
+        id="temperature",
+    ),
+    pytest.param("cooleron", {"CoolerOn": "true"}, id="cooler-on"),
+    pytest.param(
+        "startexposure",
+        {"Duration": "0", "Light": "true"},
+        id="exposure",
+    ),
+]
+
+
+def _put_fields(client, command: str, fields: dict[str, object]):
+    return client.simulate_put(
+        f"/api/v1/camera/0/{command}",
+        json=fields,
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "fields", "get_command", "initial_value"),
+    _LEXICALLY_INVALID_PUTS,
+)
+def test_lexical_errors_precede_disconnected_state_without_side_effects(
+    command,
+    fields,
+    get_command,
+    initial_value,
+    disconnected_client,
+    coordinator,
+):
+    response = _put_fields(disconnected_client, command, fields)
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == INVALID_VALUE
+    assert coordinator.snapshot().connected is False
+    assert coordinator.frame is None
+
+    connected = _put_fields(
+        disconnected_client,
+        "connected",
+        {"Connected": "true"},
+    )
+    assert connected.json["ErrorNumber"] == 0
+    if get_command is not None:
+        assert get_value(disconnected_client, get_command) == initial_value
+    assert coordinator.frame is None
+
+
+@pytest.mark.parametrize(
+    ("command", "fields", "get_command", "initial_value"),
+    _LEXICALLY_INVALID_PUTS,
+)
+def test_lexical_errors_precede_busy_state_without_side_effects(
+    command,
+    fields,
+    get_command,
+    initial_value,
+    client,
+    coordinator,
+    api_camera,
+):
+    api_camera.release_acquisition.clear()
+    coordinator.start_exposure(0.001, True)
+    assert api_camera.acquisition_started.wait(timeout=1)
+    try:
+        response = _put_fields(client, command, fields)
+        assert response.status_code == 400
+        assert response.json["ErrorNumber"] == INVALID_VALUE
+        assert coordinator.snapshot().camera_state == 2
+        assert coordinator.frame is None
+        if get_command is not None:
+            assert get_value(client, get_command) == initial_value
+    finally:
+        if coordinator.snapshot().camera_state == 2:
+            coordinator.abort_exposure()
+
+
+@pytest.mark.parametrize(
+    ("command", "fields"),
+    _DOMAIN_INVALID_OR_VALID_PUTS,
+)
+def test_valid_lexemes_defer_to_disconnected_state(
+    command,
+    fields,
+    disconnected_client,
+):
+    response = _put_fields(disconnected_client, command, fields)
+    assert response.status_code == 200
+    assert response.json["ErrorNumber"] == 0x407
+
+
+@pytest.mark.parametrize(
+    ("command", "fields"),
+    _DOMAIN_INVALID_OR_VALID_PUTS,
+)
+def test_valid_lexemes_defer_to_busy_state(
+    command,
+    fields,
+    client,
+    coordinator,
+    api_camera,
+):
+    api_camera.release_acquisition.clear()
+    coordinator.start_exposure(0.001, True)
+    assert api_camera.acquisition_started.wait(timeout=1)
+    try:
+        response = _put_fields(client, command, fields)
+        assert response.status_code == 200
+        assert response.json["ErrorNumber"] == INVALID_OPERATION
+        assert coordinator.snapshot().camera_state == 2
+    finally:
+        if coordinator.snapshot().camera_state == 2:
+            coordinator.abort_exposure()
+
+
 @pytest.mark.parametrize("command", ["binx", "biny"])
 @pytest.mark.parametrize("binning", range(1, 9))
 def test_writing_either_bin_axis_synchronizes_both(command, binning, client):

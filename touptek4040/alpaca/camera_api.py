@@ -194,6 +194,7 @@ class CameraApi:
 
     def put(self, command: str, request: Any) -> None:
         if command in _UNSUPPORTED or command == "pulseguide":
+            self._parse_unsupported_put(command, request)
             self._not_implemented(command)
         if command == "abortexposure":
             self._coordinator.abort_exposure()
@@ -205,11 +206,10 @@ class CameraApi:
             self._stop_exposure()
             return
 
+        value = self._parse_setting_parameter(command, request)
         self._require_connected()
         self._require_idle()
         if command == "binx" or command == "biny":
-            value = _strict_int(get_parameter(request, command), command)
-
             def commit_binning(capabilities):
                 _require_int_range(value, command, 1, capabilities.max_bin)
                 with self._lock:
@@ -218,8 +218,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_binning)
             return
         if command == "startx":
-            value = _strict_int(get_parameter(request, "StartX"), "StartX")
-
             def commit_start_x(capabilities):
                 _require_int_range(value, "StartX", 0, capabilities.width - 1)
                 with self._lock:
@@ -228,8 +226,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_start_x)
             return
         if command == "starty":
-            value = _strict_int(get_parameter(request, "StartY"), "StartY")
-
             def commit_start_y(capabilities):
                 _require_int_range(value, "StartY", 0, capabilities.height - 1)
                 with self._lock:
@@ -238,8 +234,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_start_y)
             return
         if command == "numx":
-            value = _strict_int(get_parameter(request, "NumX"), "NumX")
-
             def commit_num_x(capabilities):
                 _require_int_range(value, "NumX", 1, capabilities.width)
                 with self._lock:
@@ -248,8 +242,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_num_x)
             return
         if command == "numy":
-            value = _strict_int(get_parameter(request, "NumY"), "NumY")
-
             def commit_num_y(capabilities):
                 _require_int_range(value, "NumY", 1, capabilities.height)
                 with self._lock:
@@ -258,8 +250,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_num_y)
             return
         if command == "gain":
-            value = _strict_int(get_parameter(request, "Gain"), "Gain")
-
             def commit_gain(capabilities):
                 del capabilities
                 _require_int_range(value, "Gain", _GAIN_MIN, _GAIN_MAX)
@@ -269,11 +259,6 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_gain)
             return
         if command == "readoutmode":
-            value = _strict_int(
-                get_parameter(request, "ReadoutMode"),
-                "ReadoutMode",
-            )
-
             def commit_readout_mode(capabilities):
                 _require_int_range(
                     value,
@@ -287,24 +272,59 @@ class CameraApi:
             self._coordinator.update_settings_if_idle(commit_readout_mode)
             return
         if command == "setccdtemperature":
-            target = _strict_float(
-                get_parameter(request, "SetCCDTemperature"),
-                "SetCCDTemperature",
-            )
-            if not _TEMPERATURE_MIN <= target <= _TEMPERATURE_MAX:
+            if not _TEMPERATURE_MIN <= value <= _TEMPERATURE_MAX:
                 raise AlpacaError(
                     INVALID_VALUE,
                     "SetCCDTemperature must be between -50.0 and 40.0",
                 )
-            self._coordinator.set_target_temperature_if_idle(target)
+            self._coordinator.set_target_temperature_if_idle(value)
             return
         if command == "cooleron":
-            enabled = _alpaca_bool(
+            self._coordinator.set_cooler_on_if_idle(value)
+            return
+        self._not_implemented(command)
+
+    def _parse_unsupported_put(self, command: str, request: Any) -> None:
+        if command == "fastreadout":
+            _alpaca_bool(
+                get_parameter(request, "FastReadout"),
+                "FastReadout",
+            )
+        elif command == "offset":
+            _strict_int(get_parameter(request, "Offset"), "Offset")
+        elif command == "subexposureduration":
+            _strict_float(
+                get_parameter(request, "SubExposureDuration"),
+                "SubExposureDuration",
+            )
+        elif command == "pulseguide":
+            _strict_int(get_parameter(request, "Direction"), "Direction")
+            _strict_int(get_parameter(request, "Duration"), "Duration")
+
+    def _parse_setting_parameter(self, command: str, request: Any) -> object:
+        integer_parameters = {
+            "binx": "BinX",
+            "biny": "BinY",
+            "startx": "StartX",
+            "starty": "StartY",
+            "numx": "NumX",
+            "numy": "NumY",
+            "gain": "Gain",
+            "readoutmode": "ReadoutMode",
+        }
+        parameter = integer_parameters.get(command)
+        if parameter is not None:
+            return _strict_int(get_parameter(request, parameter), parameter)
+        if command == "setccdtemperature":
+            return _strict_float(
+                get_parameter(request, "SetCCDTemperature"),
+                "SetCCDTemperature",
+            )
+        if command == "cooleron":
+            return _alpaca_bool(
                 get_parameter(request, "CoolerOn"),
                 "CoolerOn",
             )
-            self._coordinator.set_cooler_on_if_idle(enabled)
-            return
         self._not_implemented(command)
 
     def device_state(self) -> list[dict[str, object]]:
@@ -325,10 +345,10 @@ class CameraApi:
         return state
 
     def _start_exposure(self, request: Any) -> None:
-        self._require_connected()
-        self._require_idle()
         duration = _strict_float(get_parameter(request, "Duration"), "Duration")
         light = _alpaca_bool(get_parameter(request, "Light"), "Light")
+        self._require_connected()
+        self._require_idle()
         exposure_us = round(duration * 1_000_000)
         if not 12 <= exposure_us <= 3_600_000_000:
             raise AlpacaError(

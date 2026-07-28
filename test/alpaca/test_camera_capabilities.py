@@ -39,33 +39,55 @@ def test_camera_capability(command, value, client):
 
 
 @pytest.mark.parametrize(
-    ("method", "command"),
+    ("method", "command", "fields"),
     [
-        ("GET", "bayeroffsetx"),
-        ("GET", "bayeroffsety"),
-        ("GET", "fastreadout"),
-        ("PUT", "fastreadout"),
-        ("GET", "offset"),
-        ("PUT", "offset"),
-        ("GET", "offsetmin"),
-        ("GET", "offsetmax"),
-        ("GET", "offsets"),
-        ("GET", "gains"),
-        ("GET", "electronsperadu"),
-        ("GET", "fullwellcapacity"),
-        ("GET", "heatsinktemperature"),
-        ("GET", "subexposureduration"),
-        ("PUT", "subexposureduration"),
-        ("PUT", "pulseguide"),
+        ("GET", "bayeroffsetx", {}),
+        ("GET", "bayeroffsety", {}),
+        ("GET", "fastreadout", {}),
+        ("PUT", "fastreadout", {"FastReadout": "false"}),
+        ("GET", "offset", {}),
+        ("PUT", "offset", {"Offset": "0"}),
+        ("GET", "offsetmin", {}),
+        ("GET", "offsetmax", {}),
+        ("GET", "offsets", {}),
+        ("GET", "gains", {}),
+        ("GET", "electronsperadu", {}),
+        ("GET", "fullwellcapacity", {}),
+        ("GET", "heatsinktemperature", {}),
+        ("GET", "subexposureduration", {}),
+        ("PUT", "subexposureduration", {"SubExposureDuration": "1.0"}),
+        ("PUT", "pulseguide", {"Direction": "0", "Duration": "100"}),
     ],
 )
-def test_unsupported_camera_members_are_explicit(method, command, client):
+def test_unsupported_camera_members_are_explicit(method, command, fields, client):
     response = client.simulate_request(
         method=method,
         path=f"/api/v1/camera/0/{command}",
+        json=fields if method == "PUT" else None,
     )
     assert response.status_code == 200
     assert response.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
+
+
+@pytest.mark.parametrize(
+    ("command", "fields"),
+    [
+        ("fastreadout", {"FastReadout": "yes"}),
+        ("offset", {"Offset": "bad"}),
+        ("subexposureduration", {"SubExposureDuration": "1_0"}),
+        ("pulseguide", {"Direction": "bad", "Duration": "100"}),
+        ("pulseguide", {"Direction": "0", "Duration": "bad"}),
+    ],
+)
+def test_unsupported_camera_puts_parse_parameters_before_business_error(
+    command, fields, disconnected_client
+):
+    response = disconnected_client.simulate_put(
+        f"/api/v1/camera/0/{command}",
+        json=fields,
+    )
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == 0x401
 
 
 @pytest.mark.parametrize(

@@ -225,3 +225,64 @@ Fix commit subject:
 
 Fix commit reference: `HEAD`; the exact immutable hash is recorded in the
 round 1 handoff after commit.
+
+---
+
+## Fix round 2/5: parse required PUT parameters before device state
+
+### Review RED evidence
+
+The first deterministic disconnected/busy matrix produced
+`26 failed, 16 passed`:
+
+- all 13 invalid lexical forms returned NotConnected while disconnected;
+- the same 13 forms returned InvalidOperation during a blocking exposure;
+- the 16 valid-lexeme state-precedence cases already returned the correct
+  HTTP 200 NotConnected or InvalidOperation result.
+
+The matrix covers BinX, BinY, StartX, StartY, NumX, NumY, Gain, ReadoutMode,
+SetCCDTemperature, CoolerOn, StartExposure Duration, and StartExposure Light.
+Each busy case uses a real coordinator exposure blocked by the controlled
+camera, not timing sleeps.
+
+A second completeness RED covered parameter-bearing NotImplemented PUTs. Nine
+invalid Action/Command/FastReadout/Offset/SubExposureDuration/PulseGuide
+cases incorrectly returned their business NotImplemented error before parsing;
+16 valid parameter cases retained the intended NotImplemented behavior.
+
+### Fix implementation
+
+- Camera setting PUTs now read request media and perform strict integer,
+  Boolean, or float lexical parsing before connected and Idle checks.
+- StartExposure parses both Duration and Light before connection/state and
+  duration-range/ROI business validation.
+- Valid lexical values still reach device state first: disconnected requests
+  return HTTP 200 `0x407`, busy requests return HTTP 200 `0x40B`, and only
+  connected/Idle domain range failures return HTTP 200 `0x401`.
+- Invalid lexical values return stable HTTP 400 `0x401` without changing local
+  settings, cooler/temperature hardware state, exposure state, or image state.
+- Parameter-bearing NotImplemented members parse their official parameters
+  first. Valid parameters still return ActionNotImplemented or
+  MethodNotImplemented; no unsupported operation was implemented.
+- The round 1 coordinator atomic commit points and coordinator-to-API lock
+  order are unchanged. All existing barrier tests remain green.
+
+### Fix verification
+
+- Disconnected/busy supported PUT ordering matrix: `42 passed`.
+- Parameter-bearing NotImplemented PUT matrix: `25 passed`.
+- Focused Task 7 suite: `290 passed`.
+- Complete current test tree: `473 passed, 4 skipped`; the skips remain the
+  hardware opt-in cases.
+- `python -m compileall -q touptek4040 test`: exit `0`.
+- `git diff --check`: exit `0`.
+- Scope: Task 7 Camera/Common parsing order, Alpaca tests, and this report.
+  Coordinator, manifest, image routes, ledger, plan, and approved design were
+  not modified.
+
+Fix commit subject:
+
+`fix: parse Camera PUT values before device state`
+
+Fix commit reference: `HEAD`; the exact immutable hash is recorded in the
+round 2 handoff after commit.
