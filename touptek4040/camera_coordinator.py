@@ -64,6 +64,8 @@ class CameraCoordinator:
         self._source = source
         self._condition = threading.Condition(threading.RLock())
         self._lifecycle_lock = threading.Lock()
+        self._acquisition_gate = threading.Lock()
+        self._lifecycle_errors: list[CameraError] = []
         self._camera: CameraContract | None = None
         self._connected = False
         self._connecting = False
@@ -89,6 +91,8 @@ class CameraCoordinator:
                 return
             if self._connecting and self._connection_target is True:
                 return
+            if not self._connecting:
+                self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
             self._connection_target = True
@@ -96,8 +100,7 @@ class CameraCoordinator:
             self._error = None
             if self._state is CameraState.ERROR:
                 self._state = CameraState.IDLE
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            self._publish_changed_locked()
         self._start_thread(
             target=self._connect_worker,
             args=(generation,),
@@ -114,6 +117,8 @@ class CameraCoordinator:
                 return
             if self._connecting and self._connection_target is False:
                 return
+            if not self._connecting:
+                self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
             self._connection_target = False
@@ -123,8 +128,7 @@ class CameraCoordinator:
             self._state = CameraState.IDLE
             self._error = None
             self._clear_formal_image_locked()
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            self._publish_changed_locked()
         self._start_thread(
             target=self._disconnect_worker,
             args=(generation,),
@@ -134,13 +138,28 @@ class CameraCoordinator:
     def set_connected_sync(self, connected: bool) -> None:
         if not isinstance(connected, bool):
             raise CameraInvalidValueError("connected state must be boolean")
+        with self._condition:
+            existing_operation = (
+                self._connecting and self._connection_target is connected
+            )
+            previous_generation = self._connection_generation
         if connected:
             self.connect_async()
         else:
             self.disconnect_async()
         with self._condition:
+            operation_generation = self._connection_generation
+            participated = (
+                existing_operation or operation_generation != previous_generation
+            )
             while self._connecting and self._connection_target is connected:
                 self._condition.wait()
+            if (
+                participated
+                and operation_generation == self._connection_generation
+                and self._error is not None
+            ):
+                raise self._error
             if self._connected is connected:
                 return
             if self._error is not None:
@@ -161,10 +180,8 @@ class CameraCoordinator:
             self._clear_formal_image_locked()
             self._state = CameraState.EXPOSING
             self._error = None
-            self._exposure_started_monotonic = time.monotonic()
             self._exposure_duration_s = duration
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            self._publish_changed_locked()
         self._exposure_thread = self._start_thread(
             target=self._exposure_worker,
             args=(session, camera, duration, preview_thread if had_preview else None),
@@ -181,8 +198,7 @@ class CameraCoordinator:
             self._state = CameraState.IDLE
             self._error = None
             self._clear_formal_image_locked()
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            self._publish_changed_locked()
         try:
             camera.abort()
         except Exception as error:
@@ -195,11 +211,7 @@ class CameraCoordinator:
                 ):
                     self._state = CameraState.ERROR
                     self._error = translated
-                    snapshot = self._changed_locked()
-                else:
-                    snapshot = None
-            if snapshot is not None:
-                self.events.publish(snapshot)
+                    self._publish_changed_locked()
             raise translated from error
 
     def start_preview(self, callback: Callable[[Frame], None]) -> None:
@@ -230,13 +242,40 @@ class CameraCoordinator:
                 return
             camera = self._camera
             self._invalidate_preview_locked()
+        error = self._stop_preview_thread(camera, thread)
+        if error is None:
+            return
+        with self._condition:
+            self._state = CameraState.ERROR
+            self._error = error
+            if _contains_not_connected(error):
+                self._connected = False
+                self._camera = None
+                self._connection_target = False
+            self._publish_changed_locked()
+        raise error
+
+    def _stop_preview_thread(
+        self,
+        camera: CameraContract | None,
+        thread: threading.Thread,
+    ) -> CameraError | None:
+        error: CameraError | None = None
         if camera is not None:
             try:
                 camera.abort()
             except CameraOperationCancelledError:
                 pass
+            except Exception as caught:
+                error = _camera_error(caught, "stop preview")
         if thread is not threading.current_thread():
             thread.join()
+        with self._condition:
+            if self._preview_thread is thread:
+                self._preview_thread = None
+                self._preview_stop = None
+                self._condition.notify_all()
+        return error
 
     def snapshot(self) -> CameraSnapshot:
         with self._condition:
@@ -287,6 +326,26 @@ class CameraCoordinator:
         camera: CameraContract | None = None
         error: CameraError | None = None
         with self._lifecycle_lock:
+            with self._condition:
+                current = (
+                    generation == self._connection_generation
+                    and self._connection_target is True
+                )
+                pending_errors = tuple(self._lifecycle_errors)
+                if current and pending_errors:
+                    self._camera = None
+                    self._connected = False
+                    self._connecting = False
+                    self._state = CameraState.ERROR
+                    self._error = _combined_error(
+                        "previous camera owner cleanup failed",
+                        list(pending_errors),
+                    )
+                    self._lifecycle_errors.clear()
+                    self._publish_changed_locked()
+                    return
+                if not current:
+                    return
             try:
                 camera = self._factory(self._source)
                 camera.connect()
@@ -303,23 +362,31 @@ class CameraCoordinator:
                     self._connecting = False
                     self._state = CameraState.IDLE
                     self._error = None
-                    snapshot = self._changed_locked()
+                    self._lifecycle_errors.clear()
+                    self._publish_changed_locked()
                 elif current:
                     self._camera = None
                     self._connected = False
                     self._connecting = False
                     self._state = CameraState.ERROR
                     self._error = error or CameraError("connect camera failed")
-                    snapshot = self._changed_locked()
-                else:
-                    snapshot = None
+                    self._lifecycle_errors.clear()
+                    self._publish_changed_locked()
             if not current and camera is not None:
+                cleanup_errors: list[CameraError] = []
                 try:
                     camera.disconnect()
-                except Exception:
-                    pass
-        if snapshot is not None:
-            self.events.publish(snapshot)
+                except Exception as cleanup_error:
+                    _append_error(
+                        cleanup_errors,
+                        _camera_error(
+                            cleanup_error,
+                            "disconnect superseded camera owner",
+                        ),
+                    )
+                if cleanup_errors:
+                    with self._condition:
+                        self._lifecycle_errors.extend(cleanup_errors)
 
     def _disconnect_worker(self, generation: int) -> None:
         errors: list[CameraError] = []
@@ -330,34 +397,40 @@ class CameraCoordinator:
                 try:
                     camera.abort()
                 except Exception as error:
-                    errors.append(_camera_error(error, "abort before disconnect"))
+                    _append_error(
+                        errors,
+                        _camera_error(error, "abort before disconnect"),
+                    )
                 try:
                     camera.disconnect()
                 except Exception as error:
-                    errors.append(_camera_error(error, "disconnect camera"))
+                    _append_error(
+                        errors,
+                        _camera_error(error, "disconnect camera"),
+                    )
             with self._condition:
                 current = (
                     generation == self._connection_generation
                     and self._connection_target is False
                 )
                 if current:
+                    all_errors = [*self._lifecycle_errors, *errors]
+                    self._lifecycle_errors.clear()
                     self._camera = None
                     self._connected = False
                     self._connecting = False
                     self._clear_formal_image_locked()
-                    if errors:
+                    if all_errors:
                         self._state = CameraState.ERROR
                         self._error = _combined_error(
-                            "camera disconnect failed", errors
+                            "camera disconnect failed", all_errors
                         )
                     else:
                         self._state = CameraState.IDLE
                         self._error = None
-                    snapshot = self._changed_locked()
+                    self._publish_changed_locked()
                 else:
-                    snapshot = None
-        if snapshot is not None:
-            self.events.publish(snapshot)
+                    self._lifecycle_errors.extend(errors)
 
     def _exposure_worker(
         self,
@@ -367,37 +440,44 @@ class CameraCoordinator:
         preview_thread: threading.Thread | None,
     ) -> None:
         if preview_thread is not None:
+            error = self._stop_preview_thread(camera, preview_thread)
+            if error is not None:
+                self._finish_exposure_error(session, camera, error)
+                return
+        with self._acquisition_gate:
+            with self._condition:
+                if not self._is_current_exposure_locked(session, camera):
+                    return
             try:
-                camera.abort()
+                capabilities = camera.capabilities
             except Exception as error:
                 self._finish_exposure_error(session, camera, error)
                 return
-            preview_thread.join()
-        with self._condition:
-            if not self._is_current_exposure_locked(session, camera):
+            with self._condition:
+                if not self._is_current_exposure_locked(session, camera):
+                    return
+                self._exposure_started_monotonic = time.monotonic()
+                self._publish_changed_locked()
+            try:
+                frame = camera.acquire(
+                    duration_s,
+                    Roi(0, 0, capabilities.width, capabilities.height),
+                    1,
+                    ReadoutMode.RAW12,
+                )
+            except Exception as error:
+                self._finish_exposure_error(session, camera, error)
                 return
-        try:
-            capabilities = camera.capabilities
-            frame = camera.acquire(
-                duration_s,
-                Roi(0, 0, capabilities.width, capabilities.height),
-                1,
-                ReadoutMode.RAW12,
-            )
-        except Exception as error:
-            self._finish_exposure_error(session, camera, error)
-            return
-        with self._condition:
-            if not self._is_current_exposure_locked(session, camera):
-                return
-            self._frame = frame
-            self._image_ready = True
-            self._state = CameraState.IDLE
-            self._error = None
-            self._exposure_started_monotonic = None
-            self._exposure_duration_s = None
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            with self._condition:
+                if not self._is_current_exposure_locked(session, camera):
+                    return
+                self._frame = frame
+                self._image_ready = True
+                self._state = CameraState.IDLE
+                self._error = None
+                self._exposure_started_monotonic = None
+                self._exposure_duration_s = None
+                self._publish_changed_locked()
 
     def _finish_exposure_error(
         self,
@@ -411,8 +491,11 @@ class CameraCoordinator:
             self._state = CameraState.ERROR
             self._error = _camera_error(error, "acquire frame")
             self._clear_formal_image_locked()
-            snapshot = self._changed_locked()
-        self.events.publish(snapshot)
+            if _contains_not_connected(self._error):
+                self._connected = False
+                self._camera = None
+                self._connection_target = False
+            self._publish_changed_locked()
 
     def _preview_worker(
         self,
@@ -423,20 +506,21 @@ class CameraCoordinator:
     ) -> None:
         try:
             while not stop.is_set():
-                with self._condition:
-                    if not self._is_current_preview_locked(session, camera):
-                        return
-                capabilities = camera.capabilities
-                frame = camera.acquire(
-                    self._PREVIEW_DURATION_S,
-                    Roi(0, 0, capabilities.width, capabilities.height),
-                    1,
-                    ReadoutMode.RAW12,
-                )
-                with self._condition:
-                    if not self._is_current_preview_locked(session, camera):
-                        return
-                    self._preview_frame = frame
+                with self._acquisition_gate:
+                    with self._condition:
+                        if not self._is_current_preview_locked(session, camera):
+                            return
+                    capabilities = camera.capabilities
+                    frame = camera.acquire(
+                        self._PREVIEW_DURATION_S,
+                        Roi(0, 0, capabilities.width, capabilities.height),
+                        1,
+                        ReadoutMode.RAW12,
+                    )
+                    with self._condition:
+                        if not self._is_current_preview_locked(session, camera):
+                            return
+                        self._preview_frame = frame
                 callback(frame)
         except Exception as error:
             with self._condition:
@@ -444,8 +528,11 @@ class CameraCoordinator:
                     return
                 self._state = CameraState.ERROR
                 self._error = _camera_error(error, "acquire preview frame")
-                snapshot = self._changed_locked()
-            self.events.publish(snapshot)
+                if _contains_not_connected(self._error):
+                    self._connected = False
+                    self._camera = None
+                    self._connection_target = False
+                self._publish_changed_locked()
         finally:
             with self._condition:
                 if (
@@ -504,19 +591,24 @@ class CameraCoordinator:
         self._exposure_started_monotonic = None
         self._exposure_duration_s = None
 
-    def _changed_locked(self) -> CameraSnapshot:
+    def _publish_changed_locked(self) -> None:
         self._condition.notify_all()
-        return self._snapshot_locked()
+        self.events.publish(self._snapshot_locked())
 
     def _snapshot_locked(self) -> CameraSnapshot:
         percent: int | None = None
-        if (
-            self._state is CameraState.EXPOSING
-            and self._exposure_started_monotonic is not None
-            and self._exposure_duration_s is not None
-        ):
-            elapsed = max(0.0, time.monotonic() - self._exposure_started_monotonic)
-            percent = min(100, max(0, int(elapsed * 100 / self._exposure_duration_s)))
+        if self._state is CameraState.EXPOSING and self._exposure_duration_s is not None:
+            if self._exposure_started_monotonic is None:
+                percent = 0
+            else:
+                elapsed = max(
+                    0.0,
+                    time.monotonic() - self._exposure_started_monotonic,
+                )
+                percent = min(
+                    100,
+                    max(0, int(elapsed * 100 / self._exposure_duration_s)),
+                )
         return CameraSnapshot(
             connected=self._connected,
             connecting=self._connecting,
@@ -531,9 +623,15 @@ class CameraCoordinator:
         if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)):
             raise CameraInvalidValueError("duration_s must be numeric")
         duration = float(duration_s)
-        if not math.isfinite(duration) or duration <= 0:
-            raise CameraInvalidValueError("duration_s must be positive")
-        return round(duration * 1_000_000) / 1_000_000
+        if not math.isfinite(duration):
+            raise CameraInvalidValueError("duration_s must be finite")
+        exposure_us = round(duration * 1_000_000)
+        if not 12 <= exposure_us <= 3_600_000_000:
+            raise CameraInvalidValueError(
+                "duration_s must quantize to between 12 and "
+                "3600000000 microseconds"
+            )
+        return exposure_us / 1_000_000
 
     @staticmethod
     def _start_thread(
@@ -556,3 +654,19 @@ def _combined_error(message: str, errors: list[CameraError]) -> CameraError:
     if len(errors) == 1:
         return errors[0]
     return CameraCleanupError(message, tuple(errors))
+
+
+def _append_error(errors: list[CameraError], error: CameraError) -> None:
+    if isinstance(error, CameraCleanupError):
+        for nested in error.errors:
+            _append_error(errors, nested)
+    else:
+        errors.append(error)
+
+
+def _contains_not_connected(error: CameraError) -> bool:
+    if isinstance(error, CameraNotConnectedError):
+        return True
+    if isinstance(error, CameraCleanupError):
+        return any(_contains_not_connected(nested) for nested in error.errors)
+    return False

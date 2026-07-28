@@ -11,7 +11,9 @@ from touptek4040.camera_contract import CameraCapabilities, Frame, ReadoutMode, 
 from touptek4040.camera_coordinator import CameraCoordinator, CameraState
 from touptek4040.errors import (
     CameraBusyError,
+    CameraCleanupError,
     CameraError,
+    CameraInvalidValueError,
     CameraNotConnectedError,
 )
 
@@ -52,7 +54,10 @@ class ControlledCamera:
         self.active_acquisitions = 0
         self.max_active_acquisitions = 0
         self.abort_count = 0
+        self.abort_error: Exception | None = None
+        self.disconnect_error: Exception | None = None
         self.failure: Exception | None = None
+        self.requested_durations: list[float] = []
 
     def connect(self) -> None:
         self.connect_started.set()
@@ -63,11 +68,14 @@ class ControlledCamera:
         self.disconnect_started.set()
         self.disconnect_release.wait()
         self.connected = False
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
 
     def acquire(
         self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
     ) -> Frame:
         with self._acquisition_condition:
+            self.requested_durations.append(duration_s)
             self.acquire_count += 1
             sequence = self.acquire_count
             self.active_acquisitions += 1
@@ -93,6 +101,10 @@ class ControlledCamera:
 
     def abort(self) -> None:
         self.abort_count += 1
+        if self.abort_error is not None:
+            if isinstance(self.abort_error, CameraNotConnectedError):
+                self.connected = False
+            raise self.abort_error
 
     @property
     def temperature_c(self) -> float:
@@ -290,3 +302,86 @@ def test_disconnected_coordinator_rejects_cooling_access():
 
     with pytest.raises(CameraNotConnectedError):
         _ = coordinator.temperature_c
+
+
+@pytest.mark.parametrize(
+    ("requested", "applied"),
+    [
+        (0.000012, 0.000012),
+        (0.0000124, 0.000012),
+        (3_600.0, 3_600.0),
+    ],
+)
+def test_exposure_duration_is_quantized_and_accepts_inclusive_microsecond_bounds(
+    coordinator, controlled_camera, requested, applied
+):
+    coordinator.start_exposure(requested, True)
+    controlled_camera.wait_for_acquisitions(1)
+
+    assert controlled_camera.requested_durations == [applied]
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+@pytest.mark.parametrize(
+    "duration_s",
+    [0.0000004, 0.000011, 3_600.000001, float("nan"), float("inf")],
+)
+def test_invalid_quantized_duration_is_rejected_before_state_changes(
+    coordinator, controlled_camera, duration_s
+):
+    before = coordinator.snapshot()
+
+    with pytest.raises(CameraInvalidValueError):
+        coordinator.start_exposure(duration_s, True)
+
+    assert coordinator.snapshot() == before
+    assert controlled_camera.acquire_count == 0
+
+
+def test_superseded_connect_cleanup_failure_is_reported_with_all_causes():
+    first = CameraBusyError("close still busy")
+    second = CameraNotConnectedError("owner vanished during close")
+    cleanup = CameraCleanupError("old owner cleanup failed", (first, second))
+    camera = ControlledCamera()
+    camera.connect_release.clear()
+    camera.disconnect_error = cleanup
+    coordinator = CameraCoordinator(lambda source: camera, "controlled")
+
+    coordinator.connect_async()
+    assert camera.connect_started.wait(1.0)
+    coordinator.disconnect_async()
+    camera.connect_release.set()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state == CameraState.ERROR
+    assert isinstance(snapshot.error, CameraCleanupError)
+    assert snapshot.error.errors == (first, second)
+
+
+def test_superseded_disconnect_cleanup_failure_prevents_new_owner_success():
+    first = CameraBusyError("abort cleanup failed")
+    second = CameraError("close cleanup failed")
+    cleanup = CameraCleanupError("old owner cleanup failed", (first, second))
+    old_camera = ControlledCamera()
+    new_camera = ControlledCamera()
+    cameras = iter((old_camera, new_camera))
+    coordinator = CameraCoordinator(lambda source: next(cameras), "controlled")
+    coordinator.set_connected_sync(True)
+    old_camera.disconnect_release.clear()
+    old_camera.disconnect_error = cleanup
+
+    coordinator.disconnect_async()
+    assert old_camera.disconnect_started.wait(1.0)
+    coordinator.connect_async()
+    old_camera.disconnect_release.set()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state == CameraState.ERROR
+    assert isinstance(snapshot.error, CameraCleanupError)
+    assert snapshot.error.errors == (first, second)
+    assert new_camera.connect_started.is_set() is False
