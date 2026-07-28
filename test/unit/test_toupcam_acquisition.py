@@ -542,3 +542,26 @@ def test_acquisition_requires_connection() -> None:
 
     with pytest.raises(CameraNotConnectedError):
         camera.acquire(0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
+
+
+def test_cancelled_start_control_never_reaches_native_acquisition(
+    camera: ToupTekCamera,
+) -> None:
+    class CancelledControl:
+        def commit_start(self, claim):
+            del claim
+            return False
+
+    with pytest.raises(CameraOperationCancelledError):
+        camera.acquire(
+            0.01,
+            Roi(0, 0, 32, 32),
+            1,
+            ReadoutMode.RAW12,
+            control=CancelledControl(),
+        )
+
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in camera._sdk.calls
+    )

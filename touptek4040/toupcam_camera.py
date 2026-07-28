@@ -15,7 +15,13 @@ from typing import Any
 
 import numpy as np
 
-from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
+from .camera_contract import (
+    AcquisitionControl,
+    CameraCapabilities,
+    Frame,
+    ReadoutMode,
+    Roi,
+)
 from .errors import (
     CameraBusyError,
     CameraCleanupError,
@@ -173,7 +179,12 @@ class ToupTekCamera:
             return self._apply_settings_locked(handle, settings)
 
     def acquire(
-        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+        self,
+        duration_s: float,
+        roi: Roi,
+        binning: int,
+        readout_mode: ReadoutMode,
+        control: AcquisitionControl | None = None,
     ) -> Frame:
         """Issue one synchronous software trigger and return its private frame."""
         waited_for_stop = False
@@ -188,17 +199,30 @@ class ToupTekCamera:
         try:
             settings = CaptureSettings(duration_s, roi, binning, readout_mode)
             with self._condition:
-                handle = self._require_connected_locked()
-                generation = self._abort_generation
-                self._acquiring = True
-                self._frame_committed = False
-                self._cancel_requested = False
-                self._stop_claimed = False
+                self._require_connected_locked()
             with self._native_lease(during_acquisition=True) as handle:
                 applied = self._apply_settings_locked(handle, settings)
                 buffer = _allocate_buffer(applied)
                 frame_info = self._sdk.ToupcamFrameInfoV4()
                 timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
+                claim_state: dict[str, int] = {}
+
+                def claim() -> None:
+                    with self._condition:
+                        self._require_connected_locked()
+                        claim_state["generation"] = self._abort_generation
+                        self._acquiring = True
+                        self._frame_committed = False
+                        self._cancel_requested = False
+                        self._stop_claimed = False
+
+                if control is None:
+                    claim()
+                elif not control.commit_start(claim):
+                    raise CameraOperationCancelledError(
+                        "exposure was cancelled before native acquisition started"
+                    )
+                generation = claim_state["generation"]
                 operation_errors: list[CameraError] = []
                 try:
                     handle.StartPullModeWithCallback(None, None)

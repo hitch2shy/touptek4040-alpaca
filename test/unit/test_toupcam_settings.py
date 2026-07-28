@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import time
 
 import pytest
 
@@ -15,7 +16,8 @@ from test.fixtures.fake_toupcam import (
     OPTION_TRIGGER,
     FakeSdk,
 )
-from touptek4040.camera_contract import ReadoutMode, Roi
+from touptek4040.camera_contract import ExposureSettings, ReadoutMode, Roi
+from touptek4040.camera_coordinator import CameraCoordinator, CameraState
 from touptek4040.errors import CameraBusyError, CameraInvalidValueError
 from touptek4040.toupcam_camera import CaptureSettings, ToupTekCamera
 
@@ -78,6 +80,45 @@ def test_gain_rejects_values_outside_the_approved_range_before_native_call(
         camera.gain = gain
 
     assert not any(call[0] == "put_ExpoAGain" for call in camera._sdk.calls)
+
+
+def test_percent_stays_zero_during_native_capture_configuration(
+    camera: ToupTekCamera,
+) -> None:
+    coordinator = CameraCoordinator(lambda _source: camera, "fake-toupcam")
+    coordinator.set_connected_sync(True)
+    handle = camera._handle
+    handle.block_put_option = True
+
+    started = time.monotonic()
+    coordinator.start_exposure(
+        0.012,
+        True,
+        settings=lambda _capabilities: ExposureSettings(
+            roi=Roi(0, 0, 32, 32),
+            binning=1,
+            readout_mode=ReadoutMode.RAW12,
+            gain=100,
+        ),
+    )
+
+    assert time.monotonic() - started < 0.1
+    assert handle.put_option_entered.wait(1.0)
+    time.sleep(0.03)
+    snapshot = coordinator.snapshot()
+    assert snapshot.camera_state is CameraState.EXPOSING
+    assert snapshot.percent_completed == 0
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in camera._sdk.calls
+    )
+
+    coordinator.abort_exposure()
+    handle.block_put_option = False
+    handle.put_option_release.set()
+    thread = coordinator._exposure_thread
+    assert thread is not None
+    thread.join(1.0)
 
 
 def test_apply_settings_returns_final_sdk_dimensions(camera: ToupTekCamera) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from enum import IntEnum
 from typing import TypeVar
 
 from .camera_contract import (
+    AcquisitionControl,
     CameraCapabilities,
     CameraContract,
     ExposureSettings,
@@ -25,6 +27,7 @@ from .errors import (
     CameraInvalidValueError,
     CameraNotConnectedError,
     CameraOperationCancelledError,
+    CameraTimeoutError,
 )
 from .event_broker import EventBroker
 
@@ -50,6 +53,31 @@ class CameraSnapshot:
     image_ready: bool
     percent_completed: int | None
     error: CameraError | None
+
+
+class _CoordinatorAcquisitionControl(AcquisitionControl):
+    def __init__(
+        self,
+        coordinator: CameraCoordinator,
+        session: int,
+        camera: CameraContract,
+    ) -> None:
+        self._coordinator = coordinator
+        self._session = session
+        self._camera = camera
+
+    def commit_start(self, claim: Callable[[], None]) -> bool:
+        coordinator = self._coordinator
+        with coordinator._condition:
+            if not coordinator._is_current_exposure_locked(
+                self._session,
+                self._camera,
+            ):
+                return False
+            claim()
+            coordinator._exposure_started_monotonic = time.monotonic()
+            coordinator._publish_changed_locked()
+            return True
 
 
 class CameraCoordinator:
@@ -209,6 +237,11 @@ class CameraCoordinator:
             self._invalidate_preview_locked()
             self._session_id += 1
             session = self._session_id
+            acquisition_control = _CoordinatorAcquisitionControl(
+                self,
+                session,
+                camera,
+            )
             self._clear_formal_image_locked()
             self._state = CameraState.EXPOSING
             self._error = None
@@ -221,6 +254,7 @@ class CameraCoordinator:
                 camera,
                 duration,
                 exposure_settings,
+                acquisition_control,
                 preview_thread if had_preview else None,
             ),
             name=f"camera-exposure-{session}",
@@ -313,7 +347,6 @@ class CameraCoordinator:
             self._error = error
             if _contains_not_connected(error):
                 self._connected = False
-                self._camera = None
                 self._connection_target = False
             self._publish_changed_locked()
         raise error
@@ -395,20 +428,56 @@ class CameraCoordinator:
                     and self._connection_target is True
                 )
                 pending_errors = tuple(self._lifecycle_errors)
-                if current and pending_errors:
-                    self._camera = None
+                if not current:
+                    return
+                stale_camera = self._camera
+                self._lifecycle_errors.clear()
+            cleanup_errors: list[CameraError] = []
+            if stale_camera is not None:
+                try:
+                    stale_camera.abort()
+                except Exception as caught:
+                    _append_error(
+                        cleanup_errors,
+                        _camera_error(
+                            caught,
+                            "abort previous camera owner",
+                        ),
+                    )
+                try:
+                    stale_camera.disconnect()
+                except Exception as caught:
+                    _append_error(
+                        cleanup_errors,
+                        _camera_error(
+                            caught,
+                            "disconnect previous camera owner",
+                        ),
+                    )
+                with self._condition:
+                    if self._camera is stale_camera:
+                        self._camera = None
+                    current = (
+                        generation == self._connection_generation
+                        and self._connection_target is True
+                    )
+                    if not current:
+                        self._lifecycle_errors.extend(
+                            [*pending_errors, *cleanup_errors]
+                        )
+                        return
+            prior_cleanup_errors = [*pending_errors, *cleanup_errors]
+            if prior_cleanup_errors:
+                with self._condition:
                     self._connected = False
                     self._connecting = False
                     self._state = CameraState.ERROR
                     self._error = _combined_error(
                         "previous camera owner cleanup failed",
-                        list(pending_errors),
+                        prior_cleanup_errors,
                     )
-                    self._lifecycle_errors.clear()
                     self._publish_changed_locked()
-                    return
-                if not current:
-                    return
+                return
             try:
                 camera = self._factory(self._source)
                 camera.connect()
@@ -472,6 +541,8 @@ class CameraCoordinator:
                         _camera_error(error, "disconnect camera"),
                     )
             with self._condition:
+                if self._camera is camera:
+                    self._camera = None
                 current = (
                     generation == self._connection_generation
                     and self._connection_target is False
@@ -479,7 +550,6 @@ class CameraCoordinator:
                 if current:
                     all_errors = [*self._lifecycle_errors, *errors]
                     self._lifecycle_errors.clear()
-                    self._camera = None
                     self._connected = False
                     self._connecting = False
                     self._clear_formal_image_locked()
@@ -501,35 +571,57 @@ class CameraCoordinator:
         camera: CameraContract,
         duration_s: float,
         settings: ExposureSettings,
+        acquisition_control: AcquisitionControl,
         preview_thread: threading.Thread | None,
     ) -> None:
         if preview_thread is not None:
             error = self._stop_preview_thread(camera, preview_thread)
             if error is not None:
-                self._finish_exposure_error(session, camera, error)
+                self._finish_exposure_error(
+                    session,
+                    camera,
+                    error,
+                    operation="stop preview",
+                    duration_s=duration_s,
+                    settings=settings,
+                )
                 return
         with self._acquisition_gate:
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
                     return
+            try:
+                camera.gain = settings.gain
+            except Exception as error:
+                self._finish_exposure_error(
+                    session,
+                    camera,
+                    error,
+                    operation="apply gain",
+                    duration_s=duration_s,
+                    settings=settings,
+                )
+                return
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
                     return
-                self._exposure_started_monotonic = time.monotonic()
-                self._publish_changed_locked()
             try:
-                camera.gain = settings.gain
-                with self._condition:
-                    if not self._is_current_exposure_locked(session, camera):
-                        return
                 frame = camera.acquire(
                     duration_s,
                     settings.roi,
                     settings.binning,
                     settings.readout_mode,
+                    acquisition_control,
                 )
             except Exception as error:
-                self._finish_exposure_error(session, camera, error)
+                self._finish_exposure_error(
+                    session,
+                    camera,
+                    error,
+                    operation="acquire frame",
+                    duration_s=duration_s,
+                    settings=settings,
+                )
                 return
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
@@ -547,16 +639,27 @@ class CameraCoordinator:
         session: int,
         camera: CameraContract,
         error: Exception,
+        *,
+        operation: str,
+        duration_s: float,
+        settings: ExposureSettings,
     ) -> None:
         with self._condition:
             if not self._is_current_exposure_locked(session, camera):
                 return
+            disconnected = isinstance(error, CameraError) and _contains_not_connected(
+                error
+            )
             self._state = CameraState.ERROR
-            self._error = _camera_error(error, "acquire frame")
+            self._error = _async_exposure_error(
+                operation,
+                error,
+                duration_s,
+                settings,
+            )
             self._clear_formal_image_locked()
-            if _contains_not_connected(self._error):
+            if disconnected:
                 self._connected = False
-                self._camera = None
                 self._connection_target = False
             self._publish_changed_locked()
 
@@ -593,7 +696,6 @@ class CameraCoordinator:
                 self._error = _camera_error(error, "acquire preview frame")
                 if _contains_not_connected(self._error):
                     self._connected = False
-                    self._camera = None
                     self._connection_target = False
                 self._publish_changed_locked()
         finally:
@@ -757,6 +859,84 @@ def _camera_error(error: Exception, operation: str) -> CameraError:
     if isinstance(error, CameraError):
         return error
     return CameraError(f"{operation} failed: {error}")
+
+
+def _async_exposure_error(
+    operation: str,
+    error: Exception,
+    duration_s: float,
+    settings: ExposureSettings,
+) -> CameraError:
+    cause = type(error).__name__
+    error_text = str(error)
+    hresult_match = re.search(
+        r"\bHRESULT\s+(0x[0-9a-fA-F]{8})\b",
+        error_text,
+        re.IGNORECASE,
+    )
+    event_match = re.search(
+        r"\bevent\s*[:=]?\s*(0x[0-9a-fA-F]+|\d+)\b",
+        error_text,
+        re.IGNORECASE,
+    )
+    hresult = _normalized_hex(hresult_match.group(1)) if hresult_match else None
+    event = _normalized_hex(event_match.group(1)) if event_match else None
+
+    if isinstance(error, CameraNotConnectedError):
+        summary = "camera disconnected"
+        recovery = "Disconnect, reconnect the camera, then retry."
+    elif isinstance(error, CameraTimeoutError) or (
+        hresult is not None and hresult == "0x8001011F"
+    ):
+        summary = "camera acquisition timed out"
+        recovery = "Check the USB link, reconnect the camera, then retry."
+    elif event is not None:
+        prefix = "USB transfer" if "usb" in error_text.casefold() else "camera"
+        summary = f"{prefix} event {event} failure"
+        recovery = "Check the USB link, reconnect the camera, then retry."
+    elif isinstance(error, CameraOperationCancelledError):
+        summary = "camera acquisition was cancelled"
+        recovery = "Start a new exposure when the camera is Idle."
+    elif isinstance(error, CameraBusyError):
+        summary = "camera backend was busy"
+        recovery = "Wait for the camera to become Idle, then retry."
+    elif isinstance(error, CameraInvalidValueError):
+        summary = "camera rejected the frozen exposure settings"
+        recovery = "Review ROI, binning, readout mode, and gain, then retry."
+    else:
+        summary = "unexpected camera backend failure"
+        recovery = "Disconnect, reconnect the camera, then retry."
+
+    fields = [
+        "AsyncExposureFailure",
+        f"operation={operation}",
+        "CameraState=Error(5)",
+        f"duration={duration_s:.6f}s",
+        (
+            "roi=("
+            f"x={settings.roi.x},"
+            f"y={settings.roi.y},"
+            f"width={settings.roi.width},"
+            f"height={settings.roi.height}"
+            ")"
+        ),
+        f"binning={settings.binning}",
+        f"readout={settings.readout_mode.name}",
+        f"gain={settings.gain}",
+        f"cause={cause}",
+    ]
+    if hresult is not None:
+        fields.append(f"hresult={hresult}")
+    if event is not None:
+        fields.append(f"event={event}")
+    fields.extend((f"summary={summary}", f"recovery={recovery}"))
+    return CameraError("; ".join(fields))
+
+
+def _normalized_hex(value: str) -> str:
+    if value.casefold().startswith("0x"):
+        return f"0x{value[2:].upper()}"
+    return value
 
 
 def _combined_error(message: str, errors: list[CameraError]) -> CameraError:

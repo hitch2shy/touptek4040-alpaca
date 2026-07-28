@@ -21,6 +21,7 @@ from touptek4040.errors import (
     CameraError,
     CameraInvalidValueError,
     CameraNotConnectedError,
+    CameraOperationCancelledError,
 )
 
 
@@ -64,10 +65,15 @@ class ControlledCamera:
         self.disconnect_error: Exception | None = None
         self.failure: Exception | None = None
         self._gain = 100
+        self.gain_error: Exception | None = None
         self.block_gain = False
         self.gain_started = threading.Event()
         self.gain_release = threading.Event()
         self.gain_release.set()
+        self.block_acquisition_claim = False
+        self.acquisition_claim_entered = threading.Event()
+        self.acquisition_claim_release = threading.Event()
+        self.acquisition_claim_release.set()
         self.operation_order: list[tuple[object, ...]] = []
         self.requested_acquisitions: list[
             tuple[float, Roi, int, ReadoutMode, int]
@@ -87,23 +93,42 @@ class ControlledCamera:
             raise self.disconnect_error
 
     def acquire(
-        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+        self,
+        duration_s: float,
+        roi: Roi,
+        binning: int,
+        readout_mode: ReadoutMode,
+        control=None,
     ) -> Frame:
+        self.acquisition_claim_entered.set()
+        if self.block_acquisition_claim:
+            self.acquisition_claim_release.wait(2.0)
+
+        def claim() -> None:
+            with self._acquisition_condition:
+                self.operation_order.append(
+                    ("acquire", duration_s, roi, binning, readout_mode, self._gain)
+                )
+                self.requested_acquisitions.append(
+                    (duration_s, roi, binning, readout_mode, self._gain)
+                )
+                self.requested_durations.append(duration_s)
+                self.acquire_count += 1
+                self.active_acquisitions += 1
+                self.max_active_acquisitions = max(
+                    self.max_active_acquisitions, self.active_acquisitions
+                )
+                self._acquisition_condition.notify_all()
+
+        if control is not None:
+            if not control.commit_start(claim):
+                raise CameraOperationCancelledError(
+                    "exposure was cancelled before acquisition started"
+                )
+        else:
+            claim()
         with self._acquisition_condition:
-            self.operation_order.append(
-                ("acquire", duration_s, roi, binning, readout_mode, self._gain)
-            )
-            self.requested_acquisitions.append(
-                (duration_s, roi, binning, readout_mode, self._gain)
-            )
-            self.requested_durations.append(duration_s)
-            self.acquire_count += 1
             sequence = self.acquire_count
-            self.active_acquisitions += 1
-            self.max_active_acquisitions = max(
-                self.max_active_acquisitions, self.active_acquisitions
-            )
-            self._acquisition_condition.notify_all()
         self._releases.acquire()
         with self._acquisition_condition:
             self.active_acquisitions -= 1
@@ -131,6 +156,8 @@ class ControlledCamera:
         self.gain_started.set()
         if self.block_gain:
             self.gain_release.wait(2.0)
+        if self.gain_error is not None:
+            raise self.gain_error
         self._gain = value
 
     def abort(self) -> None:
@@ -311,6 +338,46 @@ def test_abort_while_gain_is_being_applied_never_starts_acquisition(
     assert coordinator.frame is None
 
 
+def test_percent_stays_zero_while_gain_is_being_applied(
+    coordinator, controlled_camera
+):
+    controlled_camera.block_gain = True
+    controlled_camera.gain_release.clear()
+
+    started = time.monotonic()
+    coordinator.start_exposure(0.012, True)
+
+    assert time.monotonic() - started < 0.1
+    assert controlled_camera.gain_started.wait(1.0)
+    time.sleep(0.03)
+    snapshot = coordinator.snapshot()
+    assert snapshot.camera_state is CameraState.EXPOSING
+    assert snapshot.percent_completed == 0
+    assert controlled_camera.acquire_count == 0
+
+    coordinator.abort_exposure()
+    controlled_camera.gain_release.set()
+
+
+def test_abort_linearizes_before_backend_acquisition_claim(
+    coordinator, controlled_camera
+):
+    controlled_camera.block_acquisition_claim = True
+    controlled_camera.acquisition_claim_release.clear()
+    coordinator.start_exposure(1.0, True)
+    assert controlled_camera.acquisition_claim_entered.wait(1.0)
+
+    coordinator.abort_exposure()
+    controlled_camera.acquisition_claim_release.set()
+    thread = coordinator._exposure_thread
+    assert thread is not None
+    thread.join(1.0)
+
+    assert controlled_camera.acquire_count == 0
+    assert coordinator.snapshot().camera_state is CameraState.IDLE
+    assert coordinator.frame is None
+
+
 def test_percent_completed_is_available_only_during_exposure(
     coordinator, controlled_camera
 ):
@@ -353,7 +420,80 @@ def test_async_acquisition_failure_enters_error_without_image(
     snapshot = coordinator.snapshot()
     assert snapshot.image_ready is False
     assert isinstance(snapshot.error, CameraError)
-    assert "sensor transfer failed" in str(snapshot.error)
+    assert "summary=unexpected camera backend failure" in str(snapshot.error)
+    assert "sensor transfer failed" not in str(snapshot.error)
+
+
+@pytest.mark.parametrize("failure_stage", ["gain", "acquire"])
+def test_not_connected_exposure_failure_cleans_old_owner_before_new_factory(
+    failure_stage,
+):
+    old_camera = ControlledCamera()
+    new_camera = ControlledCamera()
+    cameras = iter((old_camera, new_camera))
+    factory_calls = []
+    coordinator = CameraCoordinator(
+        lambda source: factory_calls.append(source) or next(cameras),
+        "controlled",
+    )
+    coordinator.set_connected_sync(True)
+    old_camera.disconnect_release.clear()
+    failure = CameraNotConnectedError(f"{failure_stage} lost camera")
+    if failure_stage == "gain":
+        old_camera.gain_error = failure
+    else:
+        old_camera.failure = failure
+
+    coordinator.start_exposure(0.1, True)
+    if failure_stage == "acquire":
+        old_camera.wait_for_acquisitions(1)
+        old_camera.release_frame()
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+
+    coordinator.connect_async()
+    try:
+        assert old_camera.disconnect_started.wait(1.0)
+        assert new_camera.connect_started.is_set() is False
+        assert factory_calls == ["controlled"]
+
+        old_camera.disconnect_release.set()
+        wait_until(lambda: coordinator.snapshot().connected)
+        assert new_camera.connect_started.is_set()
+        assert factory_calls == ["controlled", "controlled"]
+        assert old_camera.connected is False
+    finally:
+        old_camera.disconnect_release.set()
+        coordinator.disconnect_async()
+
+
+def test_stale_owner_cleanup_failure_prevents_new_factory_and_is_diagnostic():
+    old_camera = ControlledCamera()
+    new_camera = ControlledCamera()
+    cameras = iter((old_camera, new_camera))
+    factory_calls = []
+    coordinator = CameraCoordinator(
+        lambda source: factory_calls.append(source) or next(cameras),
+        "controlled",
+    )
+    coordinator.set_connected_sync(True)
+    old_camera.gain_error = CameraNotConnectedError("gain lost camera")
+    old_camera.disconnect_error = CameraError("old owner close failed")
+    old_camera.disconnect_release.clear()
+
+    coordinator.start_exposure(0.1, True)
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+    coordinator.connect_async()
+    assert old_camera.disconnect_started.wait(1.0)
+    old_camera.disconnect_release.set()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state is CameraState.ERROR
+    assert snapshot.error is not None
+    assert "old owner close failed" in str(snapshot.error)
+    assert new_camera.connect_started.is_set() is False
+    assert factory_calls == ["controlled"]
 
 
 def test_exposure_requires_connection():

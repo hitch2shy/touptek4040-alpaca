@@ -15,6 +15,7 @@ from touptek4040.camera_contract import (
     Roi,
 )
 from touptek4040.camera_coordinator import CameraCoordinator
+from touptek4040.errors import CameraOperationCancelledError
 
 
 class ApiCamera:
@@ -22,7 +23,8 @@ class ApiCamera:
         self.connected = False
         self.target_temperature_c = -10.0
         self.cooler_on = False
-        self.gain = 100
+        self._gain = 100
+        self.gain_error: Exception | None = None
         self.abort_calls = 0
         self.failure: Exception | None = None
         self.temperature_error: Exception | None = None
@@ -58,11 +60,21 @@ class ApiCamera:
         roi: Roi,
         binning: int,
         readout_mode: ReadoutMode,
+        control=None,
     ) -> Frame:
-        self.requested_acquisitions.append(
-            (duration_s, roi, binning, readout_mode, self.gain)
-        )
-        self.acquisition_started.set()
+        def claim() -> None:
+            self.requested_acquisitions.append(
+                (duration_s, roi, binning, readout_mode, self.gain)
+            )
+            self.acquisition_started.set()
+
+        if control is not None:
+            if not control.commit_start(claim):
+                raise CameraOperationCancelledError(
+                    "exposure was cancelled before acquisition started"
+                )
+        else:
+            claim()
         self.release_acquisition.wait(timeout=2)
         if self.failure is not None:
             raise self.failure
@@ -78,6 +90,16 @@ class ApiCamera:
             readout_mode,
             self.gain,
         )
+
+    @property
+    def gain(self) -> int:
+        return self._gain
+
+    @gain.setter
+    def gain(self, value: int) -> None:
+        if self.gain_error is not None:
+            raise self.gain_error
+        self._gain = value
 
     def abort(self) -> None:
         self.abort_calls += 1

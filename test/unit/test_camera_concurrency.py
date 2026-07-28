@@ -18,6 +18,7 @@ from touptek4040.errors import (
     CameraCleanupError,
     CameraError,
     CameraNotConnectedError,
+    CameraOperationCancelledError,
 )
 
 
@@ -67,14 +68,31 @@ class SequencedCamera:
         self.connected = False
 
     def acquire(
-        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+        self,
+        duration_s: float,
+        roi: Roi,
+        binning: int,
+        readout_mode: ReadoutMode,
+        control=None,
     ) -> Frame:
-        with self._condition:
-            self.acquire_count += 1
-            sequence = self.acquire_count
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-            self._condition.notify_all()
+        sequence_holder = {}
+
+        def claim() -> None:
+            with self._condition:
+                self.acquire_count += 1
+                sequence_holder["value"] = self.acquire_count
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self._condition.notify_all()
+
+        if control is not None:
+            if not control.commit_start(claim):
+                raise CameraOperationCancelledError(
+                    "exposure was cancelled before acquisition started"
+                )
+        else:
+            claim()
+        sequence = sequence_holder["value"]
         self._releases.acquire()
         self.cleanup_release.wait()
         with self._condition:

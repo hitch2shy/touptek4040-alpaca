@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -62,6 +63,12 @@ class Frame:
     gain: int = 100
 
 
+class AcquisitionControl(Protocol):
+    """Linearize a backend acquisition claim against coordinator cancellation."""
+
+    def commit_start(self, claim: Callable[[], None]) -> bool: ...
+
+
 @runtime_checkable
 class CameraContract(Protocol):
     """Minimal synchronous interface shared by all camera backends."""
@@ -74,7 +81,12 @@ class CameraContract(Protocol):
     def disconnect(self) -> None: ...
 
     def acquire(
-        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+        self,
+        duration_s: float,
+        roi: Roi,
+        binning: int,
+        readout_mode: ReadoutMode,
+        control: AcquisitionControl | None = None,
     ) -> Frame: ...
 
     def abort(self) -> None: ...

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import time
 
+from touptek4040.errors import (
+    CameraNotConnectedError,
+    CameraTimeoutError,
+)
+
 
 def _get(client, command: str):
     return client.simulate_get(f"/api/v1/camera/0/{command}")
@@ -19,26 +24,98 @@ def _wait_until(predicate, timeout: float = 1.0) -> None:
         time.sleep(0.005)
 
 
-def test_async_failure_is_exposed_by_image_and_state_queries_with_stable_code(
-    client, coordinator, api_camera
-):
-    api_camera.failure = RuntimeError("USB transfer event 0x0081 failed")
-    api_camera.release_acquisition.clear()
-    started = _put(client, "startexposure", Duration="0.1", Light="true")
-    assert started.json["ErrorNumber"] == 0
-    assert api_camera.acquisition_started.wait(1.0)
-    api_camera.release_acquisition.set()
-    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
-
+def _failure_messages(client) -> list[str]:
     messages = []
     for command in ("camerastate", "imageready", "percentcompleted"):
         response = _get(client, command)
         assert response.status_code == 200
         assert response.json["ErrorNumber"] == 0x500
-        assert "USB transfer event 0x0081 failed" in response.json["ErrorMessage"]
         messages.append(response.json["ErrorMessage"])
     assert len(set(messages)) == 1
+    return messages
+
+
+def test_async_failure_is_exposed_by_image_and_state_queries_with_stable_code(
+    client, coordinator, api_camera
+):
+    for command, values in (
+        ("binx", {"BinX": "2"}),
+        ("startx", {"StartX": "2"}),
+        ("starty", {"StartY": "4"}),
+        ("numx", {"NumX": "32"}),
+        ("numy", {"NumY": "24"}),
+        ("readoutmode", {"ReadoutMode": "1"}),
+        ("gain", {"Gain": "1650"}),
+    ):
+        assert _put(client, command, **values).json["ErrorNumber"] == 0
+    api_camera.failure = RuntimeError(
+        "USB transfer event 0x0081 failed\nAuthorization: secret-token"
+    )
+    api_camera.release_acquisition.clear()
+    started = _put(client, "startexposure", Duration="0.125", Light="true")
+    assert started.json["ErrorNumber"] == 0
+    assert api_camera.acquisition_started.wait(1.0)
+    api_camera.release_acquisition.set()
+    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
+
+    message = _failure_messages(client)[0]
+    for field in (
+        "operation=acquire frame",
+        "CameraState=Error(5)",
+        "duration=0.125000s",
+        "roi=(x=2,y=4,width=32,height=24)",
+        "binning=2",
+        "readout=RAW8",
+        "gain=1650",
+        "cause=RuntimeError",
+        "event=0x0081",
+        "summary=USB transfer event 0x0081 failure",
+        "recovery=",
+    ):
+        assert field in message
+    assert "secret-token" not in message
+    assert "\n" not in message
+    assert len(message) <= 700
     assert coordinator.frame is None
+
+
+def test_gain_failure_diagnostic_identifies_operation_and_recovery(
+    client, coordinator, api_camera
+):
+    api_camera.gain_error = CameraNotConnectedError(
+        "camera disconnected while applying gain"
+    )
+
+    started = _put(client, "startexposure", Duration="0.25", Light="false")
+
+    assert started.json["ErrorNumber"] == 0
+    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
+    message = _failure_messages(client)[0]
+    assert "operation=apply gain" in message
+    assert "CameraState=Error(5)" in message
+    assert "duration=0.250000s" in message
+    assert "cause=CameraNotConnectedError" in message
+    assert "summary=camera disconnected" in message
+    assert "recovery=Disconnect, reconnect the camera, then retry." in message
+
+
+def test_timeout_hresult_diagnostic_has_stable_code_and_safe_summary(
+    client, coordinator, api_camera
+):
+    api_camera.failure = CameraTimeoutError(
+        "acquire frame failed with HRESULT 0x8001011F"
+    )
+
+    started = _put(client, "startexposure", Duration="0.5", Light="true")
+
+    assert started.json["ErrorNumber"] == 0
+    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
+    message = _failure_messages(client)[0]
+    assert "operation=acquire frame" in message
+    assert "cause=CameraTimeoutError" in message
+    assert "hresult=0x8001011F" in message
+    assert "summary=camera acquisition timed out" in message
+    assert "recovery=Check the USB link, reconnect the camera, then retry." in message
 
 
 def test_new_exposure_clears_previous_image_and_async_failure(

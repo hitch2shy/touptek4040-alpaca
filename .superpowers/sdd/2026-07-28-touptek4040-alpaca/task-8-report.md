@@ -172,3 +172,87 @@ Commit subject:
 Commit reference: `HEAD`. The exact immutable hash is recorded in the Task 8
 handoff immediately after commit because a Git commit cannot contain its own
 final hash without changing that hash.
+
+## Review fix round 1/5
+
+Four Important review findings were closed with deterministic RED/GREEN
+coverage.
+
+### Acquisition and Abort linearization
+
+- Added an acquisition-control handshake shared by the coordinator, simulator,
+  and ToupCam backend.
+- The coordinator rechecks the exposure session and commits the backend claim
+  under one condition-lock critical section. If Abort returns first, a waiting
+  worker cannot later claim the backend or issue `StartPullModeWithCallback`
+  or `Trigger`.
+- The ToupCam claim preserves its abort generation and acquisition flags while
+  moving all native configuration before the claim.
+- Initial RED evidence: the controlled backend recorded an acquisition after
+  Abort, and the simulator/ToupCam backends did not accept the new control
+  handshake (`3 failed`). The unchanged tests passed after implementation.
+
+### PercentCompleted start point
+
+- Exposure progress now starts at the committed backend acquisition claim.
+  Preview teardown, acquisition-gate waiting, gain application, and ToupCam
+  native configuration all continue to report zero percent.
+- Slow-gain and slow-native-configuration tests verify StartExposure remains
+  non-blocking, CameraState remains Exposing, and PercentCompleted remains
+  zero.
+- A deliberate mutation restoring the old pre-gain timestamp made both tests
+  fail at 100 percent; removing the mutation made both pass.
+
+### Stable asynchronous diagnostics
+
+- Gain and frame-acquisition failures now persist one stable, bounded,
+  single-line diagnostic containing the operation, Error state, frozen
+  duration/ROI/binning/readout/gain, exception class, allow-listed HRESULT or
+  event metadata, a safe summary, and actionable recovery.
+- Arbitrary backend text, including multiline or secret-like native content,
+  is not reflected.
+- CameraState, ImageReady, and PercentCompleted return exactly the same stored
+  diagnostic with Alpaca driver error `0x500`.
+- Initial RED evidence: all three diagnostic tests failed because raw backend
+  strings were exposed and contextual fields were absent. All three passed
+  after implementation.
+
+### Failed-owner lifecycle cleanup
+
+- A CameraNotConnectedError during gain or acquisition marks the camera
+  unavailable but retains its owner reference.
+- Reconnect serializes through the lifecycle lock, aborts and disconnects the
+  old owner, and does not construct the replacement until cleanup completes.
+- Cleanup failures remain diagnostic and prevent a replacement owner from
+  opening. A superseded disconnect releases ownership after its single cleanup
+  attempt so saved cleanup errors are not duplicated by a second attempt.
+- Initial RED evidence: gain, acquisition, and cleanup-failure tests all showed
+  the old owner was dropped before cleanup (`3 failed`). All three passed after
+  implementation.
+
+### Review-fix verification
+
+Focused coordinator/backend/Alpaca regression set:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -q test/unit/test_camera_coordinator.py test/unit/test_sim_camera.py test/unit/test_toupcam_acquisition.py test/unit/test_toupcam_settings.py test/unit/test_camera_concurrency.py test/alpaca/test_async_failures.py
+```
+
+Result: `123 passed`.
+
+Unit suite: `141 passed`.
+
+Alpaca suite: `383 passed`.
+
+Complete test tree: `524 passed, 4 skipped`. The four existing hardware tests
+remain opt-in; `TOUPTEK_HARDWARE_TEST` was unset, so no hardware access was
+attempted.
+
+Compilation and whitespace validation both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+No ledger, approved plan, or approved design file was modified.

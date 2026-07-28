@@ -6,8 +6,19 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .camera_contract import CameraCapabilities, CameraContract, Frame, ReadoutMode, Roi
-from .errors import CameraInvalidValueError, CameraNotConnectedError
+from .camera_contract import (
+    AcquisitionControl,
+    CameraCapabilities,
+    CameraContract,
+    Frame,
+    ReadoutMode,
+    Roi,
+)
+from .errors import (
+    CameraInvalidValueError,
+    CameraNotConnectedError,
+    CameraOperationCancelledError,
+)
 
 
 class SimCamera(CameraContract):
@@ -42,10 +53,19 @@ class SimCamera(CameraContract):
         self._connected = False
 
     def acquire(
-        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+        self,
+        duration_s: float,
+        roi: Roi,
+        binning: int,
+        readout_mode: ReadoutMode,
+        control: AcquisitionControl | None = None,
     ) -> Frame:
         self._require_connected()
         self._validate_acquisition(duration_s, roi, binning, readout_mode)
+        if control is not None and not control.commit_start(lambda: None):
+            raise CameraOperationCancelledError(
+                "exposure was cancelled before acquisition started"
+            )
         started_utc = datetime.now(timezone.utc)
         pixels = self._pixels(roi, binning, readout_mode)
         return Frame(

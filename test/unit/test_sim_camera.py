@@ -2,7 +2,11 @@ import numpy as np
 import pytest
 
 from touptek4040.camera_contract import ReadoutMode, Roi
-from touptek4040.errors import CameraInvalidValueError, CameraNotConnectedError
+from touptek4040.errors import (
+    CameraInvalidValueError,
+    CameraNotConnectedError,
+    CameraOperationCancelledError,
+)
 from touptek4040.sim_camera import SimCamera
 
 
@@ -124,3 +128,21 @@ def test_simulator_rejects_gain_outside_the_approved_numeric_range(gain):
 
     with pytest.raises(CameraInvalidValueError):
         camera.gain = gain
+
+
+def test_simulator_does_not_acquire_when_start_control_was_cancelled():
+    camera = SimCamera("SIM-4040")
+
+    class CancelledControl:
+        def commit_start(self, claim):
+            del claim
+            return False
+
+    with pytest.raises(CameraOperationCancelledError):
+        camera.acquire(
+            0.001,
+            Roi(0, 0, 16, 16),
+            1,
+            ReadoutMode.RAW12,
+            control=CancelledControl(),
+        )
