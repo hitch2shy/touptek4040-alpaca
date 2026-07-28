@@ -33,6 +33,7 @@ from .errors import (
     safe_exception_text,
 )
 from .event_broker import EventBroker
+from .image_workspace import ImageGeneration, ImageWorkspace
 
 _ResultT = TypeVar("_ResultT")
 _ASYNC_DIAGNOSTIC_LIMIT = 700
@@ -126,6 +127,7 @@ class CameraCoordinator:
         self._preview_stop: threading.Event | None = None
         self._preview_thread: threading.Thread | None = None
         self._exposure_thread: threading.Thread | None = None
+        self._image_workspace = ImageWorkspace()
         self.events: EventBroker[CameraSnapshot] = EventBroker()
 
     def connect_async(self) -> None:
@@ -396,6 +398,10 @@ class CameraCoordinator:
     def frame(self) -> Frame | None:
         with self._condition:
             return self._frame
+
+    @property
+    def image_generation(self) -> ImageGeneration | None:
+        return self._image_workspace.current()
 
     @property
     def preview_frame(self) -> Frame | None:
@@ -669,13 +675,28 @@ class CameraCoordinator:
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
                     return
-                self._frame = frame
-                self._image_ready = True
-                self._state = CameraState.IDLE
-                self._error = None
-                self._exposure_started_monotonic = None
-                self._exposure_duration_s = None
-                self._publish_changed_locked()
+                try:
+                    generation = self._image_workspace.publish(frame)
+                except BaseException as error:
+                    publication_error = error
+                else:
+                    publication_error = None
+                    self._frame = generation.frame
+                    self._image_ready = True
+                    self._state = CameraState.IDLE
+                    self._error = None
+                    self._exposure_started_monotonic = None
+                    self._exposure_duration_s = None
+                    self._publish_changed_locked()
+            if publication_error is not None:
+                self._finish_exposure_error(
+                    session,
+                    camera,
+                    publication_error,
+                    operation="publish frame",
+                    duration_s=duration_s,
+                    settings=settings,
+                )
 
     def _finish_exposure_error(
         self,
@@ -850,6 +871,7 @@ class CameraCoordinator:
 
     def _clear_formal_image_locked(self) -> None:
         self._frame = None
+        self._image_workspace.clear_formal()
         self._image_ready = False
         self._exposure_started_monotonic = None
         self._exposure_duration_s = None

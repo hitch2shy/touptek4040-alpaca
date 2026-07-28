@@ -1,0 +1,16 @@
+Task 9 RED evidence
+===================
+
+Command:
+.\.venv64\Scripts\python.exe -m pytest -c test\pytest.ini test\unit\test_image_workspace.py test\alpaca\test_imagebytes.py test\alpaca\test_imagearray_json.py test\unit\test_fits_io.py -v
+
+Result:
+- Exit code: 1
+- Collected: 0 tests, 4 collection errors
+- test/unit/test_image_workspace.py: ModuleNotFoundError: touptek4040.image_workspace
+- test/alpaca/test_imagebytes.py: ModuleNotFoundError: touptek4040.alpaca.image_api
+- test/alpaca/test_imagearray_json.py: ModuleNotFoundError: touptek4040.alpaca.image_api
+- test/unit/test_fits_io.py: ModuleNotFoundError: touptek4040.alpaca.image_api
+
+The failures are expected because the Task 9 production modules do not yet
+exist. No Task 9 production code had been added when this run was recorded.

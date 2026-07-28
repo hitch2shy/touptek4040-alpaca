@@ -18,6 +18,7 @@ from ..errors import (
 )
 from .camera_api import CameraApi
 from .common_api import CommonApi
+from .image_api import ImageApiResource
 from .manifest import CAMERA_V4_ENDPOINTS, EndpointSpec
 from .request import client_transaction_id
 from .responses import (
@@ -48,6 +49,10 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
     resources: dict[tuple[str, str], _EndpointResource] = {}
     for spec in CAMERA_V4_ENDPOINTS:
         if spec.category == "image":
+            app.add_route(
+                f"/api/v1/camera/0/{spec.command}",
+                ImageApiResource(coordinator, spec.command, allocator),
+            )
             continue
         api = apis[spec.category]
         key = (spec.category, spec.command)
