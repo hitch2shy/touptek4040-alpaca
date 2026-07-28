@@ -1,16 +1,50 @@
-"""Read-only ToupTek camera discovery keyed by immutable serial numbers."""
+"""ToupTek discovery, settings, cooling, and synchronous acquisition."""
 
 from __future__ import annotations
 
+import ctypes
+import math
 import sys
 from ctypes import ArgumentError
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from threading import Lock, RLock
 from types import ModuleType
 from typing import Any
 
-from .camera_contract import CameraCapabilities
-from .errors import CameraInvalidValueError, CameraNotConnectedError
+import numpy as np
+
+from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
+from .errors import (
+    CameraBusyError,
+    CameraError,
+    CameraInvalidValueError,
+    CameraNotConnectedError,
+    CameraNotSupportedError,
+    CameraOperationCancelledError,
+    CameraTimeoutError,
+)
 from .toupcam_loader import load_default_toupcam_module
+
+
+@dataclass(frozen=True)
+class CaptureSettings:
+    """Requested output geometry and exposure settings."""
+
+    duration_s: float
+    roi: Roi
+    binning: int
+    readout_mode: ReadoutMode
+
+
+@dataclass(frozen=True)
+class AppliedSettings:
+    """SDK-confirmed output geometry and storage type."""
+
+    duration_s: float
+    width: int
+    height: int
+    dtype: np.dtype
 
 
 @dataclass(frozen=True)
@@ -48,7 +82,7 @@ def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentit
 
 
 class ToupTekCamera:
-    """Stable ToupTek camera selection with cached read-only capabilities."""
+    """Stable ToupTek selection with one synchronized hardware handle."""
 
     def __init__(self, serial: str | None, sdk: ModuleType | Any | None = None) -> None:
         self._sdk = sdk if sdk is not None else load_default_toupcam_module()
@@ -63,26 +97,359 @@ class ToupTekCamera:
                 raise CameraNotConnectedError(f"camera with serial {serial!r} is not attached")
         self.serial = self.identity.serial
         self._handle: Any | None = None
+        self._state_lock = RLock()
+        self._acquisition_lock = Lock()
+        self._acquiring = False
+        self._camera_started = False
+        self._cancel_requested = False
+        self._stopped_by_abort = False
+        self._abort_generation = 0
 
     @property
     def capabilities(self) -> CameraCapabilities:
         return self.identity.capabilities
 
     def connect(self) -> None:
-        if self._handle is None:
-            self._handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
+        with self._state_lock:
             if self._handle is None:
-                raise CameraNotConnectedError(f"could not open camera with serial {self.serial!r}")
+                try:
+                    handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
+                except Exception as error:
+                    raise _translate_sdk_error(error, "connect camera") from error
+                if handle is None:
+                    raise CameraNotConnectedError(
+                        f"could not open camera with serial {self.serial!r}"
+                    )
+                self._handle = handle
 
     def disconnect(self) -> None:
-        if self._handle is not None:
-            self._handle.Close()
-            self._handle = None
+        with self._state_lock:
+            acquiring = self._acquiring
+        if acquiring:
+            self.abort()
+        with self._acquisition_lock:
+            with self._state_lock:
+                handle = self._handle
+                self._handle = None
+            if handle is not None:
+                try:
+                    handle.Close()
+                except Exception as error:
+                    raise _translate_sdk_error(error, "disconnect camera") from error
+
+    def apply_settings(self, settings: CaptureSettings) -> AppliedSettings:
+        """Validate and configure every non-running acquisition option."""
+        with self._state_lock:
+            handle = self._require_connected_locked()
+            if self._acquiring:
+                raise CameraBusyError("cannot configure a running acquisition")
+            return self._apply_settings_locked(handle, settings)
+
+    def acquire(
+        self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
+    ) -> Frame:
+        """Issue one synchronous software trigger and return its private frame."""
+        if not self._acquisition_lock.acquire(blocking=False):
+            raise CameraBusyError("another acquisition is already running")
+        try:
+            settings = CaptureSettings(duration_s, roi, binning, readout_mode)
+            with self._state_lock:
+                handle = self._require_connected_locked()
+                applied = self._apply_settings_locked(handle, settings)
+                generation = self._abort_generation
+                self._acquiring = True
+                self._cancel_requested = False
+                self._stopped_by_abort = False
+            buffer = _allocate_buffer(applied)
+            frame_info = self._sdk.ToupcamFrameInfoV4()
+            timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
+            operation_error: Exception | None = None
+            camera_started = False
+            try:
+                handle.StartPullModeWithCallback(None, None)
+                camera_started = True
+                with self._state_lock:
+                    cancelled_before_trigger = (
+                        generation != self._abort_generation
+                    )
+                    if not cancelled_before_trigger:
+                        self._camera_started = True
+                if cancelled_before_trigger:
+                    operation_error = CameraOperationCancelledError(
+                        "exposure was aborted before trigger"
+                    )
+                else:
+                    started_utc = datetime.now(timezone.utc)
+                    handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
+            except Exception as error:
+                operation_error = error
+            finally:
+                if camera_started:
+                    with self._state_lock:
+                        stopped_by_abort = self._stopped_by_abort
+                    if not stopped_by_abort:
+                        with self._state_lock:
+                            # Transfer Stop ownership away from Abort before the
+                            # native call, which can release the GIL.
+                            self._camera_started = False
+                        try:
+                            handle.Stop()
+                        except Exception as error:
+                            if operation_error is None:
+                                operation_error = error
+                    with self._state_lock:
+                        self._camera_started = False
+            if operation_error is not None:
+                if self._was_aborted(generation):
+                    raise CameraOperationCancelledError(
+                        "exposure was aborted; frame discarded"
+                    ) from operation_error
+                raise _translate_sdk_error(
+                    operation_error, "acquire frame"
+                ) from operation_error
+            if self._was_aborted(generation):
+                raise CameraOperationCancelledError(
+                    "exposure was aborted; frame discarded"
+                )
+            info_width = frame_info.v3.width
+            info_height = frame_info.v3.height
+            if (info_width, info_height) != (applied.width, applied.height):
+                raise CameraError(
+                    "SDK frame dimensions "
+                    f"{info_width}x{info_height} do not match configured "
+                    f"{applied.width}x{applied.height}"
+                )
+            pixels = np.frombuffer(
+                buffer,
+                dtype=applied.dtype,
+                count=applied.width * applied.height,
+            ).reshape(applied.height, applied.width).copy()
+            return Frame(
+                pixels=pixels,
+                started_utc=started_utc,
+                duration_s=applied.duration_s,
+                binning=binning,
+                roi=roi,
+                readout_mode=readout_mode,
+            )
+        finally:
+            with self._state_lock:
+                self._acquiring = False
+                self._camera_started = False
+                self._cancel_requested = False
+                self._stopped_by_abort = False
+            self._acquisition_lock.release()
 
     def abort(self) -> None:
+        """Cancel a software trigger and invalidate every result from its generation."""
+        with self._state_lock:
+            handle = self._require_connected_locked()
+            if not self._acquiring or self._cancel_requested:
+                return
+            self._cancel_requested = True
+            self._abort_generation += 1
+            trigger_active = self._camera_started
+        if not trigger_active:
+            return
+        try:
+            # The SDK documents zero as stop/cancel; 0xffff means continuous trigger.
+            handle.Trigger(0)
+        except Exception:
+            # On some models Trigger(0) is rejected once the exposure is active.
+            # Stop below is the operation that interrupts the running instance.
+            pass
+        with self._state_lock:
+            # Transfer Stop ownership before entering the SDK. TriggerSyncV4 can
+            # return on another Python thread while this call is still unwinding.
+            self._stopped_by_abort = True
+            self._camera_started = False
+        try:
+            handle.Stop()
+        except Exception as error:
+            raise _translate_sdk_error(error, "abort running camera") from error
+
+    @property
+    def temperature_c(self) -> float:
+        handle = self._require_connected()
+        try:
+            return handle.get_Temperature() / 10.0
+        except Exception as error:
+            raise _translate_sdk_error(error, "read sensor temperature") from error
+
+    @property
+    def target_temperature_c(self) -> float:
+        return self._get_option("TOUPCAM_OPTION_TECTARGET") / 10.0
+
+    @target_temperature_c.setter
+    def target_temperature_c(self, value: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CameraInvalidValueError("target temperature must be numeric")
+        deci_c = round(float(value) * 10)
+        target_range = self.identity.tec_target_range_deci_c
+        if target_range is not None and not target_range[0] <= deci_c <= target_range[1]:
+            raise CameraInvalidValueError(
+                f"target temperature must be between "
+                f"{target_range[0] / 10:.1f} and {target_range[1] / 10:.1f} °C"
+            )
+        handle = self._require_connected()
+        try:
+            handle.put_Temperature(deci_c)
+        except Exception as error:
+            raise _translate_sdk_error(error, "set TEC target") from error
+
+    @property
+    def cooler_on(self) -> bool:
+        return bool(self._get_option("TOUPCAM_OPTION_TEC"))
+
+    @cooler_on.setter
+    def cooler_on(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise CameraInvalidValueError("cooler state must be boolean")
+        self._put_option("TOUPCAM_OPTION_TEC", int(enabled), "set TEC state")
+
+    def tec_voltage(self) -> tuple[float, float]:
+        """Return current and configured maximum TEC voltage in volts."""
+        current = self._get_option("TOUPCAM_OPTION_TEC_VOLTAGE") / 10.0
+        maximum = self._get_option("TOUPCAM_OPTION_TEC_VOLTAGE_MAX") / 10.0
+        return current, maximum
+
+    @property
+    def cooler_power_percent(self) -> float:
+        current, maximum = self.tec_voltage()
+        if maximum <= 0:
+            return 0.0
+        return min(100.0, max(0.0, current * 100.0 / maximum))
+
+    def _apply_settings_locked(
+        self, handle: Any, settings: CaptureSettings
+    ) -> AppliedSettings:
+        exposure_us, sdk_roi, dtype = self._validated_sdk_settings(settings)
+        try:
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_RAW, 1)
+            handle.put_Option(
+                self._sdk.TOUPCAM_OPTION_BITDEPTH,
+                1 if settings.readout_mode is ReadoutMode.RAW12 else 0,
+            )
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_BINNING, settings.binning)
+            handle.put_Roi(*sdk_roi)
+            handle.put_ExpoTime(exposure_us)
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_TRIGGER, 1)
+            width, height = handle.get_FinalSize()
+        except Exception as error:
+            raise _translate_sdk_error(error, "apply capture settings") from error
+        if width <= 0 or height <= 0:
+            raise CameraError(f"SDK returned invalid final size {width}x{height}")
+        if (width, height) != (settings.roi.width, settings.roi.height):
+            raise CameraInvalidValueError(
+                "requested ROI does not produce the same final SDK dimensions"
+            )
+        return AppliedSettings(exposure_us / 1_000_000.0, width, height, dtype)
+
+    def _validated_sdk_settings(
+        self, settings: CaptureSettings
+    ) -> tuple[int, tuple[int, int, int, int], np.dtype]:
+        if isinstance(settings.duration_s, bool) or not isinstance(
+            settings.duration_s, (int, float)
+        ):
+            raise CameraInvalidValueError("duration_s must be numeric")
+        if not math.isfinite(settings.duration_s) or settings.duration_s <= 0:
+            raise CameraInvalidValueError("duration_s must be positive")
+        exposure_us = round(settings.duration_s * 1_000_000)
+        minimum, maximum, _ = self.identity.exposure_time_range_us
+        if not minimum <= exposure_us <= maximum:
+            raise CameraInvalidValueError(
+                f"exposure must be between {minimum} and {maximum} microseconds"
+            )
+        if isinstance(settings.binning, bool) or not isinstance(settings.binning, int):
+            raise CameraInvalidValueError("binning must be an integer")
+        if not 1 <= settings.binning <= self.capabilities.max_bin:
+            raise CameraInvalidValueError(
+                f"binning must be between 1 and {self.capabilities.max_bin}"
+            )
+        if not isinstance(settings.readout_mode, ReadoutMode):
+            raise CameraInvalidValueError("unsupported readout mode")
+        roi = settings.roi
+        if not isinstance(roi, Roi):
+            raise CameraInvalidValueError("ROI must be a Roi")
+        if roi.x < 0 or roi.y < 0 or roi.width <= 0 or roi.height <= 0:
+            raise CameraInvalidValueError("ROI must have a non-negative origin and positive size")
+        scale = settings.binning
+        sdk_roi = (
+            roi.x * scale,
+            roi.y * scale,
+            roi.width * scale,
+            roi.height * scale,
+        )
+        x, y, width, height = sdk_roi
+        if width < 16 or height < 16 or any(value % 2 for value in sdk_roi):
+            raise CameraInvalidValueError(
+                "scaled SDK ROI coordinates and dimensions must be even and at least 16 pixels"
+            )
+        if x + width > self.capabilities.width or y + height > self.capabilities.height:
+            raise CameraInvalidValueError("ROI extends outside the sensor")
+        if roi.width % 2 or roi.height % 2:
+            raise CameraInvalidValueError("final SDK image dimensions must be even")
+        dtype = np.dtype(
+            np.uint16
+            if settings.readout_mode is ReadoutMode.RAW12
+            else np.uint8
+        )
+        return exposure_us, sdk_roi, dtype
+
+    def _was_aborted(self, generation: int) -> bool:
+        with self._state_lock:
+            return generation != self._abort_generation
+
+    def _require_connected(self) -> Any:
+        with self._state_lock:
+            return self._require_connected_locked()
+
+    def _require_connected_locked(self) -> Any:
         if self._handle is None:
             raise CameraNotConnectedError("camera is not connected")
-        self._handle.Stop()
+        return self._handle
+
+    def _get_option(self, name: str) -> int:
+        handle = self._require_connected()
+        option = getattr(self._sdk, name)
+        try:
+            return handle.get_Option(option)
+        except Exception as error:
+            raise _translate_sdk_error(error, f"read option {name}") from error
+
+    def _put_option(self, name: str, value: int, operation: str) -> None:
+        handle = self._require_connected()
+        option = getattr(self._sdk, name)
+        try:
+            handle.put_Option(option, value)
+        except Exception as error:
+            raise _translate_sdk_error(error, operation) from error
+
+
+def _allocate_buffer(settings: AppliedSettings) -> Any:
+    byte_count = settings.width * settings.height * settings.dtype.itemsize
+    return ctypes.create_string_buffer(byte_count)
+
+
+def _translate_sdk_error(error: Exception, operation: str) -> CameraError:
+    if isinstance(error, CameraError):
+        return error
+    hr = getattr(error, "hr", None)
+    if hr is None:
+        return CameraError(f"{operation} failed: {error}")
+    code = int(hr) & 0xFFFFFFFF
+    message = f"{operation} failed with HRESULT 0x{code:08X}"
+    if code == 0x80070057:
+        return CameraInvalidValueError(message)
+    if code == 0x80004001:
+        return CameraNotSupportedError(message)
+    if code in {0x800700AA, 0x8000FFFF, 0x8001010E, 0x8000000A}:
+        return CameraBusyError(message)
+    if code == 0x8001011F:
+        return CameraTimeoutError(message)
+    if code in {0x8007001F, 0x80070005}:
+        return CameraNotConnectedError(message)
+    return CameraError(message)
 
 
 def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:

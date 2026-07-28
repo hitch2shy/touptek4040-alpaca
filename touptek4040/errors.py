@@ -15,3 +15,15 @@ class CameraNotConnectedError(CameraError):
 
 class CameraInvalidValueError(CameraError):
     """Raised when a camera operation receives an unsupported value."""
+
+
+class CameraNotSupportedError(CameraError):
+    """Raised when the attached camera does not implement an operation."""
+
+
+class CameraTimeoutError(CameraError):
+    """Raised when the camera does not deliver a frame before its deadline."""
+
+
+class CameraOperationCancelledError(CameraError):
+    """Raised when an in-flight operation is explicitly cancelled."""
