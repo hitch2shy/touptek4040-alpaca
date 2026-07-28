@@ -14,6 +14,7 @@ from ..errors import (
     CameraNotConnectedError,
     CameraNotSupportedError,
     CameraOperationCancelledError,
+    safe_exception_text,
 )
 from .camera_api import CameraApi
 from .common_api import CommonApi
@@ -106,7 +107,7 @@ class _EndpointResource:
                 self._api.put(spec.command, request)
                 body = method_response(envelope_request, server_transaction_id)
             response.status = falcon.HTTP_200
-        except Exception as error:
+        except BaseException as error:
             translated, status = _translate_error(error)
             body = _error_response(
                 request,
@@ -118,23 +119,35 @@ class _EndpointResource:
         response.media = body
 
 
-def _translate_error(error: Exception) -> tuple[AlpacaError, str]:
+def _translate_error(error: BaseException) -> tuple[AlpacaError, str]:
     if isinstance(error, RequestParseError):
         return error, falcon.HTTP_400
     if isinstance(error, AlpacaError):
         return error, falcon.HTTP_200
     if isinstance(error, CameraInvalidValueError):
-        return AlpacaError(INVALID_VALUE, str(error)), falcon.HTTP_200
+        return AlpacaError(INVALID_VALUE, safe_exception_text(error)), falcon.HTTP_200
     if isinstance(error, CameraNotConnectedError):
-        return AlpacaError(NOT_CONNECTED, str(error)), falcon.HTTP_200
+        return AlpacaError(NOT_CONNECTED, safe_exception_text(error)), falcon.HTTP_200
     if isinstance(error, CameraBusyError):
-        return AlpacaError(INVALID_OPERATION, str(error)), falcon.HTTP_200
+        return AlpacaError(
+            INVALID_OPERATION,
+            safe_exception_text(error),
+        ), falcon.HTTP_200
     if isinstance(error, CameraNotSupportedError):
-        return AlpacaError(METHOD_NOT_IMPLEMENTED, str(error)), falcon.HTTP_200
+        return AlpacaError(
+            METHOD_NOT_IMPLEMENTED,
+            safe_exception_text(error),
+        ), falcon.HTTP_200
     if isinstance(error, CameraOperationCancelledError):
-        return AlpacaError(OPERATION_CANCELLED, str(error)), falcon.HTTP_200
+        return AlpacaError(
+            OPERATION_CANCELLED,
+            safe_exception_text(error),
+        ), falcon.HTTP_200
     if isinstance(error, CameraError):
-        return AlpacaError(_DRIVER_ERROR, str(error)), falcon.HTTP_200
+        return AlpacaError(
+            _DRIVER_ERROR,
+            safe_exception_text(error),
+        ), falcon.HTTP_200
     return (
         AlpacaError(_DRIVER_ERROR, "An internal camera service error occurred"),
         falcon.HTTP_500,

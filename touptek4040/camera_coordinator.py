@@ -28,6 +28,9 @@ from .errors import (
     CameraNotConnectedError,
     CameraOperationCancelledError,
     CameraTimeoutError,
+    safe_camera_error,
+    safe_exception_identity,
+    safe_exception_text,
 )
 from .event_broker import EventBroker
 
@@ -39,6 +42,7 @@ _KNOWN_ASYNC_EVENTS = {
     "0x0082": "camera no-frame timeout event 0x0082",
     "0x0083": "camera no-packet timeout event 0x0083",
 }
+_ASYNC_TEXT_SCAN_LIMIT = 512
 
 
 class CameraState(IntEnum):
@@ -309,7 +313,7 @@ class CameraCoordinator:
             self._publish_changed_locked()
         try:
             camera.abort()
-        except Exception as error:
+        except BaseException as error:
             translated = _camera_error(error, "abort exposure")
             with self._condition:
                 if (
@@ -373,7 +377,7 @@ class CameraCoordinator:
                 camera.abort()
             except CameraOperationCancelledError:
                 pass
-            except Exception as caught:
+            except BaseException as caught:
                 error = _camera_error(caught, "stop preview")
         if thread is not threading.current_thread():
             thread.join()
@@ -449,7 +453,7 @@ class CameraCoordinator:
                     stale_camera.abort()
                 except CameraNotConnectedError:
                     pass
-                except Exception as caught:
+                except BaseException as caught:
                     _append_error(
                         cleanup_errors,
                         _camera_error(
@@ -459,7 +463,7 @@ class CameraCoordinator:
                     )
                 try:
                     stale_camera.disconnect()
-                except Exception as caught:
+                except BaseException as caught:
                     _append_error(
                         cleanup_errors,
                         _camera_error(
@@ -509,7 +513,7 @@ class CameraCoordinator:
             try:
                 camera = self._factory(self._source)
                 camera.connect()
-            except Exception as caught:
+            except BaseException as caught:
                 error = _camera_error(caught, "connect camera")
             with self._condition:
                 current = (
@@ -536,7 +540,7 @@ class CameraCoordinator:
                 cleanup_errors: list[CameraError] = []
                 try:
                     camera.disconnect()
-                except Exception as cleanup_error:
+                except BaseException as cleanup_error:
                     _append_error(
                         cleanup_errors,
                         _camera_error(
@@ -562,14 +566,14 @@ class CameraCoordinator:
                     camera.abort()
                 except CameraNotConnectedError:
                     pass
-                except Exception as error:
+                except BaseException as error:
                     _append_error(
                         errors,
                         _camera_error(error, "abort before disconnect"),
                     )
                 try:
                     camera.disconnect()
-                except Exception as error:
+                except BaseException as error:
                     _append_error(
                         errors,
                         _camera_error(error, "disconnect camera"),
@@ -631,7 +635,7 @@ class CameraCoordinator:
                     return
             try:
                 camera.gain = settings.gain
-            except Exception as error:
+            except BaseException as error:
                 self._finish_exposure_error(
                     session,
                     camera,
@@ -652,7 +656,7 @@ class CameraCoordinator:
                     settings.readout_mode,
                     acquisition_control,
                 )
-            except Exception as error:
+            except BaseException as error:
                 self._finish_exposure_error(
                     session,
                     camera,
@@ -683,19 +687,28 @@ class CameraCoordinator:
         duration_s: float,
         settings: ExposureSettings,
     ) -> None:
-        with self._condition:
-            if not self._is_current_exposure_locked(session, camera):
-                return
-            disconnected = isinstance(error, CameraError) and _contains_not_connected(
-                error
-            )
-            self._state = CameraState.ERROR
-            self._error = _async_exposure_error(
+        try:
+            diagnostic = _async_exposure_error(
                 operation,
                 error,
                 duration_s,
                 settings,
             )
+            if not isinstance(diagnostic, CameraError):
+                diagnostic = _fallback_async_exposure_error(operation)
+        except BaseException:
+            diagnostic = _fallback_async_exposure_error(operation)
+        try:
+            disconnected = isinstance(error, CameraError) and _contains_not_connected(
+                safe_camera_error(error, operation)
+            )
+        except BaseException:
+            disconnected = False
+        with self._condition:
+            if not self._is_current_exposure_locked(session, camera):
+                return
+            self._state = CameraState.ERROR
+            self._error = diagnostic
             self._clear_formal_image_locked()
             if disconnected:
                 self._connected = False
@@ -727,7 +740,7 @@ class CameraCoordinator:
                             return
                         self._preview_frame = frame
                 callback(frame)
-        except Exception as error:
+        except BaseException as error:
             with self._condition:
                 if not self._is_current_preview_locked(session, camera):
                     return
@@ -894,20 +907,40 @@ class CameraCoordinator:
         return thread
 
 
-def _camera_error(error: Exception, operation: str) -> CameraError:
-    if isinstance(error, CameraError):
-        return error
-    return CameraError(f"{operation} failed: {error}")
+def _camera_error(error: BaseException, operation: str) -> CameraError:
+    return safe_camera_error(error, operation)
 
 
 def _async_exposure_error(
     operation: str,
-    error: Exception,
+    error: BaseException,
+    duration_s: float,
+    settings: ExposureSettings,
+) -> CameraError:
+    try:
+        return _build_async_exposure_error(
+            operation,
+            error,
+            duration_s,
+            settings,
+        )
+    except BaseException:
+        return _fallback_async_exposure_error(operation)
+
+
+def _build_async_exposure_error(
+    operation: str,
+    error: BaseException,
     duration_s: float,
     settings: ExposureSettings,
 ) -> CameraError:
     cause = _safe_async_cause(error)
-    error_text = str(error)
+    error_text = safe_exception_text(
+        error,
+        fallback="",
+        limit=_ASYNC_TEXT_SCAN_LIMIT,
+        reject_line_breaks=False,
+    )
     hresult = _safe_hresult(error_text)
     event = _safe_event(error_text)
 
@@ -960,15 +993,27 @@ def _async_exposure_error(
     fields.extend((f"summary={summary}", f"recovery={recovery}"))
     diagnostic = "; ".join(fields)
     if len(diagnostic) > _ASYNC_DIAGNOSTIC_LIMIT:
-        diagnostic = (
-            "AsyncExposureFailure; operation=acquire frame; "
-            "CameraState=Error(5); duration=bounded; "
-            "roi=(x=bounded,y=bounded,width=bounded,height=bounded); "
-            "binning=bounded; readout=bounded; gain=bounded; "
-            "cause=Exception; summary=unexpected camera backend failure; "
-            "recovery=Disconnect, reconnect the camera, then retry."
-        )
+        return _fallback_async_exposure_error(operation)
     return CameraError(diagnostic)
+
+
+def _fallback_async_exposure_error(operation: str) -> CameraError:
+    safe_operation = (
+        operation
+        if operation in {"stop preview", "apply gain", "acquire frame"}
+        else "camera operation"
+    )
+    return CameraError(
+        "AsyncExposureFailure; "
+        f"operation={safe_operation}; "
+        "CameraState=Error(5); "
+        "duration=bounded; "
+        "roi=(x=bounded,y=bounded,width=bounded,height=bounded); "
+        "binning=bounded; readout=bounded; gain=bounded; "
+        "cause=Exception; "
+        "summary=unexpected camera backend failure; "
+        "recovery=Disconnect, reconnect the camera, then retry."
+    )
 
 
 def _normalized_hex(value: str) -> str:
@@ -1001,20 +1046,8 @@ def _safe_event(error_text: str) -> str | None:
     return None
 
 
-def _safe_async_cause(error: Exception) -> str:
-    exact_causes = {
-        CameraNotConnectedError: "CameraNotConnectedError",
-        CameraTimeoutError: "CameraTimeoutError",
-        CameraOperationCancelledError: "CameraOperationCancelledError",
-        CameraBusyError: "CameraBusyError",
-        CameraInvalidValueError: "CameraInvalidValueError",
-        CameraCleanupError: "CameraCleanupError",
-        CameraError: "CameraError",
-        RuntimeError: "RuntimeError",
-        ValueError: "ValueError",
-        OSError: "OSError",
-    }
-    return exact_causes.get(type(error), "Exception")
+def _safe_async_cause(error: BaseException) -> str:
+    return safe_exception_identity(error)
 
 
 def _safe_duration(duration_s: float) -> str:
@@ -1033,22 +1066,33 @@ def _combined_error(message: str, errors: list[CameraError]) -> CameraError:
     return CameraCleanupError(message, tuple(errors))
 
 
-def _append_error(errors: list[CameraError], error: CameraError) -> None:
-    if isinstance(error, CameraCleanupError):
-        for nested in error.errors:
-            _append_error(errors, nested)
-    else:
-        errors.append(error)
+def _append_error(errors: list[CameraError], error: BaseException) -> None:
+    normalized = safe_camera_error(error, "camera cleanup")
+    try:
+        if isinstance(normalized, CameraCleanupError):
+            for nested in normalized.errors:
+                _append_error(errors, nested)
+            return
+    except BaseException:
+        errors.append(CameraError("camera cleanup failed"))
+        return
+    errors.append(normalized)
 
 
 def _unique_errors(errors: list[CameraError]) -> list[CameraError]:
     unique: list[CameraError] = []
-    seen: set[tuple[type[CameraError], str]] = set()
+    seen: set[tuple[str, str]] = set()
     for error in errors:
         flattened: list[CameraError] = []
         _append_error(flattened, error)
         for nested in flattened:
-            key = (type(nested), str(nested))
+            key = (
+                safe_exception_identity(nested),
+                safe_exception_text(
+                    nested,
+                    fallback="camera cleanup failed",
+                ),
+            )
             if key not in seen:
                 seen.add(key)
                 unique.append(nested)
@@ -1056,8 +1100,11 @@ def _unique_errors(errors: list[CameraError]) -> list[CameraError]:
 
 
 def _contains_not_connected(error: CameraError) -> bool:
-    if isinstance(error, CameraNotConnectedError):
-        return True
-    if isinstance(error, CameraCleanupError):
-        return any(_contains_not_connected(nested) for nested in error.errors)
+    try:
+        if isinstance(error, CameraNotConnectedError):
+            return True
+        if isinstance(error, CameraCleanupError):
+            return any(_contains_not_connected(nested) for nested in error.errors)
+    except BaseException:
+        return False
     return False

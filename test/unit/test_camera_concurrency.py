@@ -454,9 +454,20 @@ def test_stop_preview_waits_for_worker_and_preserves_abort_error(abort_error):
 
     snapshot = coordinator.snapshot()
     assert returned_early is False
-    assert result == [abort_error]
+    assert len(result) == 1
+    assert type(result[0]) is type(abort_error)
+    assert str(result[0]) == str(abort_error)
+    if isinstance(abort_error, CameraCleanupError):
+        translated_cleanup = result[0]
+        assert isinstance(translated_cleanup, CameraCleanupError)
+        assert tuple(type(error) for error in translated_cleanup.errors) == tuple(
+            type(error) for error in abort_error.errors
+        )
+        assert tuple(str(error) for error in translated_cleanup.errors) == tuple(
+            str(error) for error in abort_error.errors
+        )
     assert snapshot.camera_state == CameraState.ERROR
-    assert snapshot.error is abort_error
+    assert snapshot.error is result[0]
     assert snapshot.connected is not isinstance(abort_error, CameraNotConnectedError)
     assert camera.active == 0
 

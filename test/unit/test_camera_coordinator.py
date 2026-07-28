@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
+import touptek4040.camera_coordinator as camera_coordinator_module
 from touptek4040.camera_contract import (
     CameraCapabilities,
     ExposureSettings,
@@ -23,6 +24,26 @@ from touptek4040.errors import (
     CameraNotConnectedError,
     CameraOperationCancelledError,
 )
+
+
+class ThrowingTextCleanupError(CameraError):
+    def __str__(self):
+        raise RuntimeError("secondary cleanup string failure")
+
+
+class NonStringTextCleanupError(CameraError):
+    def __str__(self):
+        return object()
+
+
+class LongMultilineCleanupError(CameraError):
+    def __str__(self):
+        return "close failed\nSECRET\n" + "B" * 4000
+
+
+class ThrowingTextCleanupBaseError(BaseException):
+    def __str__(self):
+        raise RuntimeError("secondary cleanup base failure")
 
 
 def wait_until(predicate, timeout: float = 1.0) -> None:
@@ -548,6 +569,89 @@ def test_failed_owner_stays_quarantined_across_retries_until_cleanup_succeeds():
     assert factory_calls == ["controlled", "controlled"]
 
 
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        ThrowingTextCleanupError(),
+        NonStringTextCleanupError(),
+        LongMultilineCleanupError(),
+        ThrowingTextCleanupBaseError(),
+    ],
+    ids=("throwing-str", "non-string-str", "long-multiline", "base-exception"),
+)
+def test_pathological_cleanup_error_keeps_owner_quarantined_and_retryable(
+    cleanup_error,
+):
+    old_camera = ControlledCamera()
+    new_camera = ControlledCamera()
+    cameras = iter((old_camera, new_camera))
+    factory_calls = []
+    coordinator = CameraCoordinator(
+        lambda source: factory_calls.append(source) or next(cameras),
+        "controlled",
+    )
+    coordinator.set_connected_sync(True)
+    old_camera.gain_error = CameraNotConnectedError("gain lost camera")
+    old_camera.disconnect_error = cleanup_error
+
+    coordinator.start_exposure(0.1, True)
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+    coordinator.connect_async()
+    wait_until(lambda: coordinator.snapshot().connecting is False)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state is CameraState.ERROR
+    assert snapshot.error is not None
+    message = str(snapshot.error)
+    assert len(message) <= 700
+    assert "\n" not in message
+    assert "SECRET" not in message
+    assert "secondary" not in message
+    assert factory_calls == ["controlled"]
+
+    old_camera.disconnect_error = None
+    coordinator.set_connected_sync(True)
+
+    assert coordinator.snapshot().connected is True
+    assert factory_calls == ["controlled", "controlled"]
+
+
+def test_diagnostic_builder_failure_is_atomically_replaced_by_safe_fallback(
+    coordinator,
+    controlled_camera,
+    monkeypatch,
+):
+    def fail_diagnostic(*args, **kwargs):
+        del args, kwargs
+        raise ThrowingTextCleanupBaseError()
+
+    monkeypatch.setattr(
+        camera_coordinator_module,
+        "_async_exposure_error",
+        fail_diagnostic,
+    )
+    controlled_camera.failure = CameraError("sensor failed")
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    controlled_camera.release_frame()
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+    thread = coordinator._exposure_thread
+    assert thread is not None
+    thread.join(1.0)
+
+    snapshot = coordinator.snapshot()
+    assert thread.is_alive() is False
+    assert snapshot.error is not None
+    message = str(snapshot.error)
+    assert message.startswith("AsyncExposureFailure;")
+    assert "CameraState=Error(5)" in message
+    assert "summary=unexpected camera backend failure" in message
+    assert "recovery=Disconnect, reconnect the camera, then retry." in message
+    assert len(message) <= 700
+    assert "\n" not in message
+
+
 def test_exposure_requires_connection():
     coordinator = CameraCoordinator(lambda source: ControlledCamera(), "controlled")
 
@@ -640,7 +744,14 @@ def test_superseded_connect_cleanup_failure_is_reported_with_all_causes():
     assert snapshot.connected is False
     assert snapshot.camera_state == CameraState.ERROR
     assert isinstance(snapshot.error, CameraCleanupError)
-    assert snapshot.error.errors == (first, second)
+    assert tuple(type(error) for error in snapshot.error.errors) == (
+        CameraBusyError,
+        CameraNotConnectedError,
+    )
+    assert tuple(str(error) for error in snapshot.error.errors) == (
+        "close still busy",
+        "owner vanished during close",
+    )
 
 
 def test_superseded_disconnect_cleanup_failure_prevents_new_owner_success():
@@ -665,5 +776,12 @@ def test_superseded_disconnect_cleanup_failure_prevents_new_owner_success():
     assert snapshot.connected is False
     assert snapshot.camera_state == CameraState.ERROR
     assert isinstance(snapshot.error, CameraCleanupError)
-    assert snapshot.error.errors == (first, second)
+    assert tuple(type(error) for error in snapshot.error.errors) == (
+        CameraBusyError,
+        CameraError,
+    )
+    assert tuple(str(error) for error in snapshot.error.errors) == (
+        "abort cleanup failed",
+        "close cleanup failed",
+    )
     assert new_camera.connect_started.is_set() is False

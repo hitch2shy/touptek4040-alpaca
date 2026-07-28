@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from touptek4040.errors import (
+    CameraError,
     CameraNotConnectedError,
     CameraTimeoutError,
 )
@@ -33,6 +36,26 @@ def _failure_messages(client) -> list[str]:
         messages.append(response.json["ErrorMessage"])
     assert len(set(messages)) == 1
     return messages
+
+
+class ThrowingTextCameraError(CameraError):
+    def __str__(self):
+        raise RuntimeError("secondary string conversion failure")
+
+
+class NonStringTextCameraError(CameraError):
+    def __str__(self):
+        return 42
+
+
+class ThrowingTextBaseError(BaseException):
+    def __str__(self):
+        raise RuntimeError("secondary base-exception conversion failure")
+
+
+class LongMultilineCameraError(CameraError):
+    def __str__(self):
+        return "HRESULT 0x8001011F\nSECRET\n" + "A" * 4000
 
 
 def test_async_failure_is_exposed_by_image_and_state_queries_with_stable_code(
@@ -123,14 +146,13 @@ def test_async_diagnostic_bounds_and_allowlists_all_untrusted_metadata(
 ):
     untrusted_type = type("SecretCause" + "A" * 2000, (RuntimeError,), {})
     api_camera.failure = untrusted_type(
-        "A" * 2000
+        "HRESULT 0x8001011f USB transfer event 0x0083 "
+        + "A" * 2000
         + " event 0x"
         + "A" * 2000
         + " event 0xDEADBEEF"
         + " token 0xCAFEBABE"
         + " HRESULT 0x123456789"
-        + " HRESULT 0x8001011f"
-        + " USB transfer event 0x0083"
     )
 
     started = _put(client, "startexposure", Duration="0.5", Light="true")
@@ -152,6 +174,54 @@ def test_async_diagnostic_bounds_and_allowlists_all_untrusted_metadata(
         "0x123456789",
     ):
         assert untrusted not in message
+
+
+@pytest.mark.parametrize("failure_stage", ["gain", "acquire"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ThrowingTextCameraError(),
+        NonStringTextCameraError(),
+        ThrowingTextBaseError(),
+        LongMultilineCameraError(),
+    ],
+    ids=("throwing-str", "non-string-str", "base-exception", "long-multiline"),
+)
+def test_pathological_backend_exception_always_publishes_one_safe_failure(
+    client,
+    coordinator,
+    api_camera,
+    failure_stage,
+    failure,
+):
+    if failure_stage == "gain":
+        api_camera.gain_error = failure
+    else:
+        api_camera.failure = failure
+
+    started = _put(client, "startexposure", Duration="0.5", Light="true")
+
+    assert started.json["ErrorNumber"] == 0
+    if failure_stage == "acquire":
+        assert api_camera.acquisition_started.wait(1.0)
+        api_camera.release_acquisition.set()
+    _wait_until(lambda: coordinator.snapshot().camera_state == 5)
+    thread = coordinator._exposure_thread
+    assert thread is not None
+    thread.join(1.0)
+    assert thread.is_alive() is False
+
+    message = _failure_messages(client)[0]
+    assert message.startswith("AsyncExposureFailure;")
+    assert f"operation={'apply gain' if failure_stage == 'gain' else 'acquire frame'}" in message
+    assert "CameraState=Error(5)" in message
+    assert "cause=Exception" in message
+    assert "summary=" in message
+    assert "recovery=" in message
+    assert len(message) <= 700
+    assert "\n" not in message
+    assert "SECRET" not in message
+    assert "secondary" not in message
 
 
 def test_new_exposure_clears_previous_image_and_async_failure(

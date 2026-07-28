@@ -31,6 +31,8 @@ from .errors import (
     CameraNotSupportedError,
     CameraOperationCancelledError,
     CameraTimeoutError,
+    safe_camera_error,
+    safe_exception_text,
 )
 from .toupcam_loader import load_default_toupcam_module
 
@@ -136,7 +138,7 @@ class ToupTekCamera:
                 return
             try:
                 handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "connect camera") from error
             if handle is None:
                 raise CameraNotConnectedError(
@@ -166,7 +168,7 @@ class ToupTekCamera:
         if handle is not None:
             try:
                 handle.Close()
-            except Exception as error:
+            except BaseException as error:
                 close_error = _translate_sdk_error(error, "disconnect camera")
         with self._condition:
             if close_error is None and self._handle is handle:
@@ -247,7 +249,7 @@ class ToupTekCamera:
                     if not cancelled:
                         started_utc = datetime.now(timezone.utc)
                         handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
-                except Exception as error:
+                except BaseException as error:
                     operation_errors.append(_translate_sdk_error(error, "acquire frame"))
                 stop_error = self._stop_if_claimed_by_caller()
                 if stop_error is not None:
@@ -279,7 +281,7 @@ class ToupTekCamera:
                         readout_mode=readout_mode,
                         gain=applied.gain,
                     )
-                except Exception as error:
+                except BaseException as error:
                     completed = self._complete_error(generation, error)
                     if isinstance(completed, CameraOperationCancelledError):
                         raise completed from error
@@ -308,12 +310,12 @@ class ToupTekCamera:
         cleanup_errors: list[CameraError] = []
         try:
             handle.Trigger(0)
-        except Exception as error:
+        except BaseException as error:
             cleanup_errors.append(_translate_sdk_error(error, "cancel trigger"))
         stop_error: CameraError | None = None
         try:
             handle.Stop()
-        except Exception as error:
+        except BaseException as error:
             stop_error = _translate_sdk_error(error, "abort running camera")
             cleanup_errors.append(stop_error)
         finally:
@@ -330,7 +332,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 return handle.get_ExpoAGain()
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "read exposure gain") from error
 
     @gain.setter
@@ -345,7 +347,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 handle.put_ExpoAGain(value)
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "set exposure gain") from error
 
     def _claim_stop(self) -> tuple[bool, Any | None]:
@@ -375,7 +377,7 @@ class ToupTekCamera:
         error: CameraError | None = None
         try:
             handle.Stop()
-        except Exception as native_error:
+        except BaseException as native_error:
             error = _translate_sdk_error(native_error, "stop camera")
         finally:
             self._finish_stop(error)
@@ -467,7 +469,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 return handle.get_Temperature() / 10.0
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "read sensor temperature") from error
 
     @property
@@ -491,7 +493,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 handle.put_Temperature(deci_c)
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "set TEC target") from error
 
     @property
@@ -513,7 +515,7 @@ class ToupTekCamera:
                 current = handle.get_Option(current_option) / 10.0
                 maximum = handle.get_Option(maximum_option) / 10.0
                 return current, maximum
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, "read TEC voltage") from error
 
     @property
@@ -539,7 +541,7 @@ class ToupTekCamera:
             handle.put_Option(self._sdk.TOUPCAM_OPTION_TRIGGER, 1)
             width, height = handle.get_FinalSize()
             gain = handle.get_ExpoAGain()
-        except Exception as error:
+        except BaseException as error:
             raise _translate_sdk_error(error, "apply capture settings") from error
         if width <= 0 or height <= 0:
             raise CameraError(f"SDK returned invalid final size {width}x{height}")
@@ -620,7 +622,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 return handle.get_Option(option)
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, f"read option {name}") from error
 
     def _put_option(self, name: str, value: int, operation: str) -> None:
@@ -628,7 +630,7 @@ class ToupTekCamera:
         with self._native_lease() as handle:
             try:
                 handle.put_Option(option, value)
-            except Exception as error:
+            except BaseException as error:
                 raise _translate_sdk_error(error, operation) from error
 
 
@@ -637,13 +639,19 @@ def _allocate_buffer(settings: AppliedSettings) -> Any:
     return ctypes.create_string_buffer(byte_count)
 
 
-def _translate_sdk_error(error: Exception, operation: str) -> CameraError:
+def _translate_sdk_error(error: BaseException, operation: str) -> CameraError:
     if isinstance(error, CameraError):
-        return error
-    hr = getattr(error, "hr", None)
+        return safe_camera_error(error, operation)
+    try:
+        hr = getattr(error, "hr", None)
+    except BaseException:
+        hr = None
     if hr is None:
-        return CameraError(f"{operation} failed: {error}")
-    code = int(hr) & 0xFFFFFFFF
+        return safe_camera_error(error, operation)
+    try:
+        code = int(hr) & 0xFFFFFFFF
+    except BaseException:
+        return CameraError(f"{operation} failed")
     message = f"{operation} failed with HRESULT 0x{code:08X}"
     if code == 0x80070057:
         return CameraInvalidValueError(message)
@@ -700,7 +708,7 @@ def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:
 
 def _is_known_pixel_size_wrapper_error(error: ArgumentError) -> bool:
     """Match only the SDK 20250623 Python 3.13 second-argument annotation defect."""
-    message = str(error)
+    message = safe_exception_text(error, fallback="")
     return (
         sys.version_info[:2] == (3, 13)
         and "argument 2:" in message

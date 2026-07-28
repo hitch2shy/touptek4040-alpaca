@@ -16,6 +16,7 @@ from ..camera_contract import (
     Roi,
 )
 from ..camera_coordinator import CameraCoordinator, CameraState
+from ..errors import safe_exception_text
 from .common_api import _alpaca_bool
 from .request import get_parameter
 from .responses import (
@@ -101,7 +102,10 @@ class CameraApi:
             command in {"camerastate", "imageready", "percentcompleted"}
             and snapshot.error is not None
         ):
-            raise AlpacaError(_DRIVER_ERROR, str(snapshot.error))
+            raise AlpacaError(
+                _DRIVER_ERROR,
+                safe_exception_text(snapshot.error),
+            )
         if command == "camerastate":
             return int(snapshot.camera_state)
         if command == "imageready":

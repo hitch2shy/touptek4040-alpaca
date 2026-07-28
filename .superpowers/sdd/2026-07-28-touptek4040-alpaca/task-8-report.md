@@ -340,3 +340,70 @@ git diff --check
 
 No Minor review item, ledger, approved plan, or approved design file was
 modified.
+
+## Review fix round 3/5
+
+The remaining pathological exception-conversion finding was closed with
+focused RED/GREEN coverage.
+
+### Non-throwing exception conversion
+
+- Added shared exception-text, identity, and CameraError normalization helpers.
+  They accept BaseException, never call repr, catch failures from `__str__`,
+  reject non-string results, bound input to 512 characters before metadata
+  matching, and return a fixed single-line fallback for unsafe text.
+- Exception identity is selected only from an exact allow-list. Dynamic class
+  names are never read or reflected.
+- Coordinator exposure, preview, connection, disconnection, and cleanup
+  boundaries now catch BaseException and immediately normalize it.
+- ToupCam native translation and Alpaca response translation use the same safe
+  conversion rather than interpolating or stringifying backend exceptions
+  directly.
+
+### Atomic asynchronous failure publication
+
+- The exposure worker constructs the complete diagnostic before taking the
+  coordinator condition.
+- CameraState Error, the stored safe CameraError, cleared image state, and
+  disconnected ownership status are committed together under the condition.
+- The diagnostic builder itself is guarded. A forced BaseException from that
+  builder stores a fixed structured diagnostic instead of leaving Error with
+  no error object or terminating the worker.
+
+### Safe cleanup de-duplication
+
+- Cleanup flattening normalizes every nested throwable before storage.
+- De-duplication keys use allow-listed identity plus safe bounded text; they
+  never call a potentially hostile `str` implementation.
+- Throwing, non-string, BaseException, and long multiline cleanup errors all
+  keep the old owner quarantined. A later successful retry releases it and
+  only then opens the replacement owner.
+
+### RED/GREEN and verification
+
+Initial async RED result: `6 failed, 2 passed`. Throwing and non-string
+CameraError text left Error with no diagnostic; BaseException left the worker
+in Exposing. The long-text baseline cases already avoided raw reflection.
+
+Initial cleanup/atomic RED result: `5 failed`. Cleanup workers terminated
+during de-duplication or BaseException handling, multiline text exceeded the
+bound, and a forced diagnostic-builder failure left Error with no error.
+
+All new pathological cases passed after implementation: async/security
+`9 passed`; cleanup/atomic publication `5 passed`.
+
+Focused coordinator, ToupCam, async API, and response suites: `145 passed`.
+
+Complete test tree: `551 passed, 4 skipped`. The four existing hardware tests
+remain opt-in; `TOUPTEK_HARDWARE_TEST` was unset, so no hardware access was
+attempted.
+
+Compilation and whitespace checks both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+No unrelated review item, ledger, approved plan, or approved design file was
+modified.
