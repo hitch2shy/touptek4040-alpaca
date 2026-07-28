@@ -1,0 +1,5 @@
+pytest
+alpyca
+requests
+psutil
+PyInstaller

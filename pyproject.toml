@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "touptek4040"
+version = "0.1.0"
+description = "Alpaca camera service for the ToupTek 4040"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0,<3",
+    "falcon>=4,<5",
+    "waitress>=3,<4",
+]
+
+[tool.setuptools]
+packages = ["touptek4040"]

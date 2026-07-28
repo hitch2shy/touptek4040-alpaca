@@ -1,2 +1,10 @@
 .worktrees/
 .superpowers/
+.venv64/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+logs/
