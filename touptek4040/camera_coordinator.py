@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TypeVar
 
 from .camera_contract import (
     CameraCapabilities,
@@ -25,6 +26,8 @@ from .errors import (
     CameraOperationCancelledError,
 )
 from .event_broker import EventBroker
+
+_ResultT = TypeVar("_ResultT")
 
 
 class CameraState(IntEnum):
@@ -166,12 +169,21 @@ class CameraCoordinator:
                 raise self._error
             raise CameraBusyError("connection request was superseded")
 
-    def start_exposure(self, duration_s: float, light: bool) -> None:
+    def start_exposure(
+        self,
+        duration_s: float,
+        light: bool,
+        validate: Callable[[CameraCapabilities], None] | None = None,
+    ) -> None:
         duration = self._validated_duration(duration_s)
         del light  # The camera has no mechanical shutter.
+        if validate is not None and not callable(validate):
+            raise CameraInvalidValueError("exposure validator must be callable")
         with self._condition:
             camera = self._require_available_camera_locked()
             self._require_idle_locked()
+            if validate is not None:
+                validate(camera.capabilities)
             preview_thread = self._preview_thread
             had_preview = preview_thread is not None and preview_thread.is_alive()
             self._invalidate_preview_locked()
@@ -187,6 +199,31 @@ class CameraCoordinator:
             args=(session, camera, duration, preview_thread if had_preview else None),
             name=f"camera-exposure-{session}",
         )
+
+    def update_settings_if_idle(
+        self,
+        operation: Callable[[CameraCapabilities], _ResultT],
+    ) -> _ResultT:
+        """Run a short settings commit at the connected/idle linearization point."""
+
+        if not callable(operation):
+            raise CameraInvalidValueError("settings operation must be callable")
+        with self._condition:
+            camera = self._require_available_camera_locked()
+            self._require_idle_locked()
+            return operation(camera.capabilities)
+
+    def set_target_temperature_if_idle(self, value: float) -> None:
+        with self._condition:
+            camera = self._require_available_camera_locked()
+            self._require_idle_locked()
+            camera.target_temperature_c = value
+
+    def set_cooler_on_if_idle(self, enabled: bool) -> None:
+        with self._condition:
+            camera = self._require_available_camera_locked()
+            self._require_idle_locked()
+            camera.cooler_on = enabled
 
     def abort_exposure(self) -> None:
         with self._condition:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any
 
+from ..camera_contract import CameraCapabilities
 from ..camera_coordinator import CameraCoordinator, CameraState
 from .common_api import _alpaca_bool
 from .request import get_parameter
@@ -16,6 +18,7 @@ from .responses import (
     METHOD_NOT_IMPLEMENTED,
     VALUE_NOT_SET,
     AlpacaError,
+    RequestParseError,
 )
 
 _SENSOR_NAME = "sMAX16AM-U3-CL-GPS"
@@ -26,6 +29,10 @@ _EXPOSURE_MAX = 3600.0
 _EXPOSURE_RESOLUTION = 0.000001
 _TEMPERATURE_MIN = -50.0
 _TEMPERATURE_MAX = 40.0
+_ALPACA_FLOAT = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+    re.ASCII,
+)
 
 _UNSUPPORTED = frozenset(
     {
@@ -200,76 +207,84 @@ class CameraApi:
 
         self._require_connected()
         self._require_idle()
-        capabilities = self._coordinator.capabilities
         if command == "binx" or command == "biny":
-            value = _bounded_int(
-                get_parameter(request, command),
-                command,
-                1,
-                capabilities.max_bin,
-            )
-            with self._lock:
-                self._settings.binning = value
+            value = _strict_int(get_parameter(request, command), command)
+
+            def commit_binning(capabilities):
+                _require_int_range(value, command, 1, capabilities.max_bin)
+                with self._lock:
+                    self._settings.binning = value
+
+            self._coordinator.update_settings_if_idle(commit_binning)
             return
         if command == "startx":
-            value = _bounded_int(
-                get_parameter(request, "StartX"),
-                "StartX",
-                0,
-                capabilities.width - 1,
-            )
-            with self._lock:
-                self._settings.start_x = value
+            value = _strict_int(get_parameter(request, "StartX"), "StartX")
+
+            def commit_start_x(capabilities):
+                _require_int_range(value, "StartX", 0, capabilities.width - 1)
+                with self._lock:
+                    self._settings.start_x = value
+
+            self._coordinator.update_settings_if_idle(commit_start_x)
             return
         if command == "starty":
-            value = _bounded_int(
-                get_parameter(request, "StartY"),
-                "StartY",
-                0,
-                capabilities.height - 1,
-            )
-            with self._lock:
-                self._settings.start_y = value
+            value = _strict_int(get_parameter(request, "StartY"), "StartY")
+
+            def commit_start_y(capabilities):
+                _require_int_range(value, "StartY", 0, capabilities.height - 1)
+                with self._lock:
+                    self._settings.start_y = value
+
+            self._coordinator.update_settings_if_idle(commit_start_y)
             return
         if command == "numx":
-            value = _bounded_int(
-                get_parameter(request, "NumX"),
-                "NumX",
-                1,
-                capabilities.width,
-            )
-            with self._lock:
-                self._settings.num_x = value
+            value = _strict_int(get_parameter(request, "NumX"), "NumX")
+
+            def commit_num_x(capabilities):
+                _require_int_range(value, "NumX", 1, capabilities.width)
+                with self._lock:
+                    self._settings.num_x = value
+
+            self._coordinator.update_settings_if_idle(commit_num_x)
             return
         if command == "numy":
-            value = _bounded_int(
-                get_parameter(request, "NumY"),
-                "NumY",
-                1,
-                capabilities.height,
-            )
-            with self._lock:
-                self._settings.num_y = value
+            value = _strict_int(get_parameter(request, "NumY"), "NumY")
+
+            def commit_num_y(capabilities):
+                _require_int_range(value, "NumY", 1, capabilities.height)
+                with self._lock:
+                    self._settings.num_y = value
+
+            self._coordinator.update_settings_if_idle(commit_num_y)
             return
         if command == "gain":
-            value = _bounded_int(
-                get_parameter(request, "Gain"),
-                "Gain",
-                _GAIN_MIN,
-                _GAIN_MAX,
-            )
-            with self._lock:
-                self._settings.gain = value
+            value = _strict_int(get_parameter(request, "Gain"), "Gain")
+
+            def commit_gain(capabilities):
+                del capabilities
+                _require_int_range(value, "Gain", _GAIN_MIN, _GAIN_MAX)
+                with self._lock:
+                    self._settings.gain = value
+
+            self._coordinator.update_settings_if_idle(commit_gain)
             return
         if command == "readoutmode":
-            value = _bounded_int(
+            value = _strict_int(
                 get_parameter(request, "ReadoutMode"),
                 "ReadoutMode",
-                0,
-                len(capabilities.readout_modes) - 1,
             )
-            with self._lock:
-                self._settings.readout_mode = value
+
+            def commit_readout_mode(capabilities):
+                _require_int_range(
+                    value,
+                    "ReadoutMode",
+                    0,
+                    len(capabilities.readout_modes) - 1,
+                )
+                with self._lock:
+                    self._settings.readout_mode = value
+
+            self._coordinator.update_settings_if_idle(commit_readout_mode)
             return
         if command == "setccdtemperature":
             target = _strict_float(
@@ -281,14 +296,14 @@ class CameraApi:
                     INVALID_VALUE,
                     "SetCCDTemperature must be between -50.0 and 40.0",
                 )
-            self._coordinator.target_temperature_c = target
+            self._coordinator.set_target_temperature_if_idle(target)
             return
         if command == "cooleron":
             enabled = _alpaca_bool(
                 get_parameter(request, "CoolerOn"),
                 "CoolerOn",
             )
-            self._coordinator.cooler_on = enabled
+            self._coordinator.set_cooler_on_if_idle(enabled)
             return
         self._not_implemented(command)
 
@@ -320,11 +335,16 @@ class CameraApi:
                 INVALID_VALUE,
                 "Duration must quantize to between 12 and 3600000000 microseconds",
             )
-        self._validate_roi_combination()
-        self._coordinator.start_exposure(exposure_us / 1_000_000, light)
+        self._coordinator.start_exposure(
+            exposure_us / 1_000_000,
+            light,
+            validate=self._validate_roi_combination,
+        )
 
-    def _validate_roi_combination(self) -> None:
-        capabilities = self._coordinator.capabilities
+    def _validate_roi_combination(
+        self,
+        capabilities: CameraCapabilities,
+    ) -> None:
         with self._lock:
             settings = _CameraSettings(**vars(self._settings))
         checks = (
@@ -412,7 +432,7 @@ class CameraApi:
 
 def _strict_int(value: object, name: str) -> int:
     if isinstance(value, bool):
-        raise AlpacaError(INVALID_VALUE, f"{name} must be an integer")
+        raise RequestParseError(INVALID_VALUE, f"{name} must be an integer")
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -433,34 +453,40 @@ def _strict_int(value: object, name: str) -> int:
                 return int(stripped)
             except (ValueError, OverflowError):
                 pass
-    raise AlpacaError(INVALID_VALUE, f"{name} must be an integer")
+    raise RequestParseError(INVALID_VALUE, f"{name} must be an integer")
 
 
-def _bounded_int(
-    value: object,
+def _require_int_range(
+    parsed: int,
     name: str,
     minimum: int,
     maximum: int,
-) -> int:
-    parsed = _strict_int(value, name)
+) -> None:
     if not minimum <= parsed <= maximum:
         raise AlpacaError(
             INVALID_VALUE,
             f"{name} must be between {minimum} and {maximum}",
         )
-    return parsed
 
 
 def _strict_float(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        raise AlpacaError(INVALID_VALUE, f"{name} must be a finite number")
+        raise RequestParseError(INVALID_VALUE, f"{name} must be a finite number")
+    if isinstance(value, str) and _ALPACA_FLOAT.fullmatch(value) is None:
+        raise RequestParseError(
+            INVALID_VALUE,
+            f"{name} must be an ASCII Alpaca number",
+        )
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise AlpacaError(
+        raise RequestParseError(
             INVALID_VALUE,
             f"{name} must be a finite number",
         ) from error
     if not math.isfinite(parsed):
-        raise AlpacaError(INVALID_VALUE, f"{name} must be a finite number")
+        raise RequestParseError(
+            INVALID_VALUE,
+            f"{name} must be a finite number",
+        )
     return parsed

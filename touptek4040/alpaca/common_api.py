@@ -10,6 +10,7 @@ from .responses import (
     ACTION_NOT_IMPLEMENTED,
     METHOD_NOT_IMPLEMENTED,
     AlpacaError,
+    RequestParseError,
 )
 
 DEVICE_NAME = "ToupTek 4040 Alpaca Camera"
@@ -99,4 +100,4 @@ def _alpaca_bool(value: object, name: str) -> bool:
             return False
     from .responses import INVALID_VALUE
 
-    raise AlpacaError(INVALID_VALUE, f"{name} must be true or false")
+    raise RequestParseError(INVALID_VALUE, f"{name} must be true or false")

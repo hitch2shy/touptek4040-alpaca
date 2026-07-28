@@ -105,7 +105,7 @@ def test_connected_rejects_non_alpaca_boolean(bad_value, disconnected_client):
         "/api/v1/camera/0/connected",
         json={"Connected": bad_value},
     )
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.json["ErrorNumber"] == 0x401
 
 
@@ -120,3 +120,74 @@ def test_device_state_uses_coordinator_snapshot_and_connected_telemetry(client):
         "CoolerOn": False,
         "CoolerPower": 50.0,
     }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/telescope/0/connected",
+        "/api/v1/camera/1/connected",
+        "/api/v1/camera/not-a-number/connected",
+        "/api/v1/camera/-1/connected",
+        "/api/v1/camera/0/not-a-camera-command",
+        "/api/v2/camera/0/connected",
+        "/API/v1/camera/0/connected",
+        "/not-an-alpaca-path",
+    ],
+)
+def test_invalid_api_paths_return_stable_http_400(path, client):
+    response = client.simulate_get(path)
+    assert response.status_code == 400
+    assert response.content_type == "application/json"
+    assert response.json == {
+        "ErrorNumber": 0x401,
+        "ErrorMessage": "Invalid Alpaca API path",
+    }
+
+
+def test_malformed_json_is_http_400_without_parser_details(client):
+    response = client.simulate_put(
+        "/api/v1/camera/0/gain",
+        body='{"Gain": !!! native-parser-detail',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.content_type == "application/json"
+    assert response.json["ErrorNumber"] == 0x401
+    assert response.json["ErrorMessage"] == "Invalid request parameters"
+    assert "native-parser-detail" not in response.text
+
+
+def test_lexically_invalid_value_is_http_400_but_domain_range_is_http_200(client):
+    lexical = client.simulate_put(
+        "/api/v1/camera/0/gain",
+        json={"Gain": "bad"},
+    )
+    assert lexical.status_code == 400
+    assert lexical.json["ErrorNumber"] == 0x401
+
+    domain = client.simulate_put(
+        "/api/v1/camera/0/gain",
+        json={"Gain": "99"},
+    )
+    assert domain.status_code == 200
+    assert domain.json["ErrorNumber"] == 0x401
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "expected_error"),
+    [
+        ("ccdtemperature", "GET", 0x407),
+        ("pulseguide", "PUT", 0x400),
+        ("percentcompleted", "GET", 0x40B),
+    ],
+)
+def test_device_errors_remain_http_200(
+    command, method, expected_error, disconnected_client
+):
+    response = disconnected_client.simulate_request(
+        method=method,
+        path=f"/api/v1/camera/0/{command}",
+    )
+    assert response.status_code == 200
+    assert response.json["ErrorNumber"] == expected_error

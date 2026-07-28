@@ -5,14 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .responses import INVALID_VALUE, AlpacaError
+from .responses import INVALID_VALUE, AlpacaError, RequestParseError
 
 _UINT32_MAX = 0xFFFFFFFF
 _MISSING = object()
 
 
-def _invalid_parameters(cause: Exception) -> AlpacaError:
-    return AlpacaError(INVALID_VALUE, f"Invalid request parameters: {cause}")
+def _invalid_parameters(cause: Exception) -> RequestParseError:
+    del cause
+    return RequestParseError(INVALID_VALUE, "Invalid request parameters")
 
 
 def _casefolded_fields(value: Any, source: str) -> dict[str, Any]:
@@ -60,7 +61,10 @@ def get_parameter(
 
     if value is _MISSING:
         if required:
-            raise AlpacaError(INVALID_VALUE, f"Missing required parameter: {name}")
+            raise RequestParseError(
+                INVALID_VALUE,
+                f"Missing required parameter: {name}",
+            )
         return None
     return value
 
@@ -96,7 +100,7 @@ def client_transaction_id(request: Any) -> int:
         transaction_id = 0
 
     if not 1 <= transaction_id <= _UINT32_MAX:
-        raise AlpacaError(
+        raise RequestParseError(
             INVALID_VALUE,
             "ClientTransactionID must be an integer from 1 through 4294967295",
         )

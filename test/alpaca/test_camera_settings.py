@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import threading
 
 import pytest
 
@@ -34,10 +35,24 @@ def test_writing_either_bin_axis_synchronizes_both(command, binning, client):
     assert get_value(client, "biny") == binning
 
 
-@pytest.mark.parametrize("bad_value", [0, 9, -1, 1.5, "1.0", True, "", None])
-def test_binning_rejects_invalid_values_without_changing_state(bad_value, client):
+@pytest.mark.parametrize(
+    ("bad_value", "status_code"),
+    [
+        (0, 200),
+        (9, 200),
+        (-1, 200),
+        (1.5, 400),
+        ("1.0", 400),
+        (True, 400),
+        ("", 400),
+        (None, 400),
+    ],
+)
+def test_binning_rejects_invalid_values_without_changing_state(
+    bad_value, status_code, client
+):
     response = put_value(client, "binx", "BinX", bad_value)
-    assert response.status_code == 200
+    assert response.status_code == status_code
     assert response.json["ErrorNumber"] == INVALID_VALUE
     assert get_value(client, "binx") == 1
     assert get_value(client, "biny") == 1
@@ -92,10 +107,22 @@ def test_readout_mode_updates_maxadu_immediately(client):
     assert get_value(client, "maxadu") == 255
 
 
-@pytest.mark.parametrize("bad_value", [-1, 2, 1.5, "RAW 8-bit", True, None])
-def test_readout_mode_rejects_invalid_enum_values(bad_value, client):
+@pytest.mark.parametrize(
+    ("bad_value", "status_code"),
+    [
+        (-1, 200),
+        (2, 200),
+        (1.5, 400),
+        ("RAW 8-bit", 400),
+        (True, 400),
+        (None, 400),
+    ],
+)
+def test_readout_mode_rejects_invalid_enum_values(
+    bad_value, status_code, client
+):
     response = put_value(client, "readoutmode", "ReadoutMode", bad_value)
-    assert response.status_code == 200
+    assert response.status_code == status_code
     assert response.json["ErrorNumber"] == INVALID_VALUE
 
 
@@ -114,13 +141,158 @@ def test_temperature_and_cooler_round_trip_through_coordinator(client, api_camer
     assert get_value(client, "coolerpower") == 50.0
 
 
-@pytest.mark.parametrize("bad_target", [-50.1, 40.1, "nan", "inf", True, None])
-def test_temperature_target_rejects_invalid_values(bad_target, client):
+@pytest.mark.parametrize(
+    ("bad_target", "status_code"),
+    [
+        (-50.1, 200),
+        (40.1, 200),
+        ("nan", 400),
+        ("inf", 400),
+        (True, 400),
+        (None, 400),
+    ],
+)
+def test_temperature_target_rejects_invalid_values(
+    bad_target, status_code, client
+):
     response = put_value(
         client, "setccdtemperature", "SetCCDTemperature", bad_target
     )
-    assert response.status_code == 200
+    assert response.status_code == status_code
     assert response.json["ErrorNumber"] == INVALID_VALUE
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "1_0",
+        "１２.５",
+        "١٢.٥",
+        "NaN",
+        "Inf",
+        "-Infinity",
+        "1.2 trailing",
+        "0x10",
+    ],
+)
+@pytest.mark.parametrize(
+    ("command", "parameter"),
+    [
+        ("setccdtemperature", "SetCCDTemperature"),
+        ("startexposure", "Duration"),
+    ],
+)
+def test_float_parameters_reject_non_ascii_or_non_alpaca_lexemes_without_side_effects(
+    command, parameter, bad_value, client, coordinator, api_camera
+):
+    before_target = api_camera.target_temperature_c
+    response = client.simulate_put(
+        f"/api/v1/camera/0/{command}",
+        json={parameter: bad_value, "Light": "true"},
+    )
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == INVALID_VALUE
+    assert api_camera.target_temperature_c == before_target
+    assert coordinator.snapshot().camera_state == 0
+    assert coordinator.frame is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("+1", 1.0),
+        ("-1.25", -1.25),
+        (".5", 0.5),
+        ("1.", 1.0),
+        ("1e1", 10.0),
+        ("-2.5E+1", -25.0),
+    ],
+)
+def test_temperature_accepts_ascii_alpaca_float_lexemes(
+    value, expected, client, api_camera
+):
+    response = put_value(
+        client,
+        "setccdtemperature",
+        "SetCCDTemperature",
+        value,
+    )
+    assert response.status_code == 200
+    assert response.json["ErrorNumber"] == 0
+    assert api_camera.target_temperature_c == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "parameter", "new_value", "get_command", "initial_value"),
+    [
+        ("binx", "BinX", "2", "binx", 1),
+        ("startx", "StartX", "2", "startx", 0),
+        ("gain", "Gain", "200", "gain", 100),
+        ("readoutmode", "ReadoutMode", "1", "readoutmode", 0),
+        (
+            "setccdtemperature",
+            "SetCCDTemperature",
+            "-20",
+            "setccdtemperature",
+            -10.0,
+        ),
+        ("cooleron", "CoolerOn", "true", "cooleron", False),
+    ],
+)
+def test_setting_commit_is_atomic_with_exposure_start(
+    command,
+    parameter,
+    new_value,
+    get_command,
+    initial_value,
+    client,
+    coordinator,
+    api_camera,
+    monkeypatch,
+):
+    from touptek4040.alpaca.camera_api import CameraApi
+
+    idle_checked = threading.Event()
+    allow_put_to_continue = threading.Event()
+    response_holder = {}
+    original_require_idle = CameraApi._require_idle
+
+    def pause_after_idle_check(api):
+        original_require_idle(api)
+        if threading.current_thread().name == "setting-put":
+            idle_checked.set()
+            assert allow_put_to_continue.wait(timeout=2)
+
+    monkeypatch.setattr(CameraApi, "_require_idle", pause_after_idle_check)
+    api_camera.release_acquisition.clear()
+
+    def write_setting():
+        response_holder["response"] = put_value(
+            client,
+            command,
+            parameter,
+            new_value,
+        )
+
+    writer = threading.Thread(target=write_setting, name="setting-put")
+    writer.start()
+    try:
+        assert idle_checked.wait(timeout=1)
+        coordinator.start_exposure(0.001, True)
+        assert api_camera.acquisition_started.wait(timeout=1)
+        allow_put_to_continue.set()
+        writer.join(timeout=2)
+        assert not writer.is_alive(), "setting PUT deadlocked with exposure start"
+
+        response = response_holder["response"]
+        assert response.status_code == 200
+        assert response.json["ErrorNumber"] == INVALID_OPERATION
+        assert get_value(client, get_command) == initial_value
+    finally:
+        allow_put_to_continue.set()
+        if coordinator.snapshot().camera_state == 2:
+            coordinator.abort_exposure()
+        writer.join(timeout=2)
 
 
 def test_snapshot_properties_and_last_exposure_metadata(client, coordinator):
@@ -171,7 +343,7 @@ def test_start_exposure_validates_parameters_without_native_exceptions(client):
         "/api/v1/camera/0/startexposure",
         json={"Duration": "not-a-number", "Light": "true"},
     )
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.json["ErrorNumber"] == INVALID_VALUE
 
 

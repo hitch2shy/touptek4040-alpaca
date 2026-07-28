@@ -26,6 +26,7 @@ from .responses import (
     NOT_CONNECTED,
     OPERATION_CANCELLED,
     AlpacaError,
+    RequestParseError,
     ServerTransactionIdAllocator,
     method_response,
     property_response,
@@ -58,6 +59,7 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
                 resource,
             )
         resource.add(spec)
+    app.add_sink(_invalid_path)
     return app
 
 
@@ -117,6 +119,8 @@ class _EndpointResource:
 
 
 def _translate_error(error: Exception) -> tuple[AlpacaError, str]:
+    if isinstance(error, RequestParseError):
+        return error, falcon.HTTP_400
     if isinstance(error, AlpacaError):
         return error, falcon.HTTP_200
     if isinstance(error, CameraInvalidValueError):
@@ -159,3 +163,16 @@ def _request_client_id(request: falcon.Request) -> int:
         query_only = SimpleNamespace(method="GET", params=request.params)
         return client_transaction_id(query_only)
     return client_transaction_id(request)
+
+
+def _invalid_path(
+    request: falcon.Request,
+    response: falcon.Response,
+) -> None:
+    del request
+    response.status = falcon.HTTP_400
+    response.content_type = falcon.MEDIA_JSON
+    response.media = {
+        "ErrorNumber": INVALID_VALUE,
+        "ErrorMessage": "Invalid Alpaca API path",
+    }

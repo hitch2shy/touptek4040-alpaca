@@ -25,6 +25,10 @@ class AlpacaError(Exception):
         super().__init__(message)
 
 
+class RequestParseError(AlpacaError):
+    """An HTTP request could not be parsed into a valid Alpaca value."""
+
+
 class ServerTransactionIdAllocator:
     """Allocate non-zero uint32 server transaction IDs safely across threads."""
 
