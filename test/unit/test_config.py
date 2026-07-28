@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from touptek4040.config import load_config
 
 
@@ -36,3 +38,16 @@ def test_explicit_overrides_win_while_missing_values_stay_from_ini(tmp_path: Pat
     assert cfg.camera.source == "simulator"
     assert cfg.camera.readout_mode == "RAW 8-bit"
     assert cfg.web.enabled is False
+
+
+def test_invalid_readout_mode_in_ini_is_rejected(tmp_path: Path):
+    config_path = tmp_path / "camera.ini"
+    config_path.write_text("[camera]\nreadout_mode = RAW 10-bit\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="readout_mode must be one of"):
+        load_config(config_path, {})
+
+
+def test_invalid_readout_mode_override_is_rejected():
+    with pytest.raises(ValueError, match="readout_mode must be one of"):
+        load_config(None, {"camera.readout_mode": "RAW 10-bit"})

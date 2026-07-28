@@ -68,8 +68,8 @@ def load_config(path: Path | None, overrides: Mapping[str, object]) -> AppConfig
     camera = CameraConfig(
         source=_value(parser, overrides, "camera", "source", CameraConfig.source),
         serial=_optional(_value(parser, overrides, "camera", "serial", CameraConfig.serial)),
-        readout_mode=_value(
-            parser, overrides, "camera", "readout_mode", CameraConfig.readout_mode
+        readout_mode=_readout_mode(
+            _value(parser, overrides, "camera", "readout_mode", CameraConfig.readout_mode)
         ),
         gain=_optional_int(_value(parser, overrides, "camera", "gain", CameraConfig.gain)),
     )
@@ -106,6 +106,14 @@ def _optional(value: object) -> str | None:
 
 def _optional_int(value: object) -> int | None:
     return None if value is None or value == "" else int(value)
+
+
+def _readout_mode(value: object) -> str:
+    mode = str(value)
+    allowed_modes = {"RAW 12-bit", "RAW 8-bit"}
+    if mode not in allowed_modes:
+        raise ValueError(f"readout_mode must be one of {sorted(allowed_modes)}; got {mode!r}")
+    return mode
 
 
 def _as_bool(value: object) -> bool:
