@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import time
+import struct
 
 import pytest
 
+from touptek4040.camera_coordinator import CameraState
 from touptek4040.errors import (
     CameraError,
     CameraNotConnectedError,
@@ -253,6 +255,36 @@ def test_new_exposure_clears_previous_image_and_async_failure(
     assert api_camera.acquisition_started.wait(1.0)
     api_camera.release_acquisition.set()
     _wait_until(lambda: coordinator.snapshot().image_ready)
+
+
+def test_invalid_raw12_publication_has_stable_json_and_imagebytes_driver_error(
+    client,
+    coordinator,
+    api_camera,
+):
+    for command, value in (("numx", 16), ("numy", 16)):
+        response = _put(client, command, **{command: value})
+        assert response.json["ErrorNumber"] == 0
+    api_camera.pixel_value = 4096
+
+    started = _put(client, "startexposure", Duration="0.1", Light="true")
+
+    assert started.json["ErrorNumber"] == 0
+    _wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+    diagnostic = _failure_messages(client)[0]
+    assert "operation=publish frame" in diagnostic
+    assert coordinator.image_generation is None
+
+    json_image = _get(client, "imagearray")
+    assert json_image.json["ErrorNumber"] == 0x500
+    assert json_image.json["ErrorMessage"] == diagnostic
+
+    imagebytes = client.simulate_get(
+        "/api/v1/camera/0/imagearray",
+        headers={"Accept": "application/imagebytes"},
+    )
+    assert struct.unpack_from("<i", imagebytes.content, 4)[0] == 0x500
+    assert imagebytes.content[44:].decode("utf-8") == diagnostic
 
 
 def test_device_state_contains_only_official_camera_operational_fields(client):

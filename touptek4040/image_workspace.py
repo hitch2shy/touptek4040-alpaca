@@ -95,6 +95,12 @@ class ImageWorkspace:
             raise ValueError(
                 "frame pixels must use the unsigned dtype for the readout mode"
             )
+        if (
+            frame.readout_mode is ReadoutMode.RAW12
+            and normalized.size
+            and int(normalized.max()) > 4095
+        ):
+            raise ValueError("RAW12 pixels must be between 0 and 4095")
 
         immutable_storage = normalized.tobytes(order="C")
         pixels = np.frombuffer(immutable_storage, dtype=expected_dtype).reshape(

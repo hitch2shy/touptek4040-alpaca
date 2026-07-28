@@ -60,6 +60,7 @@ class SequencedCamera:
         self.disconnect_release.set()
         self.reuse_buffer = False
         self._reused_pixels = np.zeros((4, 4), dtype=np.uint16)
+        self.pixel_value_override: int | None = None
 
     def connect(self) -> None:
         self.connected = True
@@ -102,12 +103,21 @@ class SequencedCamera:
             self._condition.notify_all()
         if self.failure is not None:
             raise self.failure
+        pixel_value = (
+            sequence
+            if self.pixel_value_override is None
+            else self.pixel_value_override
+        )
         if self.reuse_buffer:
             assert self._reused_pixels.shape == (roi.height, roi.width)
-            self._reused_pixels.fill(sequence)
+            self._reused_pixels.fill(pixel_value)
             pixels = self._reused_pixels
         else:
-            pixels = np.full((roi.height, roi.width), sequence, dtype=np.uint16)
+            pixels = np.full(
+                (roi.height, roi.width),
+                pixel_value,
+                dtype=np.uint16,
+            )
         return Frame(
             pixels=pixels,
             started_utc=datetime.now(timezone.utc),
@@ -319,6 +329,31 @@ def test_preview_failure_clears_the_last_published_preview():
 
     assert coordinator.preview_frame is None
     assert coordinator.preview_generation is None
+
+
+def test_invalid_raw12_preview_does_not_replace_or_mutate_formal_generation():
+    camera = SequencedCamera()
+    camera.reuse_buffer = True
+    coordinator = connected_coordinator(camera)
+    coordinator.start_exposure(0.1, True)
+    camera.wait_for_count(1)
+    camera.release()
+    wait_until(lambda: coordinator.snapshot().image_ready)
+    formal = coordinator.image_generation
+    assert formal is not None
+
+    callback_called = threading.Event()
+    camera.pixel_value_override = 4096
+    coordinator.start_preview(lambda frame: callback_called.set())
+    camera.wait_for_count(2)
+    camera.release()
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+
+    assert callback_called.is_set() is False
+    assert coordinator.preview_frame is None
+    assert coordinator.preview_generation is None
+    assert coordinator.image_generation is formal
+    assert int(formal.pixels[0, 0]) == 1
 
 
 def test_new_preview_starts_with_an_empty_preview_slot():

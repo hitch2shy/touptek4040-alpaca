@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+import tracemalloc
 
 import numpy as np
 import pytest
 
 from test.fixtures.reference_pixels import reference_frame
+from touptek4040.camera_contract import ReadoutMode, Roi
 from touptek4040.image_workspace import ImageWorkspace
 
 
@@ -81,3 +83,81 @@ def test_publish_rejects_frames_that_cannot_be_scientific_image_generations(
 
     with pytest.raises(ValueError, match=message):
         ImageWorkspace().publish(frame)
+
+
+def test_raw12_maximum_4095_is_valid_for_formal_and_preview_generations():
+    frame = replace(
+        reference_frame(),
+        pixels=np.full((2, 3), 4095, dtype=np.uint16),
+    )
+    workspace = ImageWorkspace()
+
+    formal = workspace.publish(frame)
+    preview = workspace.publish_preview(frame)
+
+    assert int(formal.pixels.max()) == 4095
+    assert int(preview.pixels.max()) == 4095
+    assert workspace.current() is formal
+    assert workspace.current_preview() is preview
+
+
+@pytest.mark.parametrize("invalid_value", [4096, 65535])
+@pytest.mark.parametrize("slot", ["formal", "preview"])
+def test_invalid_raw12_range_is_atomically_rejected_before_slot_replacement(
+    invalid_value,
+    slot,
+):
+    workspace = ImageWorkspace()
+    prior_formal = workspace.publish(reference_frame())
+    prior_preview = workspace.publish_preview(reference_frame())
+    invalid = replace(
+        reference_frame(),
+        pixels=np.full((2, 3), invalid_value, dtype=np.uint16),
+    )
+
+    publisher = (
+        workspace.publish if slot == "formal" else workspace.publish_preview
+    )
+    with pytest.raises(ValueError, match="RAW12 pixels must be between 0 and 4095"):
+        publisher(invalid)
+
+    assert workspace.current() is prior_formal
+    assert workspace.current_preview() is prior_preview
+
+
+def test_raw8_255_remains_valid_and_256_is_atomically_rejected():
+    workspace = ImageWorkspace()
+    maximum = replace(
+        reference_frame(readout_mode=ReadoutMode.RAW8),
+        pixels=np.full((2, 3), 255, dtype=np.uint8),
+    )
+    valid = workspace.publish(maximum)
+    invalid = replace(
+        maximum,
+        pixels=np.full((2, 3), 256, dtype=np.uint16),
+    )
+
+    with pytest.raises(ValueError, match="unsigned dtype"):
+        workspace.publish(invalid)
+
+    assert workspace.current() is valid
+    assert int(valid.pixels.max()) == 255
+
+
+def test_full_raw12_range_scan_does_not_allocate_a_frame_sized_boolean_array():
+    frame = replace(
+        reference_frame(),
+        pixels=np.full((4096, 4096), 4095, dtype=np.uint16),
+        roi=Roi(0, 0, 4096, 4096),
+    )
+    workspace = ImageWorkspace()
+
+    tracemalloc.start()
+    try:
+        generation = workspace.publish(frame)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert generation.pixels.nbytes == 4096 * 4096 * 2
+    assert peak < 40 * 1024 * 1024

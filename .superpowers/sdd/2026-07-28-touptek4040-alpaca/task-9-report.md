@@ -180,3 +180,78 @@ Fix commit subject:
 Fix commit reference: `HEAD`. The exact immutable hash is recorded in the
 Task 9 round-1 handoff after commit because a Git commit cannot contain its own
 final hash without changing that hash.
+
+## Review fix round 2/5
+
+The RAW12 scientific-range regression was closed without changing content
+negotiation or any other deferred review item.
+
+### RED evidence
+
+The focused boundary set initially produced `7 failed, 10 passed`:
+
+- formal and preview workspace publication accepted 4096 and 65535 in all
+  four slot/value combinations;
+- a formal exposure containing 4096 completed successfully instead of
+  atomically entering Error through the Task 8 asynchronous-failure path;
+- an invalid preview containing 4096 reached preview publication instead of
+  terminating the preview and preserving the formal generation;
+- JSON and ImageBytes did not receive the required stable publication-failure
+  `0x500` diagnostic.
+
+The passing baseline cases established that 4095 already streamed consistently
+through JSON, ImageBytes, and FITS, RAW8 255 remained valid, RAW8 256 remained
+rejected, and a 4096 by 4096 validation probe stayed within its memory limit.
+
+### Range validation and publication semantics
+
+- `ImageWorkspace` now completes RAW12 dtype and range validation before
+  immutable storage, generation ID allocation, or either slot update.
+- UInt16 guarantees non-negative values; one NumPy scalar `max()` verifies the
+  remaining upper bound without allocating a frame-sized Boolean array.
+- 4095 is inclusive. 4096 and 65535 raise a stable range error.
+- Failed direct formal or preview publication leaves the prior slot identity
+  unchanged.
+- A failed formal exposure publication follows the existing Task 8
+  publication-error boundary. CameraState, stored error, cleared formal slot,
+  and ImageReady false are committed atomically; state and both image
+  transports return the same bounded driver diagnostic as `0x500`.
+- A failed preview publication clears preview state and enters preview error
+  handling without replacing or mutating the existing formal generation.
+- Every successful generation is now guaranteed safe for the JSON 0 through
+  4095 ASCII table, UInt16 ImageBytes payload, and unsigned-16 FITS conversion.
+- RAW8 normalization and its inclusive 0 through 255 range are unchanged.
+
+### Memory verification
+
+A full 4096 by 4096 RAW12 array filled with 4095 is published while
+`tracemalloc` is active. The immutable science copy is 32 MiB and total traced
+peak must remain below 40 MiB. This catches an implementation that creates a
+16 MiB frame-sized comparison mask while allowing the one required immutable
+copy. The scalar maximum implementation passes this bound.
+
+### Round-2 verification
+
+Focused workspace, coordinator, preview, async API, JSON, ImageBytes, and FITS
+set: `103 passed`.
+
+Complete test tree: `593 passed, 4 skipped`. The four skips remain the existing
+hardware opt-in tests; `TOUPTEK_HARDWARE_TEST` was unset and no hardware access
+was attempted.
+
+Compilation and whitespace validation both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+No Accept quality Minor, ledger, approved plan, or approved design file was
+modified.
+
+Round-2 fix commit subject:
+
+`fix: reject out-of-range RAW12 generations`
+
+Round-2 commit reference: `HEAD`; its exact immutable hash is recorded in the
+handoff after commit.

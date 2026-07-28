@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import tracemalloc
 from collections.abc import Callable, Iterable
@@ -83,6 +84,24 @@ def test_raw8_fits_preserves_the_same_scientific_pixel_values():
     assert cards["READOUT"] == "'RAW 8-bit'"
     stored = struct.unpack(">6h", data[:12])
     assert [value + 32768 for value in stored] == [1, 2, 3, 10, 20, 30]
+
+
+def test_all_success_streams_preserve_the_raw12_maximum_4095():
+    frame = reference_frame()
+    frame.pixels[:] = 4095
+    generation = ImageWorkspace().publish(frame)
+    transactions = ImageTransactions(7, 9)
+
+    json_body = json.loads(b"".join(stream_image_json(generation, transactions)))
+    assert json_body["Value"] == [[4095, 4095]] * 3
+
+    imagebytes = b"".join(stream_imagebytes(generation, transactions))
+    assert struct.unpack("<6H", imagebytes[44:]) == (4095,) * 6
+
+    fits = b"".join(stream_fits(generation))
+    _, data = _split_fits(fits)
+    stored = struct.unpack(">6h", data[:12])
+    assert [value + 32768 for value in stored] == [4095] * 6
 
 
 def test_full_frame_streams_do_not_materialize_a_transpose_or_python_pixel_list():

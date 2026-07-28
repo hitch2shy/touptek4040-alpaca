@@ -101,6 +101,7 @@ class ControlledCamera:
             tuple[float, Roi, int, ReadoutMode, int]
         ] = []
         self.requested_durations: list[float] = []
+        self.pixel_value_override: int | None = None
 
     def connect(self) -> None:
         self.connect_started.set()
@@ -158,7 +159,12 @@ class ControlledCamera:
             self._acquisition_condition.notify_all()
         if self.failure is not None:
             raise self.failure
-        pixels = np.full((roi.height, roi.width), sequence, dtype=np.uint16)
+        pixel_value = (
+            sequence
+            if self.pixel_value_override is None
+            else self.pixel_value_override
+        )
+        pixels = np.full((roi.height, roi.width), pixel_value, dtype=np.uint16)
         return Frame(
             pixels=pixels,
             started_utc=datetime.now(timezone.utc),
@@ -445,6 +451,36 @@ def test_async_acquisition_failure_enters_error_without_image(
     assert isinstance(snapshot.error, CameraError)
     assert "summary=unexpected camera backend failure" in str(snapshot.error)
     assert "sensor transfer failed" not in str(snapshot.error)
+
+
+def test_invalid_raw12_publication_atomically_enters_error_without_replacement(
+    coordinator,
+    controlled_camera,
+):
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    controlled_camera.release_frame()
+    wait_until(lambda: coordinator.snapshot().image_ready)
+    prior = coordinator.image_generation
+    assert prior is not None
+
+    controlled_camera.pixel_value_override = 4096
+    coordinator.start_exposure(0.1, True)
+    assert coordinator.image_generation is None
+    controlled_camera.wait_for_acquisitions(2)
+    controlled_camera.release_frame()
+    wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
+
+    snapshot = coordinator.snapshot()
+    result = coordinator.formal_image_read()
+    assert snapshot.image_ready is False
+    assert result.connected is True
+    assert result.image_ready is False
+    assert result.generation is None
+    assert result.error is snapshot.error
+    assert snapshot.error is not None
+    assert "operation=publish frame" in str(snapshot.error)
+    assert int(prior.pixels[0, 0]) == 1
 
 
 @pytest.mark.parametrize("failure_stage", ["gain", "acquire"])

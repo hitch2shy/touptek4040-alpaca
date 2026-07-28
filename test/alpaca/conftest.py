@@ -37,6 +37,7 @@ class ApiCamera:
         self.acquisition_started = threading.Event()
         self.release_acquisition = threading.Event()
         self.release_acquisition.set()
+        self.pixel_value = 0
         self.capabilities = CameraCapabilities(
             width=4096,
             height=4096,
@@ -79,8 +80,9 @@ class ApiCamera:
         if self.failure is not None:
             raise self.failure
         return Frame(
-            np.zeros(
+            np.full(
                 (roi.height, roi.width),
+                self.pixel_value,
                 dtype=np.uint16 if readout_mode is ReadoutMode.RAW12 else np.uint8,
             ),
             datetime(2026, 7, 28, 12, 34, 56, tzinfo=timezone.utc),
