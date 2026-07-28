@@ -27,6 +27,8 @@ class SimCamera(CameraContract):
     def __init__(self, serial: str) -> None:
         self.serial = serial
         self._connected = True
+        self._target_temperature_c = 0.0
+        self._cooler_on = False
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -50,6 +52,42 @@ class SimCamera(CameraContract):
     def abort(self) -> None:
         self._require_connected()
 
+    @property
+    def temperature_c(self) -> float:
+        self._require_connected()
+        return 20.0
+
+    @property
+    def target_temperature_c(self) -> float:
+        self._require_connected()
+        return self._target_temperature_c
+
+    @target_temperature_c.setter
+    def target_temperature_c(self, value: float) -> None:
+        self._require_connected()
+        self._target_temperature_c = float(value)
+
+    @property
+    def cooler_on(self) -> bool:
+        self._require_connected()
+        return self._cooler_on
+
+    @cooler_on.setter
+    def cooler_on(self, enabled: bool) -> None:
+        self._require_connected()
+        if not isinstance(enabled, bool):
+            raise CameraInvalidValueError("cooler state must be boolean")
+        self._cooler_on = enabled
+
+    def tec_voltage(self) -> tuple[float, float]:
+        self._require_connected()
+        return (6.0 if self._cooler_on else 0.0, 6.0)
+
+    @property
+    def cooler_power_percent(self) -> float:
+        current, maximum = self.tec_voltage()
+        return current * 100.0 / maximum
+
     def _require_connected(self) -> None:
         if not self._connected:
             raise CameraNotConnectedError("camera is not connected")
@@ -67,20 +105,26 @@ class SimCamera(CameraContract):
             raise CameraInvalidValueError("ROI dimensions must be positive")
         if roi.x < 0 or roi.y < 0:
             raise CameraInvalidValueError("ROI origin must be non-negative")
-        if roi.x + roi.width > self.capabilities.width or roi.y + roi.height > self.capabilities.height:
+        if (
+            (roi.x + roi.width) * binning > self.capabilities.width
+            or (roi.y + roi.height) * binning > self.capabilities.height
+        ):
             raise CameraInvalidValueError("ROI extends outside the sensor")
-        if roi.width % binning or roi.height % binning:
-            raise CameraInvalidValueError("ROI dimensions must be divisible by binning")
 
     @staticmethod
     def _pixels(roi: Roi, binning: int, readout_mode: ReadoutMode) -> np.ndarray:
-        height = roi.height // binning
-        width = roi.width // binning
+        height = roi.height
+        width = roi.width
         maximum = 4095 if readout_mode is ReadoutMode.RAW12 else 255
         dtype = np.uint16 if readout_mode is ReadoutMode.RAW12 else np.uint8
         pixels = np.empty((height, width), dtype=dtype)
-        x_values = np.arange(roi.x, roi.x + roi.width, dtype=np.uint32).reshape(width, binning)
-        for row, y_value in enumerate(range(roi.y, roi.y + roi.height, binning)):
+        sensor_x = roi.x * binning
+        sensor_y = roi.y * binning
+        x_values = np.arange(
+            sensor_x, sensor_x + width * binning, dtype=np.uint32
+        ).reshape(width, binning)
+        for row in range(height):
+            y_value = sensor_y + row * binning
             block_sums = np.zeros(width, dtype=np.uint32)
             for y_offset in range(binning):
                 block_sums += ((x_values + y_value + y_offset) % (maximum + 1)).sum(axis=1)

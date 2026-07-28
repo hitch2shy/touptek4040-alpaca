@@ -26,50 +26,53 @@ def real_camera():
     identity = enumerate_cameras(sdk)[0]
     camera = ToupTekCamera(identity.serial, sdk=sdk)
     camera.connect()
-    handle = camera._handle
-    saved = {
-        "raw": handle.get_Option(sdk.TOUPCAM_OPTION_RAW),
-        "bitdepth": handle.get_Option(sdk.TOUPCAM_OPTION_BITDEPTH),
-        "gain": handle.get_ExpoAGain(),
-        "roi": handle.get_Roi(),
-        "binning": handle.get_Option(sdk.TOUPCAM_OPTION_BINNING),
-        "trigger": handle.get_Option(sdk.TOUPCAM_OPTION_TRIGGER),
-        "tec_target": handle.get_Option(sdk.TOUPCAM_OPTION_TECTARGET),
-        "tec": handle.get_Option(sdk.TOUPCAM_OPTION_TEC),
-        "fan": handle.get_Option(sdk.TOUPCAM_OPTION_FAN),
-    }
+    handle = None
+    saved = None
     try:
+        handle = camera._handle
+        saved = {
+            "raw": handle.get_Option(sdk.TOUPCAM_OPTION_RAW),
+            "bitdepth": handle.get_Option(sdk.TOUPCAM_OPTION_BITDEPTH),
+            "gain": handle.get_ExpoAGain(),
+            "roi": handle.get_Roi(),
+            "binning": handle.get_Option(sdk.TOUPCAM_OPTION_BINNING),
+            "trigger": handle.get_Option(sdk.TOUPCAM_OPTION_TRIGGER),
+            "tec_target": handle.get_Option(sdk.TOUPCAM_OPTION_TECTARGET),
+            "tec": handle.get_Option(sdk.TOUPCAM_OPTION_TEC),
+            "fan": handle.get_Option(sdk.TOUPCAM_OPTION_FAN),
+        }
         yield camera
     finally:
         restore_errors: list[Exception] = []
         try:
-            try:
-                handle.Trigger(0)
-            except sdk.HRESULTException as error:
-                if (error.hr & 0xFFFFFFFF) != 0x8000FFFF:
-                    restore_errors.append(error)
-            restorations = (
-                lambda: handle.put_Option(
-                    sdk.TOUPCAM_OPTION_TRIGGER, saved["trigger"]
-                ),
-                lambda: handle.put_Option(sdk.TOUPCAM_OPTION_RAW, saved["raw"]),
-                lambda: handle.put_Option(
-                    sdk.TOUPCAM_OPTION_BITDEPTH, saved["bitdepth"]
-                ),
-                lambda: handle.put_Option(
-                    sdk.TOUPCAM_OPTION_BINNING, saved["binning"]
-                ),
-                lambda: handle.put_Roi(*saved["roi"]),
-                lambda: handle.put_ExpoAGain(saved["gain"]),
-                lambda: handle.put_Temperature(saved["tec_target"]),
-                lambda: handle.put_Option(sdk.TOUPCAM_OPTION_TEC, saved["tec"]),
-                lambda: handle.put_Option(sdk.TOUPCAM_OPTION_FAN, saved["fan"]),
-            )
-            for restore in restorations:
+            if handle is not None and saved is not None:
                 try:
-                    restore()
-                except Exception as error:
-                    restore_errors.append(error)
+                    handle.Trigger(0)
+                except sdk.HRESULTException as error:
+                    if (error.hr & 0xFFFFFFFF) != 0x8000FFFF:
+                        restore_errors.append(error)
+                restorations = (
+                    lambda: handle.put_Option(
+                        sdk.TOUPCAM_OPTION_TRIGGER, saved["trigger"]
+                    ),
+                    lambda: handle.put_Option(sdk.TOUPCAM_OPTION_RAW, saved["raw"]),
+                    lambda: handle.put_Option(
+                        sdk.TOUPCAM_OPTION_BITDEPTH, saved["bitdepth"]
+                    ),
+                    lambda: handle.put_Option(
+                        sdk.TOUPCAM_OPTION_BINNING, saved["binning"]
+                    ),
+                    lambda: handle.put_Roi(*saved["roi"]),
+                    lambda: handle.put_ExpoAGain(saved["gain"]),
+                    lambda: handle.put_Temperature(saved["tec_target"]),
+                    lambda: handle.put_Option(sdk.TOUPCAM_OPTION_TEC, saved["tec"]),
+                    lambda: handle.put_Option(sdk.TOUPCAM_OPTION_FAN, saved["fan"]),
+                )
+                for restore in restorations:
+                    try:
+                        restore()
+                    except Exception as error:
+                        restore_errors.append(error)
         finally:
             camera.disconnect()
         if restore_errors:

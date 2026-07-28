@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from threading import Barrier, Event
 from datetime import timezone
 
 import numpy as np
@@ -181,6 +182,215 @@ def test_abort_does_not_enter_sdk_during_normal_stop(camera: ToupTekCamera) -> N
 
     assert sum(call == ("Stop",) for call in camera._sdk.calls) == 1
     assert ("Trigger", 0) not in camera._sdk.calls
+
+
+def test_stop_claim_is_atomic_when_abort_and_cleanup_arrive_together(
+    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both contenders at the claim boundary still produce one native Stop."""
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.deliver_after_abort = True
+    barrier = Barrier(2)
+    original_claim = camera._claim_stop
+
+    def simultaneous_claim():
+        barrier.wait(timeout=1)
+        return original_claim()
+
+    monkeypatch.setattr(camera, "_claim_stop", simultaneous_claim)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        handle.trigger_release.set()
+        cancellation = pool.submit(camera.abort)
+        cancellation.result(1)
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+
+    assert sum(call == ("Stop",) for call in camera._sdk.calls) == 1
+
+
+def test_new_acquire_waits_while_abort_stop_is_in_flight(
+    camera: ToupTekCamera,
+) -> None:
+    """No next acquisition may enter the SDK before native Stop returns."""
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.block_stop = True
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        cancellation = pool.submit(camera.abort)
+        assert handle.stop_entered.wait(1)
+        call_count = len(camera._sdk.calls)
+        next_exposure = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        with pytest.raises(FutureTimeoutError):
+            next_exposure.result(0.05)
+        assert len(camera._sdk.calls) == call_count
+        handle.block_trigger = False
+        handle.stop_release.set()
+        cancellation.result(1)
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+        next_exposure.result(1)
+
+
+def test_disconnect_waits_for_abort_stop_and_all_native_calls(
+    camera: ToupTekCamera,
+) -> None:
+    """Close must not race Stop or a blocked TriggerSyncV4."""
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.block_stop = True
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        cancellation = pool.submit(camera.abort)
+        assert handle.stop_entered.wait(1)
+        disconnect = pool.submit(camera.disconnect)
+        with pytest.raises(FutureTimeoutError):
+            disconnect.result(0.05)
+        assert ("Close",) not in camera._sdk.calls
+        handle.stop_release.set()
+        cancellation.result(1)
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+        disconnect.result(1)
+    assert camera._sdk.calls[-1] == ("Close",)
+
+
+def test_abort_before_final_commit_discards_the_built_frame(
+    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Abort wins until the final generation check is committed."""
+    entered = Event()
+    release = Event()
+    original_commit = camera._commit_frame
+
+    def blocked_commit(generation, frame):
+        entered.set()
+        assert release.wait(1)
+        return original_commit(generation, frame)
+
+    monkeypatch.setattr(camera, "_commit_frame", blocked_commit)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert entered.wait(1)
+        camera.abort()
+        release.set()
+        with pytest.raises(CameraOperationCancelledError):
+            pending.result(1)
+
+
+def test_abort_after_final_commit_cannot_cancel_the_returned_frame(
+    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit point linearizes completion before Python returns."""
+    committed = Event()
+    release = Event()
+    original_commit = camera._commit_frame
+
+    def paused_after_commit(generation, frame):
+        result = original_commit(generation, frame)
+        committed.set()
+        assert release.wait(1)
+        return result
+
+    monkeypatch.setattr(camera, "_commit_frame", paused_after_commit)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert committed.wait(1)
+        camera.abort()
+        release.set()
+        assert pending.result(1).pixels.shape == (32, 32)
+
+
+def test_stop_failure_marks_handle_unusable(camera: ToupTekCamera) -> None:
+    """A failed Stop cannot transition the handle back to reusable idle."""
+    camera._handle.stop_error = FakeHResultError(E_FAIL)
+
+    with pytest.raises(CameraError):
+        camera.acquire(0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
+    call_count = len(camera._sdk.calls)
+    with pytest.raises(CameraNotConnectedError, match="reconnect"):
+        _ = camera.temperature_c
+    assert len(camera._sdk.calls) == call_count
+
+
+def test_abort_preserves_non_benign_trigger_cancel_error(
+    camera: ToupTekCamera,
+) -> None:
+    """Only the observed idle E_UNEXPECTED may be ignored."""
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.cancel_error = FakeHResultError(E_FAIL)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        with pytest.raises(CameraError, match="cancel trigger"):
+            camera.abort()
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+
+
+def test_disconnect_closes_handle_even_when_abort_reports_cleanup_error(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.cancel_error = FakeHResultError(E_FAIL)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        disconnect = pool.submit(camera.disconnect)
+        with pytest.raises(CameraError):
+            disconnect.result(1)
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+    assert ("Close",) in camera._sdk.calls
+
+
+def test_abort_dominates_post_trigger_python_failure(
+    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = Event()
+    release = Event()
+
+    def failing_frombuffer(*args, **kwargs):
+        entered.set()
+        assert release.wait(1)
+        raise ValueError("copy failed")
+
+    monkeypatch.setattr(np, "frombuffer", failing_frombuffer)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        exposure = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert entered.wait(1)
+        camera.abort()
+        release.set()
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
 
 
 def test_a_second_acquisition_is_busy(camera: ToupTekCamera) -> None:

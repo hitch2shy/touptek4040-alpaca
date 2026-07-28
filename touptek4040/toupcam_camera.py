@@ -5,10 +5,11 @@ from __future__ import annotations
 import ctypes
 import math
 import sys
+from contextlib import contextmanager
 from ctypes import ArgumentError
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import Lock, RLock
+from threading import Condition, Lock, RLock
 from types import ModuleType
 from typing import Any
 
@@ -17,6 +18,7 @@ import numpy as np
 from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
 from .errors import (
     CameraBusyError,
+    CameraCleanupError,
     CameraError,
     CameraInvalidValueError,
     CameraNotConnectedError,
@@ -98,11 +100,17 @@ class ToupTekCamera:
         self.serial = self.identity.serial
         self._handle: Any | None = None
         self._state_lock = RLock()
+        self._condition = Condition(self._state_lock)
         self._acquisition_lock = Lock()
+        self._native_calls = 0
+        self._disconnecting = False
+        self._unusable = False
         self._acquiring = False
+        self._frame_committed = False
         self._camera_started = False
+        self._stop_claimed = False
+        self._stop_in_flight = False
         self._cancel_requested = False
-        self._stopped_by_abort = False
         self._abort_generation = 0
 
     @property
@@ -110,7 +118,7 @@ class ToupTekCamera:
         return self.identity.capabilities
 
     def connect(self) -> None:
-        with self._state_lock:
+        with self._condition:
             if self._handle is None:
                 try:
                     handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
@@ -121,160 +129,244 @@ class ToupTekCamera:
                         f"could not open camera with serial {self.serial!r}"
                     )
                 self._handle = handle
+                self._unusable = False
+                self._disconnecting = False
 
     def disconnect(self) -> None:
-        with self._state_lock:
-            acquiring = self._acquiring
+        with self._condition:
+            if self._handle is None:
+                return
+            self._disconnecting = True
+            acquiring = self._acquiring and not self._frame_committed
+        abort_error: CameraError | None = None
         if acquiring:
-            self.abort()
-        with self._acquisition_lock:
-            with self._state_lock:
-                handle = self._handle
-                self._handle = None
-            if handle is not None:
-                try:
-                    handle.Close()
-                except Exception as error:
-                    raise _translate_sdk_error(error, "disconnect camera") from error
+            try:
+                self.abort()
+            except CameraError as error:
+                abort_error = error
+        with self._condition:
+            while self._acquiring or self._native_calls or self._stop_in_flight:
+                self._condition.wait()
+            handle = self._handle
+            self._handle = None
+        if handle is not None:
+            try:
+                handle.Close()
+            except Exception as error:
+                raise _translate_sdk_error(error, "disconnect camera") from error
+        if abort_error is not None:
+            raise abort_error
 
     def apply_settings(self, settings: CaptureSettings) -> AppliedSettings:
         """Validate and configure every non-running acquisition option."""
-        with self._state_lock:
-            handle = self._require_connected_locked()
-            if self._acquiring:
-                raise CameraBusyError("cannot configure a running acquisition")
+        with self._native_lease() as handle:
             return self._apply_settings_locked(handle, settings)
 
     def acquire(
         self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
     ) -> Frame:
         """Issue one synchronous software trigger and return its private frame."""
-        if not self._acquisition_lock.acquire(blocking=False):
+        waited_for_stop = False
+        with self._condition:
+            while self._stop_in_flight:
+                waited_for_stop = True
+                self._condition.wait()
+        if waited_for_stop:
+            self._acquisition_lock.acquire()
+        elif not self._acquisition_lock.acquire(blocking=False):
             raise CameraBusyError("another acquisition is already running")
         try:
             settings = CaptureSettings(duration_s, roi, binning, readout_mode)
-            with self._state_lock:
+            with self._condition:
                 handle = self._require_connected_locked()
-                applied = self._apply_settings_locked(handle, settings)
                 generation = self._abort_generation
                 self._acquiring = True
+                self._frame_committed = False
                 self._cancel_requested = False
-                self._stopped_by_abort = False
-            buffer = _allocate_buffer(applied)
-            frame_info = self._sdk.ToupcamFrameInfoV4()
-            timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
-            operation_error: Exception | None = None
-            camera_started = False
-            try:
-                handle.StartPullModeWithCallback(None, None)
-                camera_started = True
-                with self._state_lock:
-                    cancelled_before_trigger = (
-                        generation != self._abort_generation
-                    )
-                    if not cancelled_before_trigger:
+                self._stop_claimed = False
+            with self._native_lease(during_acquisition=True) as handle:
+                applied = self._apply_settings_locked(handle, settings)
+                buffer = _allocate_buffer(applied)
+                frame_info = self._sdk.ToupcamFrameInfoV4()
+                timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
+                operation_errors: list[CameraError] = []
+                try:
+                    handle.StartPullModeWithCallback(None, None)
+                    with self._condition:
                         self._camera_started = True
-                if cancelled_before_trigger:
-                    operation_error = CameraOperationCancelledError(
-                        "exposure was aborted before trigger"
+                        cancelled = generation != self._abort_generation
+                    if not cancelled:
+                        started_utc = datetime.now(timezone.utc)
+                        handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
+                except Exception as error:
+                    operation_errors.append(_translate_sdk_error(error, "acquire frame"))
+                stop_error = self._stop_if_claimed_by_caller()
+                if stop_error is not None:
+                    operation_errors.append(stop_error)
+                self._raise_acquisition_errors(generation, operation_errors)
+                info_width = frame_info.v3.width
+                info_height = frame_info.v3.height
+                if (info_width, info_height) != (applied.width, applied.height):
+                    self._raise_if_aborted(generation)
+                    raise CameraError(
+                        "SDK frame dimensions "
+                        f"{info_width}x{info_height} do not match configured "
+                        f"{applied.width}x{applied.height}"
                     )
-                else:
-                    started_utc = datetime.now(timezone.utc)
-                    handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
-            except Exception as error:
-                operation_error = error
-            finally:
-                if camera_started:
-                    with self._state_lock:
-                        stopped_by_abort = self._stopped_by_abort
-                    if not stopped_by_abort:
-                        with self._state_lock:
-                            # Transfer Stop ownership away from Abort before the
-                            # native call, which can release the GIL.
-                            self._camera_started = False
-                        try:
-                            handle.Stop()
-                        except Exception as error:
-                            if operation_error is None:
-                                operation_error = error
-                    with self._state_lock:
-                        self._camera_started = False
-            if operation_error is not None:
-                if self._was_aborted(generation):
-                    raise CameraOperationCancelledError(
-                        "exposure was aborted; frame discarded"
-                    ) from operation_error
-                raise _translate_sdk_error(
-                    operation_error, "acquire frame"
-                ) from operation_error
-            if self._was_aborted(generation):
-                raise CameraOperationCancelledError(
-                    "exposure was aborted; frame discarded"
-                )
-            info_width = frame_info.v3.width
-            info_height = frame_info.v3.height
-            if (info_width, info_height) != (applied.width, applied.height):
-                raise CameraError(
-                    "SDK frame dimensions "
-                    f"{info_width}x{info_height} do not match configured "
-                    f"{applied.width}x{applied.height}"
-                )
-            pixels = np.frombuffer(
-                buffer,
-                dtype=applied.dtype,
-                count=applied.width * applied.height,
-            ).reshape(applied.height, applied.width).copy()
-            return Frame(
-                pixels=pixels,
-                started_utc=started_utc,
-                duration_s=applied.duration_s,
-                binning=binning,
-                roi=roi,
-                readout_mode=readout_mode,
-            )
+                try:
+                    pixels = np.frombuffer(
+                        buffer,
+                        dtype=applied.dtype,
+                        count=applied.width * applied.height,
+                    ).reshape(applied.height, applied.width).copy()
+                    frame = Frame(
+                        pixels=pixels,
+                        started_utc=started_utc,
+                        duration_s=applied.duration_s,
+                        binning=binning,
+                        roi=roi,
+                        readout_mode=readout_mode,
+                    )
+                except Exception as error:
+                    try:
+                        self._raise_if_aborted(generation)
+                    except CameraOperationCancelledError as cancelled:
+                        raise cancelled from error
+                    raise
+                return self._commit_frame(generation, frame)
         finally:
-            with self._state_lock:
-                self._acquiring = False
+            with self._condition:
+                if not self._frame_committed:
+                    self._acquiring = False
                 self._camera_started = False
                 self._cancel_requested = False
-                self._stopped_by_abort = False
+                self._condition.notify_all()
             self._acquisition_lock.release()
 
     def abort(self) -> None:
         """Cancel a software trigger and invalidate every result from its generation."""
-        with self._state_lock:
+        with self._condition:
             handle = self._require_connected_locked()
-            if not self._acquiring or self._cancel_requested:
+            if not self._acquiring or self._frame_committed or self._cancel_requested:
                 return
             self._cancel_requested = True
             self._abort_generation += 1
-            trigger_active = self._camera_started
-        if not trigger_active:
+        should_stop, handle = self._claim_stop()
+        if not should_stop:
             return
+        cleanup_errors: list[CameraError] = []
         try:
-            # The SDK documents zero as stop/cancel; 0xffff means continuous trigger.
             handle.Trigger(0)
-        except Exception:
-            # On some models Trigger(0) is rejected once the exposure is active.
-            # Stop below is the operation that interrupts the running instance.
-            pass
-        with self._state_lock:
-            # Transfer Stop ownership before entering the SDK. TriggerSyncV4 can
-            # return on another Python thread while this call is still unwinding.
-            self._stopped_by_abort = True
-            self._camera_started = False
+        except Exception as error:
+            if not _is_benign_idle_trigger_error(error):
+                cleanup_errors.append(_translate_sdk_error(error, "cancel trigger"))
+        stop_error: CameraError | None = None
         try:
             handle.Stop()
         except Exception as error:
-            raise _translate_sdk_error(error, "abort running camera") from error
+            stop_error = _translate_sdk_error(error, "abort running camera")
+            cleanup_errors.append(stop_error)
+        finally:
+            self._finish_stop(stop_error)
+        if len(cleanup_errors) > 1:
+            raise CameraCleanupError(
+                "multiple abort cleanup operations failed", tuple(cleanup_errors)
+            )
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    def _claim_stop(self) -> tuple[bool, Any | None]:
+        """Atomically transfer ownership of the one allowed native Stop call."""
+        with self._condition:
+            if self._stop_claimed or not self._camera_started:
+                return False, None
+            handle = self._require_connected_locked()
+            self._stop_claimed = True
+            self._camera_started = False
+            self._stop_in_flight = True
+            self._native_calls += 1
+            return True, handle
+
+    def _finish_stop(self, error: CameraError | None) -> None:
+        with self._condition:
+            if error is not None:
+                self._unusable = True
+            self._stop_in_flight = False
+            self._native_calls -= 1
+            self._condition.notify_all()
+
+    def _stop_if_claimed_by_caller(self) -> CameraError | None:
+        should_stop, handle = self._claim_stop()
+        if not should_stop:
+            return None
+        error: CameraError | None = None
+        try:
+            handle.Stop()
+        except Exception as native_error:
+            error = _translate_sdk_error(native_error, "stop camera")
+        finally:
+            self._finish_stop(error)
+        return error
+
+    @contextmanager
+    def _native_lease(self, *, during_acquisition: bool = False):
+        with self._condition:
+            while self._stop_in_flight:
+                self._condition.wait()
+            handle = self._require_connected_locked()
+            if self._disconnecting:
+                raise CameraNotConnectedError("camera is disconnecting")
+            if self._acquiring and not during_acquisition:
+                raise CameraBusyError("camera acquisition is running")
+            self._native_calls += 1
+        try:
+            yield handle
+        finally:
+            with self._condition:
+                self._native_calls -= 1
+                self._condition.notify_all()
+
+    def _raise_if_aborted(self, generation: int) -> None:
+        with self._condition:
+            aborted = generation != self._abort_generation
+        if aborted:
+            raise CameraOperationCancelledError(
+                "exposure was aborted; frame discarded"
+            )
+
+    def _raise_acquisition_errors(
+        self, generation: int, errors: list[CameraError]
+    ) -> None:
+        try:
+            self._raise_if_aborted(generation)
+        except CameraOperationCancelledError as cancelled:
+            if errors:
+                raise cancelled from errors[0]
+            raise
+        if len(errors) > 1:
+            raise CameraCleanupError("multiple acquisition operations failed", tuple(errors))
+        if errors:
+            raise errors[0]
+
+    def _commit_frame(self, generation: int, frame: Frame) -> Frame:
+        """Linearize successful completion against Abort before returning."""
+        with self._condition:
+            if generation != self._abort_generation:
+                raise CameraOperationCancelledError(
+                    "exposure was aborted; frame discarded"
+                )
+            self._frame_committed = True
+            self._acquiring = False
+            self._condition.notify_all()
+            return frame
 
     @property
     def temperature_c(self) -> float:
-        handle = self._require_connected()
-        try:
-            return handle.get_Temperature() / 10.0
-        except Exception as error:
-            raise _translate_sdk_error(error, "read sensor temperature") from error
+        with self._native_lease() as handle:
+            try:
+                return handle.get_Temperature() / 10.0
+            except Exception as error:
+                raise _translate_sdk_error(error, "read sensor temperature") from error
 
     @property
     def target_temperature_c(self) -> float:
@@ -291,11 +383,11 @@ class ToupTekCamera:
                 f"target temperature must be between "
                 f"{target_range[0] / 10:.1f} and {target_range[1] / 10:.1f} °C"
             )
-        handle = self._require_connected()
-        try:
-            handle.put_Temperature(deci_c)
-        except Exception as error:
-            raise _translate_sdk_error(error, "set TEC target") from error
+        with self._native_lease() as handle:
+            try:
+                handle.put_Temperature(deci_c)
+            except Exception as error:
+                raise _translate_sdk_error(error, "set TEC target") from error
 
     @property
     def cooler_on(self) -> bool:
@@ -309,9 +401,15 @@ class ToupTekCamera:
 
     def tec_voltage(self) -> tuple[float, float]:
         """Return current and configured maximum TEC voltage in volts."""
-        current = self._get_option("TOUPCAM_OPTION_TEC_VOLTAGE") / 10.0
-        maximum = self._get_option("TOUPCAM_OPTION_TEC_VOLTAGE_MAX") / 10.0
-        return current, maximum
+        current_option = self._sdk.TOUPCAM_OPTION_TEC_VOLTAGE
+        maximum_option = self._sdk.TOUPCAM_OPTION_TEC_VOLTAGE_MAX
+        with self._native_lease() as handle:
+            try:
+                current = handle.get_Option(current_option) / 10.0
+                maximum = handle.get_Option(maximum_option) / 10.0
+                return current, maximum
+            except Exception as error:
+                raise _translate_sdk_error(error, "read TEC voltage") from error
 
     @property
     def cooler_power_percent(self) -> float:
@@ -396,34 +494,30 @@ class ToupTekCamera:
         )
         return exposure_us, sdk_roi, dtype
 
-    def _was_aborted(self, generation: int) -> bool:
-        with self._state_lock:
-            return generation != self._abort_generation
-
-    def _require_connected(self) -> Any:
-        with self._state_lock:
-            return self._require_connected_locked()
-
     def _require_connected_locked(self) -> Any:
         if self._handle is None:
             raise CameraNotConnectedError("camera is not connected")
+        if self._unusable:
+            raise CameraNotConnectedError(
+                "camera handle is unusable; disconnect and reconnect"
+            )
         return self._handle
 
     def _get_option(self, name: str) -> int:
-        handle = self._require_connected()
         option = getattr(self._sdk, name)
-        try:
-            return handle.get_Option(option)
-        except Exception as error:
-            raise _translate_sdk_error(error, f"read option {name}") from error
+        with self._native_lease() as handle:
+            try:
+                return handle.get_Option(option)
+            except Exception as error:
+                raise _translate_sdk_error(error, f"read option {name}") from error
 
     def _put_option(self, name: str, value: int, operation: str) -> None:
-        handle = self._require_connected()
         option = getattr(self._sdk, name)
-        try:
-            handle.put_Option(option, value)
-        except Exception as error:
-            raise _translate_sdk_error(error, operation) from error
+        with self._native_lease() as handle:
+            try:
+                handle.put_Option(option, value)
+            except Exception as error:
+                raise _translate_sdk_error(error, operation) from error
 
 
 def _allocate_buffer(settings: AppliedSettings) -> Any:
@@ -450,6 +544,11 @@ def _translate_sdk_error(error: Exception, operation: str) -> CameraError:
     if code in {0x8007001F, 0x80070005}:
         return CameraNotConnectedError(message)
     return CameraError(message)
+
+
+def _is_benign_idle_trigger_error(error: Exception) -> bool:
+    hr = getattr(error, "hr", None)
+    return hr is not None and (int(hr) & 0xFFFFFFFF) == 0x8000FFFF
 
 
 def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:

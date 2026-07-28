@@ -17,7 +17,7 @@ class ReadoutMode(IntEnum):
 
 @dataclass(frozen=True)
 class Roi:
-    """An unbinned rectangular sensor region in pixel coordinates."""
+    """A rectangular output region in binned pixel coordinates."""
 
     x: int
     y: int
@@ -67,3 +67,23 @@ class CameraContract(Protocol):
     ) -> Frame: ...
 
     def abort(self) -> None: ...
+
+    @property
+    def temperature_c(self) -> float: ...
+
+    @property
+    def target_temperature_c(self) -> float: ...
+
+    @target_temperature_c.setter
+    def target_temperature_c(self, value: float) -> None: ...
+
+    @property
+    def cooler_on(self) -> bool: ...
+
+    @cooler_on.setter
+    def cooler_on(self, enabled: bool) -> None: ...
+
+    def tec_voltage(self) -> tuple[float, float]: ...
+
+    @property
+    def cooler_power_percent(self) -> float: ...

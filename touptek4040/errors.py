@@ -27,3 +27,11 @@ class CameraTimeoutError(CameraError):
 
 class CameraOperationCancelledError(CameraError):
     """Raised when an in-flight operation is explicitly cancelled."""
+
+
+class CameraCleanupError(CameraError):
+    """Raised when more than one native cleanup operation fails."""
+
+    def __init__(self, message: str, errors: tuple[CameraError, ...]) -> None:
+        super().__init__(message)
+        self.errors = errors

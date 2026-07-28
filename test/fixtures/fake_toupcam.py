@@ -107,9 +107,17 @@ class FakeToupCam:
         self.stop_release = Event()
         self.block_start = False
         self.block_stop = False
+        self.block_temperature = False
+        self.block_option = False
         self.block_trigger = False
         self.deliver_after_abort = False
         self.trigger_error: Exception | None = None
+        self.cancel_error: Exception | None = None
+        self.stop_error: Exception | None = None
+        self.temperature_entered = Event()
+        self.temperature_release = Event()
+        self.option_entered = Event()
+        self.option_release = Event()
         self.frame_size_override: tuple[int, int] | None = None
         self.frame_info_size_override: tuple[int, int] | None = None
         self.started = False
@@ -156,6 +164,9 @@ class FakeToupCam:
 
     def get_Option(self, option: int) -> int:
         self.sdk.calls.append(("get_Option", option))
+        self.option_entered.set()
+        if self.block_option:
+            self.option_release.wait(2)
         return self.options[option]
 
     def put_Roi(self, x: int, y: int, width: int, height: int) -> None:
@@ -238,6 +249,8 @@ class FakeToupCam:
         if self.block_stop and not self.stop_entered.is_set():
             self.stop_entered.set()
             self.stop_release.wait(2)
+        if self.stop_error is not None:
+            raise self.stop_error
         self.trigger_cancelled.set()
         self.trigger_release.set()
         self.started = False
@@ -245,10 +258,15 @@ class FakeToupCam:
     def Trigger(self, count: int) -> None:
         self.sdk.calls.append(("Trigger", count))
         if count == 0:
+            if self.cancel_error is not None:
+                raise self.cancel_error
             self.trigger_cancelled.set()
 
     def get_Temperature(self) -> int:
         self.sdk.calls.append(("get_Temperature",))
+        self.temperature_entered.set()
+        if self.block_temperature:
+            self.temperature_release.wait(2)
         return self.temperature_deci_c
 
     def put_Temperature(self, value: int) -> None:

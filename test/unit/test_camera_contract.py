@@ -45,3 +45,6 @@ def test_contract_values_are_immutable():
 
 def test_simulator_implements_camera_contract():
     assert isinstance(SimCamera(serial="SIM-4040"), CameraContract)
+    contract: CameraContract = SimCamera(serial="SIM-4040")
+    assert contract.temperature_c == 20.0
+    assert contract.tec_voltage() == (0.0, 6.0)

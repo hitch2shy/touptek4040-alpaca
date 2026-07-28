@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
 import pytest
 
 from test.fixtures.fake_toupcam import (
@@ -84,8 +86,6 @@ def test_configuration_is_rejected_while_trigger_is_running(camera: ToupTekCamer
     handle = camera._handle
     handle.block_trigger = True
 
-    from concurrent.futures import ThreadPoolExecutor
-
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(
             camera.acquire, 0.1, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
@@ -124,6 +124,60 @@ def test_zero_maximum_tec_voltage_has_zero_cooler_power(camera: ToupTekCamera) -
     camera._handle.options[OPTION_TEC_VOLTAGE_MAX] = 0
 
     assert camera.cooler_power_percent == 0.0
+
+
+def test_temperature_is_busy_during_acquisition(camera: ToupTekCamera) -> None:
+    handle = camera._handle
+    handle.block_trigger = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        with pytest.raises(CameraBusyError):
+            _ = camera.temperature_c
+        camera.abort()
+        with pytest.raises(Exception, match="aborted"):
+            pending.result(1)
+
+
+def test_disconnect_waits_for_temperature_native_lease(camera: ToupTekCamera) -> None:
+    handle = camera._handle
+    handle.block_temperature = True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(lambda: camera.temperature_c)
+        assert handle.temperature_entered.wait(1)
+        disconnecting = pool.submit(camera.disconnect)
+        with pytest.raises(FutureTimeoutError):
+            disconnecting.result(0.05)
+        assert ("Close",) not in camera._sdk.calls
+        handle.temperature_release.set()
+        assert reading.result(1) == -7.5
+        disconnecting.result(1)
+    assert camera._sdk.calls[-1] == ("Close",)
+
+
+def test_tec_voltage_holds_one_lease_across_both_option_reads(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.block_option = True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(camera.tec_voltage)
+        assert handle.option_entered.wait(1)
+        disconnecting = pool.submit(camera.disconnect)
+        with pytest.raises(FutureTimeoutError):
+            disconnecting.result(0.05)
+        handle.option_release.set()
+        assert reading.result(1) == (5.0, 6.0)
+        disconnecting.result(1)
+    option_calls = [
+        call for call in camera._sdk.calls if call[0] == "get_Option"
+    ]
+    assert option_calls[-2:] == [
+        ("get_Option", OPTION_TEC_VOLTAGE),
+        ("get_Option", OPTION_TEC_VOLTAGE_MAX),
+    ]
 
 
 def test_settings_require_a_connected_handle() -> None:
