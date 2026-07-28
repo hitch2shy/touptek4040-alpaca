@@ -1,0 +1,43 @@
+Task 10 RED evidence
+====================
+
+Command:
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini
+  test/alpaca/test_management.py
+  test/alpaca/test_setup_pages.py
+  test/alpaca/test_discovery.py
+  test/alpaca/test_protocol_errors.py -v
+
+Environment:
+Windows, Python 3.13.3, pytest 9.1.1
+
+Result:
+43 tests collected
+26 failed
+17 passed
+
+Expected missing-feature failures:
+- 6 management tests: all three management routes returned HTTP 400 because
+  they were not registered.
+- 6 setup tests: setup routes returned HTTP 400 because no HTML resources were
+  registered.
+- 13 discovery tests: the discovery module did not exist, reported by the test
+  helper as "Discovery responder module is not implemented".
+- 1 method-contract assertion exposed Falcon's automatic OPTIONS advertisement;
+  the assertion was corrected to accept the standards-compliant Allow header
+  before production implementation continued.
+
+Existing protocol boundaries that stayed green during RED:
+- invalid device types, numbers, commands, API versions, path casing, and
+  trailing slashes returned stable HTTP 400 JSON;
+- missing required parameters and malformed JSON returned safe HTTP 400;
+- valid device-level ASCOM errors remained HTTP 200;
+- Task 7 form parsing precedence remained operational.
+
+Supplemental RED cycles:
+1. test_unexpected_listener_exit_closes_its_socket_without_waiting_for_stop
+   failed because the listener socket remained open after recvfrom raised.
+2. test_real_source_without_resolved_serial_fails_fast failed with
+   "DID NOT RAISE ValueError" while a TOUPCAM-AUTO placeholder still existed.
+
+Both supplemental failures were observed before their production fixes.

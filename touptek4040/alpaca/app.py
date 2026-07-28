@@ -19,6 +19,13 @@ from ..errors import (
 from .camera_api import CameraApi
 from .common_api import CommonApi
 from .image_api import ImageApiResource
+from .management import (
+    DeviceSetupResource,
+    MainSetupResource,
+    ManagementResource,
+    invalid_setup_path,
+    management_values,
+)
 from .manifest import CAMERA_V4_ENDPOINTS, EndpointSpec
 from .request import client_transaction_id
 from .responses import (
@@ -45,6 +52,25 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
     camera_api = CameraApi(coordinator, config)
     common_api = CommonApi(coordinator, camera_api)
     apis = {"common": common_api, "camera": camera_api}
+    description, configured_devices = management_values(config)
+
+    app.add_route(
+        "/management/apiversions",
+        ManagementResource([1], allocator),
+    )
+    app.add_route(
+        "/management/v1/description",
+        ManagementResource(description, allocator),
+    )
+    app.add_route(
+        "/management/v1/configureddevices",
+        ManagementResource(configured_devices, allocator),
+    )
+    app.add_route("/setup", MainSetupResource())
+    app.add_route(
+        "/setup/v1/{device_type}/{device_number}/setup",
+        DeviceSetupResource(),
+    )
 
     resources: dict[tuple[str, str], _EndpointResource] = {}
     for spec in CAMERA_V4_ENDPOINTS:
@@ -187,7 +213,9 @@ def _invalid_path(
     request: falcon.Request,
     response: falcon.Response,
 ) -> None:
-    del request
+    if request.path.startswith("/setup"):
+        invalid_setup_path(response)
+        return
     response.status = falcon.HTTP_400
     response.content_type = falcon.MEDIA_JSON
     response.media = {
