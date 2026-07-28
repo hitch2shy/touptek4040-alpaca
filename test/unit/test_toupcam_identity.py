@@ -3,6 +3,8 @@ from __future__ import annotations
 from ctypes import ArgumentError
 from dataclasses import dataclass, field
 
+import pytest
+
 from touptek4040.toupcam_camera import ToupTekCamera, enumerate_cameras
 
 
@@ -31,9 +33,9 @@ class FakeDevice:
 
 
 class FakeHandle:
-    def __init__(self, reject_pixel_size: bool = False) -> None:
+    def __init__(self, pixel_size_error: str | None = None) -> None:
         self.closed = False
-        self.reject_pixel_size = reject_pixel_size
+        self.pixel_size_error = pixel_size_error
 
     def SerialNumber(self) -> str:
         return "TP241025143218C92B01151AEC40CB7"
@@ -56,8 +58,8 @@ class FakeHandle:
 
     def get_PixelSize(self, index: int) -> tuple[float, float]:
         assert index == 0
-        if self.reject_pixel_size:
-            raise ArgumentError("SDK wrapper rejected ctypes argument")
+        if self.pixel_size_error is not None:
+            raise ArgumentError(self.pixel_size_error)
         return (9.0, 9.0)
 
     def get_ExpTimeRange(self) -> tuple[int, int, int]:
@@ -74,8 +76,8 @@ class FakeHandle:
 
 
 class FakeToupcam:
-    def __init__(self, reject_pixel_size: bool = False) -> None:
-        self.handle = FakeHandle(reject_pixel_size)
+    def __init__(self, pixel_size_error: str | None = None) -> None:
+        self.handle = FakeHandle(pixel_size_error)
 
     def EnumV2(self) -> list[FakeDevice]:
         return [FakeDevice()]
@@ -86,8 +88,8 @@ class FakeToupcam:
 
 
 class FakeSdk:
-    def __init__(self, reject_pixel_size: bool = False) -> None:
-        self.Toupcam = FakeToupcam(reject_pixel_size)
+    def __init__(self, pixel_size_error: str | None = None) -> None:
+        self.Toupcam = FakeToupcam(pixel_size_error)
 
 
 def test_identity_uses_serial_not_usb_path() -> None:
@@ -117,9 +119,17 @@ def test_camera_discovers_static_capabilities_and_closes_probe() -> None:
 
 def test_identity_uses_model_pixel_size_when_sdk_wrapper_rejects_ctypes_value() -> None:
     """Python 3.13 can expose a ToupTek wrapper ctypes annotation defect."""
-    fake_sdk = FakeSdk(reject_pixel_size=True)
+    fake_sdk = FakeSdk("argument 2: TypeError: 'c_ulong' object cannot be interpreted as an integer")
 
     identity = enumerate_cameras(fake_sdk)[0]
 
     assert identity.capabilities.pixel_size_x == 9.0
     assert identity.capabilities.pixel_size_y == 9.0
+
+
+def test_identity_propagates_unrelated_pixel_size_argument_error() -> None:
+    """Only the known Python 3.13 c_uint/c_int mismatch is safely recoverable."""
+    fake_sdk = FakeSdk("argument 3: invalid device handle")
+
+    with pytest.raises(ArgumentError, match="invalid device handle"):
+        enumerate_cameras(fake_sdk)

@@ -5,13 +5,12 @@ from __future__ import annotations
 import sys
 from ctypes import ArgumentError
 from dataclasses import dataclass
-from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from .camera_contract import CameraCapabilities
 from .errors import CameraInvalidValueError, CameraNotConnectedError
-from .toupcam_loader import load_toupcam_module
+from .toupcam_loader import load_default_toupcam_module
 
 
 @dataclass(frozen=True)
@@ -35,7 +34,7 @@ class CameraIdentity:
 
 def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentity]:
     """Open every enumerated camera briefly to read its serial and capabilities."""
-    active_sdk = sdk if sdk is not None else load_toupcam_module(Path(sys.executable).parent)
+    active_sdk = sdk if sdk is not None else load_default_toupcam_module()
     identities: list[CameraIdentity] = []
     for device in active_sdk.Toupcam.EnumV2():
         handle = active_sdk.Toupcam.Open(device.id)
@@ -52,7 +51,7 @@ class ToupTekCamera:
     """Stable ToupTek camera selection with cached read-only capabilities."""
 
     def __init__(self, serial: str | None, sdk: ModuleType | Any | None = None) -> None:
-        self._sdk = sdk if sdk is not None else load_toupcam_module(Path(sys.executable).parent)
+        self._sdk = sdk if sdk is not None else load_default_toupcam_module()
         identities = enumerate_cameras(self._sdk)
         if serial is None:
             if len(identities) != 1:
@@ -91,9 +90,11 @@ def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:
     resolution = handle.get_Resolution(0)
     try:
         pixel_size = handle.get_PixelSize(0)
-    except ArgumentError:
+    except ArgumentError as error:
         # SDK 20250623 annotates this call as c_int but passes c_uint internally.
         # Python 3.13 rejects that mismatch; EnumV2 exposes the same static values.
+        if not _is_known_pixel_size_wrapper_error(error):
+            raise
         pixel_size = (model.xpixsz, model.ypixsz)
     capabilities = CameraCapabilities(
         width=resolution[0],
@@ -121,4 +122,15 @@ def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:
         exposure_time_range_us=handle.get_ExpTimeRange(),
         gain_range=handle.get_ExpoAGainRange(),
         tec_target_range_deci_c=tec_target_range,
+    )
+
+
+def _is_known_pixel_size_wrapper_error(error: ArgumentError) -> bool:
+    """Match only the SDK 20250623 Python 3.13 second-argument annotation defect."""
+    message = str(error)
+    return (
+        sys.version_info[:2] == (3, 13)
+        and "argument 2:" in message
+        and ("c_ulong" in message or "c_uint" in message)
+        and "cannot be interpreted as an integer" in message
     )

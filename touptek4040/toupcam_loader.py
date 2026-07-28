@@ -34,6 +34,18 @@ def load_toupcam_module(base_dir: Path) -> ModuleType:
     raise RuntimeError("could not locate toupcam.py and 64-bit toupcam.dll")
 
 
+def load_default_toupcam_module() -> ModuleType:
+    """Load from the runtime first, then from an active development worktree."""
+    runtime_dir = Path(sys.executable).resolve().parent
+    try:
+        return load_toupcam_module(runtime_dir)
+    except RuntimeError as runtime_error:
+        try:
+            return load_toupcam_module(Path.cwd())
+        except RuntimeError:
+            raise runtime_error
+
+
 def _search_roots(base_dir: Path) -> tuple[Path, ...]:
     root = base_dir.resolve()
     roots = [root]
@@ -44,8 +56,9 @@ def _search_roots(base_dir: Path) -> tuple[Path, ...]:
 
 
 def _load_wrapper(wrapper: Path, dll_directory: Path) -> ModuleType:
+    dll_directory_cookie = None
     if os.name == "nt":
-        os.add_dll_directory(str(dll_directory))
+        dll_directory_cookie = os.add_dll_directory(str(dll_directory))
     module_name = "_touptek4040_toupcam"
     existing = sys.modules.get(module_name)
     if existing is not None and Path(getattr(existing, "__file__", "")) == wrapper:
@@ -56,4 +69,7 @@ def _load_wrapper(wrapper: Path, dll_directory: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    # The object returned by add_dll_directory removes the directory on finalization.
+    # Keep it on the imported module because the wrapper loads the DLL lazily.
+    module._touptek4040_dll_directory_cookie = dll_directory_cookie
     return module

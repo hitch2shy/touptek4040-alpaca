@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import platform
+import weakref
 
 import pytest
 
-from touptek4040.toupcam_loader import load_toupcam_module, validate_runtime_architecture
+from touptek4040.toupcam_loader import (
+    load_default_toupcam_module,
+    load_toupcam_module,
+    validate_runtime_architecture,
+)
 
 
 def test_loader_rejects_32_bit_python(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -29,3 +36,62 @@ def test_loader_uses_project_sdk_python_wrapper_when_runtime_files_are_absent(
     sdk = load_toupcam_module(tmp_path)
 
     assert sdk.SOURCE == "project-sdk"
+
+
+def test_loader_keeps_dll_directory_alive_for_delayed_wrapper_load(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory cookie must survive until a lazily loaded DLL is requested."""
+    wrapper = tmp_path / "toupcamsdk.20250623" / "python" / "toupcam.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        "import ctypes\n"
+        "def delayed_dll_load():\n"
+        "    return ctypes.CDLL('toupcam.dll')\n",
+        encoding="utf-8",
+    )
+    dll = tmp_path / "toupcamsdk.20250623" / "win" / "x64" / "toupcam.dll"
+    dll.parent.mkdir(parents=True)
+    dll.touch()
+
+    class Cookie:
+        active = True
+
+        def __del__(self) -> None:
+            self.active = False
+
+    cookie = Cookie()
+    cookie_ref = weakref.ref(cookie)
+    monkeypatch.setattr("touptek4040.toupcam_loader.os.add_dll_directory", lambda _: cookie)
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda _: "loaded" if cookie_ref() is not None and cookie_ref().active else (_ for _ in ()).throw(OSError()),
+    )
+
+    sdk = load_toupcam_module(tmp_path)
+    del cookie
+    gc.collect()
+
+    assert sdk.delayed_dll_load() == "loaded"
+
+
+def test_default_loader_finds_project_sdk_from_linked_worktree(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A venv's Scripts directory must not hide the worktree's shared SDK."""
+    repository = tmp_path / "repository"
+    worktree = repository / ".worktrees" / "camera"
+    worktree.mkdir(parents=True)
+    wrapper = repository / "toupcamsdk.20250623" / "python" / "toupcam.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("SOURCE = 'linked-worktree-sdk'\n", encoding="utf-8")
+    dll = repository / "toupcamsdk.20250623" / "win" / "x64" / "toupcam.dll"
+    dll.parent.mkdir(parents=True)
+    dll.touch()
+    monkeypatch.chdir(worktree)
+    monkeypatch.setattr("touptek4040.toupcam_loader.sys.executable", str(worktree / ".venv64" / "Scripts" / "python.exe"))
+
+    sdk = load_default_toupcam_module()
+
+    assert sdk.SOURCE == "linked-worktree-sdk"
