@@ -40,6 +40,16 @@ class CameraCapabilities:
 
 
 @dataclass(frozen=True)
+class ExposureSettings:
+    """One immutable settings snapshot used for a formal exposure."""
+
+    roi: Roi
+    binning: int
+    readout_mode: ReadoutMode
+    gain: int
+
+
+@dataclass(frozen=True)
 class Frame:
     """An acquired image and the settings that produced it."""
 
@@ -49,6 +59,7 @@ class Frame:
     binning: int
     roi: Roi
     readout_mode: ReadoutMode
+    gain: int = 100
 
 
 @runtime_checkable
@@ -67,6 +78,12 @@ class CameraContract(Protocol):
     ) -> Frame: ...
 
     def abort(self) -> None: ...
+
+    @property
+    def gain(self) -> int: ...
+
+    @gain.setter
+    def gain(self, value: int) -> None: ...
 
     @property
     def temperature_c(self) -> float: ...

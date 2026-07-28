@@ -29,6 +29,7 @@ class SimCamera(CameraContract):
         self._connected = True
         self._target_temperature_c = 0.0
         self._cooler_on = False
+        self._gain = 100
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -47,10 +48,34 @@ class SimCamera(CameraContract):
         self._validate_acquisition(duration_s, roi, binning, readout_mode)
         started_utc = datetime.now(timezone.utc)
         pixels = self._pixels(roi, binning, readout_mode)
-        return Frame(pixels, started_utc, duration_s, binning, roi, readout_mode)
+        return Frame(
+            pixels,
+            started_utc,
+            duration_s,
+            binning,
+            roi,
+            readout_mode,
+            self._gain,
+        )
 
     def abort(self) -> None:
         self._require_connected()
+
+    @property
+    def gain(self) -> int:
+        self._require_connected()
+        return self._gain
+
+    @gain.setter
+    def gain(self, value: int) -> None:
+        self._require_connected()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 100 <= value <= 1650
+        ):
+            raise CameraInvalidValueError("gain must be an integer from 100 to 1650")
+        self._gain = value
 
     @property
     def temperature_c(self) -> float:

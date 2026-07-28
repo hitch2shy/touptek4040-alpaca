@@ -6,9 +6,15 @@ import math
 import re
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-from ..camera_contract import CameraCapabilities
+from ..camera_contract import (
+    CameraCapabilities,
+    ExposureSettings,
+    ReadoutMode,
+    Roi,
+)
 from ..camera_coordinator import CameraCoordinator, CameraState
 from .common_api import _alpaca_bool
 from .request import get_parameter
@@ -29,6 +35,7 @@ _EXPOSURE_MAX = 3600.0
 _EXPOSURE_RESOLUTION = 0.000001
 _TEMPERATURE_MIN = -50.0
 _TEMPERATURE_MAX = 40.0
+_DRIVER_ERROR = 0x500
 _ALPACA_FLOAT = re.compile(
     r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
     re.ASCII,
@@ -90,6 +97,11 @@ class CameraApi:
             self._not_implemented(command)
 
         snapshot = self._coordinator.snapshot()
+        if (
+            command in {"camerastate", "imageready", "percentcompleted"}
+            and snapshot.error is not None
+        ):
+            raise AlpacaError(_DRIVER_ERROR, str(snapshot.error))
         if command == "camerastate":
             return int(snapshot.camera_state)
         if command == "imageready":
@@ -332,39 +344,58 @@ class CameraApi:
         state: list[dict[str, object]] = [
             {"Name": "CameraState", "Value": int(snapshot.camera_state)},
             {"Name": "ImageReady", "Value": snapshot.image_ready},
-            {"Name": "PercentCompleted", "Value": snapshot.percent_completed},
+            {"Name": "IsPulseGuiding", "Value": False},
+            {
+                "Name": "PercentCompleted",
+                "Value": snapshot.percent_completed or 0,
+            },
         ]
         if snapshot.connected and not snapshot.connecting:
-            state.extend(
-                (
-                    {"Name": "CCDTemperature", "Value": self._coordinator.temperature_c},
-                    {"Name": "CoolerOn", "Value": self._coordinator.cooler_on},
-                    {"Name": "CoolerPower", "Value": self.get("coolerpower", None)},
+            try:
+                state.append(
+                    {
+                        "Name": "CCDTemperature",
+                        "Value": self._coordinator.temperature_c,
+                    }
                 )
-            )
+            except Exception:
+                pass
+            try:
+                state.append(
+                    {
+                        "Name": "CoolerPower",
+                        "Value": self.get("coolerpower", None),
+                    }
+                )
+            except Exception:
+                pass
+        state.append(
+            {
+                "Name": "TimeStamp",
+                "Value": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
         return state
 
     def _start_exposure(self, request: Any) -> None:
         duration = _strict_float(get_parameter(request, "Duration"), "Duration")
         light = _alpaca_bool(get_parameter(request, "Light"), "Light")
         self._require_connected()
-        self._require_idle()
-        exposure_us = round(duration * 1_000_000)
-        if not 12 <= exposure_us <= 3_600_000_000:
-            raise AlpacaError(
-                INVALID_VALUE,
-                "Duration must quantize to between 12 and 3600000000 microseconds",
-            )
+        state = self._coordinator.snapshot().camera_state
+        if state not in {CameraState.IDLE, CameraState.ERROR}:
+            self._require_idle()
         self._coordinator.start_exposure(
-            exposure_us / 1_000_000,
+            duration,
             light,
-            validate=self._validate_roi_combination,
+            settings=self._snapshot_exposure_settings,
         )
 
-    def _validate_roi_combination(
+    def _snapshot_exposure_settings(
         self,
         capabilities: CameraCapabilities,
-    ) -> None:
+    ) -> ExposureSettings:
         with self._lock:
             settings = _CameraSettings(**vars(self._settings))
         checks = (
@@ -406,6 +437,17 @@ class CameraApi:
         for valid, field, reason in checks:
             if not valid:
                 raise AlpacaError(INVALID_VALUE, f"{field} is invalid: {reason}")
+        return ExposureSettings(
+            roi=Roi(
+                settings.start_x,
+                settings.start_y,
+                settings.num_x,
+                settings.num_y,
+            ),
+            binning=settings.binning,
+            readout_mode=ReadoutMode(settings.readout_mode),
+            gain=settings.gain,
+        )
 
     def _stop_exposure(self) -> None:
         self._require_connected()

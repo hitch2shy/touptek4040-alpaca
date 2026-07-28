@@ -22,7 +22,16 @@ class ApiCamera:
         self.connected = False
         self.target_temperature_c = -10.0
         self.cooler_on = False
+        self.gain = 100
         self.abort_calls = 0
+        self.failure: Exception | None = None
+        self.temperature_error: Exception | None = None
+        self.tec_error: Exception | None = None
+        self.tec_current = 3.0
+        self.tec_maximum = 6.0
+        self.requested_acquisitions: list[
+            tuple[float, Roi, int, ReadoutMode, int]
+        ] = []
         self.acquisition_started = threading.Event()
         self.release_acquisition = threading.Event()
         self.release_acquisition.set()
@@ -50,15 +59,24 @@ class ApiCamera:
         binning: int,
         readout_mode: ReadoutMode,
     ) -> Frame:
+        self.requested_acquisitions.append(
+            (duration_s, roi, binning, readout_mode, self.gain)
+        )
         self.acquisition_started.set()
         self.release_acquisition.wait(timeout=2)
+        if self.failure is not None:
+            raise self.failure
         return Frame(
-            np.zeros((1, 1), dtype=np.uint16),
+            np.zeros(
+                (roi.height, roi.width),
+                dtype=np.uint16 if readout_mode is ReadoutMode.RAW12 else np.uint8,
+            ),
             datetime(2026, 7, 28, 12, 34, 56, tzinfo=timezone.utc),
             duration_s,
             binning,
             roi,
             readout_mode,
+            self.gain,
         )
 
     def abort(self) -> None:
@@ -67,10 +85,14 @@ class ApiCamera:
 
     @property
     def temperature_c(self) -> float:
+        if self.temperature_error is not None:
+            raise self.temperature_error
         return -4.5
 
     def tec_voltage(self) -> tuple[float, float]:
-        return (3.0, 6.0)
+        if self.tec_error is not None:
+            raise self.tec_error
+        return (self.tec_current, self.tec_maximum)
 
     @property
     def cooler_power_percent(self) -> float:

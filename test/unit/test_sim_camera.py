@@ -101,3 +101,26 @@ def test_simulator_has_deterministic_cooling_contract():
     assert camera.cooler_on is True
     assert camera.tec_voltage() == (6.0, 6.0)
     assert camera.cooler_power_percent == 100.0
+
+
+def test_simulator_gain_round_trips_and_is_recorded_in_the_frame():
+    camera = SimCamera("SIM-4040")
+
+    camera.gain = 1650
+    frame = camera.acquire(
+        0.001,
+        Roi(0, 0, 16, 16),
+        1,
+        ReadoutMode.RAW12,
+    )
+
+    assert camera.gain == 1650
+    assert frame.gain == 1650
+
+
+@pytest.mark.parametrize("gain", [99, 1651, 1.5, True])
+def test_simulator_rejects_gain_outside_the_approved_numeric_range(gain):
+    camera = SimCamera("SIM-4040")
+
+    with pytest.raises(CameraInvalidValueError):
+        camera.gain = gain

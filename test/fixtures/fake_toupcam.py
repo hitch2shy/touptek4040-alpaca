@@ -153,7 +153,7 @@ class FakeToupCam:
         return (1, 60_000_000, 1)
 
     def get_ExpoAGainRange(self) -> tuple[int, int, int]:
-        return (100, 1600, 100)
+        return (100, 1650, 100)
 
     def get_TecTargetRange(self) -> tuple[int, int]:
         return (-200, 200)
@@ -197,6 +197,7 @@ class FakeToupCam:
         self.gain = gain
 
     def get_ExpoAGain(self) -> int:
+        self.sdk.calls.append(("get_ExpoAGain",))
         return self.gain
 
     def get_FinalSize(self) -> tuple[int, int]:

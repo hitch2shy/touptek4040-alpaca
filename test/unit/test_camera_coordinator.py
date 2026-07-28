@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from touptek4040.camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
+from touptek4040.camera_contract import (
+    CameraCapabilities,
+    ExposureSettings,
+    Frame,
+    ReadoutMode,
+    Roi,
+)
 from touptek4040.camera_coordinator import CameraCoordinator, CameraState
 from touptek4040.errors import (
     CameraBusyError,
@@ -57,6 +63,15 @@ class ControlledCamera:
         self.abort_error: Exception | None = None
         self.disconnect_error: Exception | None = None
         self.failure: Exception | None = None
+        self._gain = 100
+        self.block_gain = False
+        self.gain_started = threading.Event()
+        self.gain_release = threading.Event()
+        self.gain_release.set()
+        self.operation_order: list[tuple[object, ...]] = []
+        self.requested_acquisitions: list[
+            tuple[float, Roi, int, ReadoutMode, int]
+        ] = []
         self.requested_durations: list[float] = []
 
     def connect(self) -> None:
@@ -75,6 +90,12 @@ class ControlledCamera:
         self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode
     ) -> Frame:
         with self._acquisition_condition:
+            self.operation_order.append(
+                ("acquire", duration_s, roi, binning, readout_mode, self._gain)
+            )
+            self.requested_acquisitions.append(
+                (duration_s, roi, binning, readout_mode, self._gain)
+            )
             self.requested_durations.append(duration_s)
             self.acquire_count += 1
             sequence = self.acquire_count
@@ -97,7 +118,20 @@ class ControlledCamera:
             binning=binning,
             roi=roi,
             readout_mode=readout_mode,
+            gain=self._gain,
         )
+
+    @property
+    def gain(self) -> int:
+        return self._gain
+
+    @gain.setter
+    def gain(self, value: int) -> None:
+        self.operation_order.append(("gain", value))
+        self.gain_started.set()
+        if self.block_gain:
+            self.gain_release.wait(2.0)
+        self._gain = value
 
     def abort(self) -> None:
         self.abort_count += 1
@@ -219,6 +253,62 @@ def test_completed_exposure_atomically_publishes_formal_frame(
     assert snapshot.percent_completed is None
     assert coordinator.frame is not None
     assert int(coordinator.frame.pixels[0, 0]) == 1
+
+
+def test_exposure_worker_applies_gain_then_acquires_with_frozen_settings(
+    coordinator, controlled_camera
+):
+    settings = ExposureSettings(
+        roi=Roi(1, 1, 3, 2),
+        binning=2,
+        readout_mode=ReadoutMode.RAW8,
+        gain=1650,
+    )
+
+    coordinator.start_exposure(
+        0.25,
+        False,
+        settings=lambda capabilities: settings,
+    )
+    controlled_camera.wait_for_acquisitions(1)
+
+    assert controlled_camera.operation_order[:2] == [
+        ("gain", 1650),
+        ("acquire", 0.25, Roi(1, 1, 3, 2), 2, ReadoutMode.RAW8, 1650),
+    ]
+    controlled_camera.release_frame()
+    wait_until(lambda: coordinator.snapshot().image_ready)
+    assert coordinator.frame is not None
+    assert coordinator.frame.gain == 1650
+
+
+def test_abort_while_gain_is_being_applied_never_starts_acquisition(
+    coordinator, controlled_camera
+):
+    controlled_camera.block_gain = True
+    controlled_camera.gain_release.clear()
+    settings = ExposureSettings(
+        roi=Roi(0, 0, 4, 3),
+        binning=1,
+        readout_mode=ReadoutMode.RAW12,
+        gain=200,
+    )
+    coordinator.start_exposure(
+        1.0,
+        True,
+        settings=lambda capabilities: settings,
+    )
+    assert controlled_camera.gain_started.wait(1.0)
+
+    coordinator.abort_exposure()
+    controlled_camera.gain_release.set()
+    thread = coordinator._exposure_thread
+    assert thread is not None
+    thread.join(1.0)
+
+    assert controlled_camera.acquire_count == 0
+    assert coordinator.snapshot().camera_state is CameraState.IDLE
+    assert coordinator.frame is None
 
 
 def test_percent_completed_is_available_only_during_exposure(

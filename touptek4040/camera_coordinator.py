@@ -13,6 +13,7 @@ from typing import TypeVar
 from .camera_contract import (
     CameraCapabilities,
     CameraContract,
+    ExposureSettings,
     Frame,
     ReadoutMode,
     Roi,
@@ -174,16 +175,35 @@ class CameraCoordinator:
         duration_s: float,
         light: bool,
         validate: Callable[[CameraCapabilities], None] | None = None,
+        settings: Callable[[CameraCapabilities], ExposureSettings] | None = None,
     ) -> None:
-        duration = self._validated_duration(duration_s)
         del light  # The camera has no mechanical shutter.
         if validate is not None and not callable(validate):
             raise CameraInvalidValueError("exposure validator must be callable")
+        if settings is not None and not callable(settings):
+            raise CameraInvalidValueError("exposure settings provider must be callable")
+        if validate is not None and settings is not None:
+            raise CameraInvalidValueError(
+                "validate and settings cannot both be supplied"
+            )
         with self._condition:
             camera = self._require_available_camera_locked()
-            self._require_idle_locked()
+            self._require_exposure_startable_locked()
+            duration = self._validated_duration(duration_s)
+            capabilities = camera.capabilities
             if validate is not None:
-                validate(camera.capabilities)
+                validate(capabilities)
+            exposure_settings = (
+                settings(capabilities)
+                if settings is not None
+                else ExposureSettings(
+                    roi=Roi(0, 0, capabilities.width, capabilities.height),
+                    binning=1,
+                    readout_mode=ReadoutMode.RAW12,
+                    gain=100,
+                )
+            )
+            self._validate_exposure_settings(exposure_settings, capabilities)
             preview_thread = self._preview_thread
             had_preview = preview_thread is not None and preview_thread.is_alive()
             self._invalidate_preview_locked()
@@ -196,7 +216,13 @@ class CameraCoordinator:
             self._publish_changed_locked()
         self._exposure_thread = self._start_thread(
             target=self._exposure_worker,
-            args=(session, camera, duration, preview_thread if had_preview else None),
+            args=(
+                session,
+                camera,
+                duration,
+                exposure_settings,
+                preview_thread if had_preview else None,
+            ),
             name=f"camera-exposure-{session}",
         )
 
@@ -474,6 +500,7 @@ class CameraCoordinator:
         session: int,
         camera: CameraContract,
         duration_s: float,
+        settings: ExposureSettings,
         preview_thread: threading.Thread | None,
     ) -> None:
         if preview_thread is not None:
@@ -485,22 +512,21 @@ class CameraCoordinator:
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
                     return
-            try:
-                capabilities = camera.capabilities
-            except Exception as error:
-                self._finish_exposure_error(session, camera, error)
-                return
             with self._condition:
                 if not self._is_current_exposure_locked(session, camera):
                     return
                 self._exposure_started_monotonic = time.monotonic()
                 self._publish_changed_locked()
             try:
+                camera.gain = settings.gain
+                with self._condition:
+                    if not self._is_current_exposure_locked(session, camera):
+                        return
                 frame = camera.acquire(
                     duration_s,
-                    Roi(0, 0, capabilities.width, capabilities.height),
-                    1,
-                    ReadoutMode.RAW12,
+                    settings.roi,
+                    settings.binning,
+                    settings.readout_mode,
                 )
             except Exception as error:
                 self._finish_exposure_error(session, camera, error)
@@ -594,6 +620,52 @@ class CameraCoordinator:
     def _require_idle_locked(self) -> None:
         if self._state is not CameraState.IDLE:
             raise CameraBusyError(f"camera is {self._state.name.lower()}")
+
+    def _require_exposure_startable_locked(self) -> None:
+        if self._state is CameraState.IDLE:
+            return
+        if self._state is CameraState.ERROR and self._error is not None:
+            return
+        raise CameraBusyError(f"camera is {self._state.name.lower()}")
+
+    @staticmethod
+    def _validate_exposure_settings(
+        settings: ExposureSettings,
+        capabilities: CameraCapabilities,
+    ) -> None:
+        if not isinstance(settings, ExposureSettings):
+            raise CameraInvalidValueError(
+                "settings provider must return ExposureSettings"
+            )
+        if (
+            isinstance(settings.binning, bool)
+            or not isinstance(settings.binning, int)
+            or not 1 <= settings.binning <= capabilities.max_bin
+        ):
+            raise CameraInvalidValueError(
+                f"binning must be between 1 and {capabilities.max_bin}"
+            )
+        if not isinstance(settings.readout_mode, ReadoutMode):
+            raise CameraInvalidValueError("unsupported readout mode")
+        if (
+            isinstance(settings.gain, bool)
+            or not isinstance(settings.gain, int)
+            or not 100 <= settings.gain <= 1650
+        ):
+            raise CameraInvalidValueError("gain must be between 100 and 1650")
+        roi = settings.roi
+        if not isinstance(roi, Roi):
+            raise CameraInvalidValueError("ROI must be a Roi")
+        if roi.x < 0 or roi.y < 0 or roi.width <= 0 or roi.height <= 0:
+            raise CameraInvalidValueError(
+                "ROI must have a non-negative origin and positive dimensions"
+            )
+        scale = settings.binning
+        if (
+            (roi.x + roi.width) * scale > capabilities.width
+            or (roi.y + roi.height) * scale > capabilities.height
+        ):
+            raise CameraInvalidValueError("ROI extends outside the sensor")
 
     def _is_current_exposure_locked(
         self, session: int, camera: CameraContract

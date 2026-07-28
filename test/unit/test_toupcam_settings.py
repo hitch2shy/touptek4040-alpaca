@@ -48,6 +48,38 @@ def test_settings_are_applied_before_the_synchronous_trigger(camera: ToupTekCame
     )
 
 
+def test_gain_uses_expo_again_and_is_applied_before_acquisition(
+    camera: ToupTekCamera,
+) -> None:
+    camera.gain = 1650
+
+    frame = camera.acquire(
+        0.01,
+        Roi(0, 0, 32, 32),
+        1,
+        ReadoutMode.RAW12,
+    )
+
+    assert camera.gain == 1650
+    assert frame.gain == 1650
+    assert ("put_ExpoAGain", 1650) in camera._sdk.calls
+    assert camera._sdk.calls.index(("put_ExpoAGain", 1650)) < next(
+        index
+        for index, call in enumerate(camera._sdk.calls)
+        if call[0] == "StartPullModeWithCallback"
+    )
+
+
+@pytest.mark.parametrize("gain", [99, 1651, 1.5, True])
+def test_gain_rejects_values_outside_the_approved_range_before_native_call(
+    camera: ToupTekCamera, gain
+) -> None:
+    with pytest.raises(CameraInvalidValueError):
+        camera.gain = gain
+
+    assert not any(call[0] == "put_ExpoAGain" for call in camera._sdk.calls)
+
+
 def test_apply_settings_returns_final_sdk_dimensions(camera: ToupTekCamera) -> None:
     """Calculating dimensions locally can disagree with SDK rounding rules."""
     applied = camera.apply_settings(

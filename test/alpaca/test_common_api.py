@@ -132,12 +132,14 @@ def test_connected_rejects_non_alpaca_boolean(bad_value, disconnected_client):
 def test_device_state_uses_coordinator_snapshot_and_connected_telemetry(client):
     response = client.simulate_get("/api/v1/camera/0/devicestate")
     values = {entry["Name"]: entry["Value"] for entry in response.json["Value"]}
+    timestamp = values.pop("TimeStamp")
+    assert timestamp.endswith("Z")
     assert values == {
         "CameraState": 0,
         "ImageReady": False,
-        "PercentCompleted": None,
+        "IsPulseGuiding": False,
+        "PercentCompleted": 0,
         "CCDTemperature": -4.5,
-        "CoolerOn": False,
         "CoolerPower": 50.0,
     }
 

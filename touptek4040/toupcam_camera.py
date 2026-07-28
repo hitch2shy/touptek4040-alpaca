@@ -47,6 +47,7 @@ class AppliedSettings:
     width: int
     height: int
     dtype: np.dtype
+    gain: int
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,7 @@ class ToupTekCamera:
                         binning=binning,
                         roi=roi,
                         readout_mode=readout_mode,
+                        gain=applied.gain,
                     )
                 except Exception as error:
                     completed = self._complete_error(generation, error)
@@ -283,6 +285,29 @@ class ToupTekCamera:
             )
         if cleanup_errors:
             raise cleanup_errors[0]
+
+    @property
+    def gain(self) -> int:
+        with self._native_lease() as handle:
+            try:
+                return handle.get_ExpoAGain()
+            except Exception as error:
+                raise _translate_sdk_error(error, "read exposure gain") from error
+
+    @gain.setter
+    def gain(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CameraInvalidValueError("gain must be an integer")
+        minimum, maximum, _ = self.identity.gain_range
+        if not minimum <= value <= maximum:
+            raise CameraInvalidValueError(
+                f"gain must be between {minimum} and {maximum}"
+            )
+        with self._native_lease() as handle:
+            try:
+                handle.put_ExpoAGain(value)
+            except Exception as error:
+                raise _translate_sdk_error(error, "set exposure gain") from error
 
     def _claim_stop(self) -> tuple[bool, Any | None]:
         """Atomically transfer ownership of the one allowed native Stop call."""
@@ -408,7 +433,10 @@ class ToupTekCamera:
     def target_temperature_c(self, value: float) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise CameraInvalidValueError("target temperature must be numeric")
-        deci_c = round(float(value) * 10)
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            raise CameraInvalidValueError("target temperature must be finite")
+        deci_c = round(numeric_value * 10)
         target_range = self.identity.tec_target_range_deci_c
         if target_range is not None and not target_range[0] <= deci_c <= target_range[1]:
             raise CameraInvalidValueError(
@@ -465,6 +493,7 @@ class ToupTekCamera:
             handle.put_ExpoTime(exposure_us)
             handle.put_Option(self._sdk.TOUPCAM_OPTION_TRIGGER, 1)
             width, height = handle.get_FinalSize()
+            gain = handle.get_ExpoAGain()
         except Exception as error:
             raise _translate_sdk_error(error, "apply capture settings") from error
         if width <= 0 or height <= 0:
@@ -473,7 +502,13 @@ class ToupTekCamera:
             raise CameraInvalidValueError(
                 "requested ROI does not produce the same final SDK dimensions"
             )
-        return AppliedSettings(exposure_us / 1_000_000.0, width, height, dtype)
+        return AppliedSettings(
+            exposure_us / 1_000_000.0,
+            width,
+            height,
+            dtype,
+            gain,
+        )
 
     def _validated_sdk_settings(
         self, settings: CaptureSettings
