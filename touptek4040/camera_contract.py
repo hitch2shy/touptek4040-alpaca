@@ -31,6 +31,8 @@ class CameraCapabilities:
 
     width: int
     height: int
+    pixel_size_x: float
+    pixel_size_y: float
     readout_modes: tuple[str, ...]
     max_bin: int
     can_abort: bool

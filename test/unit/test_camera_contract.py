@@ -12,6 +12,8 @@ def test_capabilities_describe_the_supported_sensor_operations():
     caps = CameraCapabilities(
         width=4096,
         height=4096,
+        pixel_size_x=9.0,
+        pixel_size_y=9.0,
         readout_modes=("RAW 12-bit", "RAW 8-bit"),
         max_bin=8,
         can_abort=True,
@@ -20,6 +22,7 @@ def test_capabilities_describe_the_supported_sensor_operations():
 
     assert caps.width == 4096
     assert caps.height == 4096
+    assert (caps.pixel_size_x, caps.pixel_size_y) == (9.0, 9.0)
     assert caps.readout_modes == ("RAW 12-bit", "RAW 8-bit")
     assert caps.max_bin == 8
     assert caps.can_abort is True

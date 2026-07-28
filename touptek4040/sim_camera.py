@@ -16,6 +16,8 @@ class SimCamera(CameraContract):
     _CAPABILITIES = CameraCapabilities(
         width=4096,
         height=4096,
+        pixel_size_x=9.0,
+        pixel_size_y=9.0,
         readout_modes=("RAW 12-bit", "RAW 8-bit"),
         max_bin=8,
         can_abort=True,
@@ -77,7 +79,10 @@ class SimCamera(CameraContract):
         maximum = 4095 if readout_mode is ReadoutMode.RAW12 else 255
         dtype = np.uint16 if readout_mode is ReadoutMode.RAW12 else np.uint8
         pixels = np.empty((height, width), dtype=dtype)
-        x_values = np.arange(roi.x, roi.x + roi.width, binning, dtype=np.uint32)
+        x_values = np.arange(roi.x, roi.x + roi.width, dtype=np.uint32).reshape(width, binning)
         for row, y_value in enumerate(range(roi.y, roi.y + roi.height, binning)):
-            pixels[row, :] = (x_values + y_value) % (maximum + 1)
+            block_sums = np.zeros(width, dtype=np.uint32)
+            for y_offset in range(binning):
+                block_sums += ((x_values + y_value + y_offset) % (maximum + 1)).sum(axis=1)
+            pixels[row, :] = np.minimum(block_sums, maximum)
         return pixels
