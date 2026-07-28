@@ -21,6 +21,7 @@ from test.fixtures.fake_toupcam import (
 from touptek4040.camera_contract import ReadoutMode, Roi
 from touptek4040.errors import (
     CameraBusyError,
+    CameraCleanupError,
     CameraError,
     CameraInvalidValueError,
     CameraNotConnectedError,
@@ -391,6 +392,107 @@ def test_abort_dominates_post_trigger_python_failure(
         release.set()
         with pytest.raises(CameraOperationCancelledError):
             exposure.result(1)
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["native", "dimensions", "copy"]
+)
+def test_abort_before_error_completion_linearization_wins(
+    camera: ToupTekCamera,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    entered = Event()
+    release = Event()
+    original_complete = camera._complete_error
+
+    def blocked_complete(generation, error):
+        entered.set()
+        assert release.wait(1)
+        return original_complete(generation, error)
+
+    monkeypatch.setattr(camera, "_complete_error", blocked_complete)
+    if failure_kind == "native":
+        camera._handle.trigger_error = FakeHResultError(E_TIMEOUT)
+    elif failure_kind == "dimensions":
+        camera._handle.frame_info_size_override = (30, 32)
+    else:
+        monkeypatch.setattr(
+            np, "frombuffer", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("copy"))
+        )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert entered.wait(1)
+        camera.abort()
+        release.set()
+        with pytest.raises(CameraOperationCancelledError):
+            pending.result(1)
+
+
+def test_abort_after_error_completion_linearization_cannot_replace_error(
+    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    committed = Event()
+    release = Event()
+    original_complete = camera._complete_error
+
+    def paused_after_complete(generation, error):
+        result = original_complete(generation, error)
+        committed.set()
+        assert release.wait(1)
+        return result
+
+    monkeypatch.setattr(camera, "_complete_error", paused_after_complete)
+    camera._handle.trigger_error = FakeHResultError(E_TIMEOUT)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert committed.wait(1)
+        camera.abort()
+        release.set()
+        with pytest.raises(CameraTimeoutError):
+            pending.result(1)
+
+
+def test_active_abort_retains_unexpected_trigger_error(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.cancel_error = FakeHResultError(E_UNEXPECTED)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        with pytest.raises(CameraBusyError, match="cancel trigger"):
+            camera.abort()
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+
+
+def test_disconnect_combines_abort_cleanup_and_close_errors(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.block_trigger = True
+    handle.cancel_error = FakeHResultError(E_FAIL)
+    handle.close_error = FakeHResultError(E_FAIL)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        disconnect = pool.submit(camera.disconnect)
+        with pytest.raises(CameraCleanupError) as raised:
+            disconnect.result(1)
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)
+    assert len(raised.value.errors) == 2
+    assert ("Close",) in camera._sdk.calls
 
 
 def test_a_second_acquisition_is_busy(camera: ToupTekCamera) -> None:

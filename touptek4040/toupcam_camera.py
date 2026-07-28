@@ -103,6 +103,7 @@ class ToupTekCamera:
         self._condition = Condition(self._state_lock)
         self._acquisition_lock = Lock()
         self._native_calls = 0
+        self._idle_native_active = False
         self._disconnecting = False
         self._unusable = False
         self._acquiring = False
@@ -149,13 +150,21 @@ class ToupTekCamera:
                 self._condition.wait()
             handle = self._handle
             self._handle = None
+        close_error: CameraError | None = None
         if handle is not None:
             try:
                 handle.Close()
             except Exception as error:
-                raise _translate_sdk_error(error, "disconnect camera") from error
-        if abort_error is not None:
-            raise abort_error
+                close_error = _translate_sdk_error(error, "disconnect camera")
+        disconnect_errors = tuple(
+            error for error in (abort_error, close_error) if error is not None
+        )
+        if len(disconnect_errors) > 1:
+            raise CameraCleanupError(
+                "abort cleanup and camera close both failed", disconnect_errors
+            )
+        if disconnect_errors:
+            raise disconnect_errors[0]
 
     def apply_settings(self, settings: CaptureSettings) -> AppliedSettings:
         """Validate and configure every non-running acquisition option."""
@@ -207,11 +216,13 @@ class ToupTekCamera:
                 info_width = frame_info.v3.width
                 info_height = frame_info.v3.height
                 if (info_width, info_height) != (applied.width, applied.height):
-                    self._raise_if_aborted(generation)
-                    raise CameraError(
-                        "SDK frame dimensions "
-                        f"{info_width}x{info_height} do not match configured "
-                        f"{applied.width}x{applied.height}"
+                    raise self._complete_error(
+                        generation,
+                        CameraError(
+                            "SDK frame dimensions "
+                            f"{info_width}x{info_height} do not match configured "
+                            f"{applied.width}x{applied.height}"
+                        ),
                     )
                 try:
                     pixels = np.frombuffer(
@@ -228,11 +239,10 @@ class ToupTekCamera:
                         readout_mode=readout_mode,
                     )
                 except Exception as error:
-                    try:
-                        self._raise_if_aborted(generation)
-                    except CameraOperationCancelledError as cancelled:
-                        raise cancelled from error
-                    raise
+                    completed = self._complete_error(generation, error)
+                    if isinstance(completed, CameraOperationCancelledError):
+                        raise completed from error
+                    raise completed
                 return self._commit_frame(generation, frame)
         finally:
             with self._condition:
@@ -258,8 +268,7 @@ class ToupTekCamera:
         try:
             handle.Trigger(0)
         except Exception as error:
-            if not _is_benign_idle_trigger_error(error):
-                cleanup_errors.append(_translate_sdk_error(error, "cancel trigger"))
+            cleanup_errors.append(_translate_sdk_error(error, "cancel trigger"))
         stop_error: CameraError | None = None
         try:
             handle.Stop()
@@ -310,20 +319,26 @@ class ToupTekCamera:
 
     @contextmanager
     def _native_lease(self, *, during_acquisition: bool = False):
+        owns_idle_slot = False
         with self._condition:
-            while self._stop_in_flight:
+            while self._stop_in_flight or self._idle_native_active:
                 self._condition.wait()
             handle = self._require_connected_locked()
             if self._disconnecting:
                 raise CameraNotConnectedError("camera is disconnecting")
             if self._acquiring and not during_acquisition:
                 raise CameraBusyError("camera acquisition is running")
+            if not during_acquisition:
+                self._idle_native_active = True
+                owns_idle_slot = True
             self._native_calls += 1
         try:
             yield handle
         finally:
             with self._condition:
                 self._native_calls -= 1
+                if owns_idle_slot:
+                    self._idle_native_active = False
                 self._condition.notify_all()
 
     def _raise_if_aborted(self, generation: int) -> None:
@@ -337,16 +352,33 @@ class ToupTekCamera:
     def _raise_acquisition_errors(
         self, generation: int, errors: list[CameraError]
     ) -> None:
-        try:
+        if not errors:
             self._raise_if_aborted(generation)
-        except CameraOperationCancelledError as cancelled:
-            if errors:
-                raise cancelled from errors[0]
-            raise
+            return
         if len(errors) > 1:
-            raise CameraCleanupError("multiple acquisition operations failed", tuple(errors))
-        if errors:
-            raise errors[0]
+            error: Exception = CameraCleanupError(
+                "multiple acquisition operations failed", tuple(errors)
+            )
+        else:
+            error = errors[0]
+        completed = self._complete_error(generation, error)
+        if isinstance(completed, CameraOperationCancelledError):
+            raise completed from error
+        raise completed
+
+    def _complete_error(
+        self, generation: int, error: Exception
+    ) -> Exception:
+        """Linearize one error completion against Abort."""
+        with self._condition:
+            if generation != self._abort_generation:
+                return CameraOperationCancelledError(
+                    "exposure was aborted; frame discarded"
+                )
+            self._frame_committed = True
+            self._acquiring = False
+            self._condition.notify_all()
+            return error
 
     def _commit_frame(self, generation: int, frame: Frame) -> Frame:
         """Linearize successful completion against Abort before returning."""
@@ -544,11 +576,6 @@ def _translate_sdk_error(error: Exception, operation: str) -> CameraError:
     if code in {0x8007001F, 0x80070005}:
         return CameraNotConnectedError(message)
     return CameraError(message)
-
-
-def _is_benign_idle_trigger_error(error: Exception) -> bool:
-    hr = getattr(error, "hr", None)
-    return hr is not None and (int(hr) & 0xFFFFFFFF) == 0x8000FFFF
 
 
 def _identity_from_handle(device: Any, handle: Any) -> CameraIdentity:

@@ -180,6 +180,55 @@ def test_tec_voltage_holds_one_lease_across_both_option_reads(
     ]
 
 
+def test_two_apply_settings_calls_are_serialized(camera: ToupTekCamera) -> None:
+    handle = camera._handle
+    handle.block_put_option = True
+    first_settings = CaptureSettings(
+        0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+    )
+    second_settings = CaptureSettings(
+        0.02, Roi(2, 2, 32, 32), 1, ReadoutMode.RAW8
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(camera.apply_settings, first_settings)
+        assert handle.put_option_entered.wait(1)
+        call_count = len(camera._sdk.calls)
+        second = pool.submit(camera.apply_settings, second_settings)
+        with pytest.raises(FutureTimeoutError):
+            second.result(0.05)
+        assert len(camera._sdk.calls) == call_count
+        handle.block_put_option = False
+        handle.put_option_release.set()
+        first.result(1)
+        second.result(1)
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_apply_settings_is_serialized_with_temperature_operations(
+    camera: ToupTekCamera, operation: str
+) -> None:
+    handle = camera._handle
+    handle.block_put_option = True
+    settings = CaptureSettings(
+        0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        applying = pool.submit(camera.apply_settings, settings)
+        assert handle.put_option_entered.wait(1)
+        call_count = len(camera._sdk.calls)
+        if operation == "read":
+            temperature = pool.submit(lambda: camera.temperature_c)
+        else:
+            temperature = pool.submit(setattr, camera, "target_temperature_c", -8.0)
+        with pytest.raises(FutureTimeoutError):
+            temperature.result(0.05)
+        assert len(camera._sdk.calls) == call_count
+        handle.block_put_option = False
+        handle.put_option_release.set()
+        applying.result(1)
+        temperature.result(1)
+
+
 def test_settings_require_a_connected_handle() -> None:
     """Settings on a probe-only object must fail before accessing the SDK."""
     camera = ToupTekCamera(

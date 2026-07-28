@@ -109,6 +109,7 @@ class FakeToupCam:
         self.block_stop = False
         self.block_temperature = False
         self.block_option = False
+        self.block_put_option = False
         self.block_trigger = False
         self.deliver_after_abort = False
         self.trigger_error: Exception | None = None
@@ -118,6 +119,9 @@ class FakeToupCam:
         self.temperature_release = Event()
         self.option_entered = Event()
         self.option_release = Event()
+        self.put_option_entered = Event()
+        self.put_option_release = Event()
+        self.close_error: Exception | None = None
         self.frame_size_override: tuple[int, int] | None = None
         self.frame_info_size_override: tuple[int, int] | None = None
         self.started = False
@@ -156,10 +160,15 @@ class FakeToupCam:
 
     def Close(self) -> None:
         self.sdk.calls.append(("Close",))
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
     def put_Option(self, option: int, value: int) -> None:
         self.sdk.calls.append(("put_Option", option, value))
+        self.put_option_entered.set()
+        if self.block_put_option:
+            self.put_option_release.wait(2)
         self.options[option] = value
 
     def get_Option(self, option: int) -> int:
