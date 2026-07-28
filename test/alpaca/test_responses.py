@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any, Callable
+
+import pytest
 
 from touptek4040.alpaca.responses import (
     ACTION_NOT_IMPLEMENTED,
@@ -46,6 +49,55 @@ def test_success_method_response_omits_value_and_has_exact_alpaca_fields() -> No
         "ErrorNumber": 0,
         "ErrorMessage": "",
     }
+
+
+ResponseFactory = Callable[[Any], dict[str, Any]]
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(
+            lambda transaction_id: property_response(
+                4,
+                FakeRequest(client_transaction_id=17),
+                transaction_id,
+            ),
+            id="property_response",
+        ),
+        pytest.param(
+            lambda transaction_id: method_response(
+                FakeRequest(client_transaction_id=17),
+                transaction_id,
+            ),
+            id="method_response",
+        ),
+    ],
+)
+def response_factory(request: pytest.FixtureRequest) -> ResponseFactory:
+    return request.param
+
+
+@pytest.mark.parametrize("transaction_id", [1, 0xFFFFFFFF])
+def test_response_helpers_accept_positive_uint32_server_transaction_ids(
+    response_factory: ResponseFactory,
+    transaction_id: int,
+) -> None:
+    assert response_factory(transaction_id)["ServerTransactionID"] == transaction_id
+
+
+@pytest.mark.parametrize(
+    "invalid_transaction_id",
+    [True, 0, -1, 0x100000000, "1", 1.0, None],
+)
+def test_response_helpers_reject_invalid_server_transaction_ids_consistently(
+    response_factory: ResponseFactory,
+    invalid_transaction_id: Any,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="transaction_id must be an integer from 1 through 4294967295",
+    ):
+        response_factory(invalid_transaction_id)
 
 
 def test_official_alpaca_error_numbers_are_exact() -> None:

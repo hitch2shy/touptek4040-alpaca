@@ -40,7 +40,22 @@ def test_missing_client_transaction_id_defaults_to_zero(method: str) -> None:
 
 @pytest.mark.parametrize(
     "invalid",
-    ["", "1.0", "-1", "+1", "not-an-integer", "4294967296", None, [], True],
+    [
+        "",
+        0,
+        "0",
+        "000",
+        "1.0",
+        -1,
+        "-1",
+        "+1",
+        "not-an-integer",
+        0x100000000,
+        "4294967296",
+        None,
+        [],
+        True,
+    ],
 )
 def test_invalid_client_transaction_id_becomes_alpaca_invalid_value(
     invalid: Any,
@@ -52,6 +67,41 @@ def test_invalid_client_transaction_id_becomes_alpaca_invalid_value(
 
     assert exc_info.value.number == INVALID_VALUE
     assert "ClientTransactionID" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    "long_value",
+    ["9" * 4_301, ("0" * 4_300) + "1"],
+    ids=["large-value", "leading-zeroes"],
+)
+def test_extremely_long_client_transaction_id_does_not_leak_int_error(
+    long_value: str,
+) -> None:
+    request = FakeRequest("GET", {"ClientTransactionID": long_value})
+
+    with pytest.raises(AlpacaError) as exc_info:
+        client_transaction_id(request)
+
+    assert exc_info.value.number == INVALID_VALUE
+    assert "ClientTransactionID" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    ("valid", "expected"),
+    [
+        (1, 1),
+        (0xFFFFFFFF, 0xFFFFFFFF),
+        ("1", 1),
+        ("4294967295", 0xFFFFFFFF),
+    ],
+)
+def test_client_transaction_id_accepts_only_positive_uint32_values(
+    valid: int | str,
+    expected: int,
+) -> None:
+    request = FakeRequest("GET", {"ClientTransactionID": valid})
+
+    assert client_transaction_id(request) == expected
 
 
 def test_get_parameters_are_case_insensitive() -> None:

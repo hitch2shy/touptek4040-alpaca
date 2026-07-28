@@ -73,24 +73,31 @@ def client_transaction_id(request: Any) -> int:
         return 0
 
     if isinstance(value, bool):
-        valid = False
+        transaction_id = 0
     elif isinstance(value, int):
-        valid = 0 <= value <= _UINT32_MAX
+        transaction_id = value
     elif isinstance(value, str):
-        valid = value.isascii() and value.isdecimal()
+        if (
+            len(value) > 10
+            or not value.isascii()
+            or not value.isdecimal()
+        ):
+            transaction_id = 0
+        else:
+            significant_digits = value.lstrip("0")
+            if not significant_digits:
+                transaction_id = 0
+            else:
+                try:
+                    transaction_id = int(significant_digits)
+                except (TypeError, ValueError, OverflowError):
+                    transaction_id = 0
     else:
-        valid = False
+        transaction_id = 0
 
-    if not valid:
+    if not 1 <= transaction_id <= _UINT32_MAX:
         raise AlpacaError(
             INVALID_VALUE,
-            "ClientTransactionID must be an unsigned 32-bit integer",
-        )
-
-    transaction_id = int(value)
-    if transaction_id > _UINT32_MAX:
-        raise AlpacaError(
-            INVALID_VALUE,
-            "ClientTransactionID must be an unsigned 32-bit integer",
+            "ClientTransactionID must be an integer from 1 through 4294967295",
         )
     return transaction_id

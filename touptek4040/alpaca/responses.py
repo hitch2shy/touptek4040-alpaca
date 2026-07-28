@@ -69,6 +69,14 @@ def _response_fields(
     request: Any,
     transaction_id: int,
 ) -> dict[str, int | str]:
+    if (
+        isinstance(transaction_id, bool)
+        or not isinstance(transaction_id, int)
+        or not 1 <= transaction_id <= _UINT32_MAX
+    ):
+        raise ValueError(
+            "transaction_id must be an integer from 1 through 4294967295"
+        )
     return {
         "ClientTransactionID": _client_transaction_id(request),
         "ServerTransactionID": transaction_id,
