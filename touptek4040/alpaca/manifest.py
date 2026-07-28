@@ -1,0 +1,108 @@
+"""Complete ASCOM Alpaca Camera V4 method manifest."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+HttpMethod = Literal["GET", "PUT"]
+EndpointCategory = Literal["common", "camera", "image"]
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointSpec:
+    http_method: HttpMethod
+    command: str
+    category: EndpointCategory
+
+
+CAMERA_V4_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("PUT", "action", "common"),
+    EndpointSpec("PUT", "commandblind", "common"),
+    EndpointSpec("PUT", "commandbool", "common"),
+    EndpointSpec("PUT", "commandstring", "common"),
+    EndpointSpec("PUT", "connect", "common"),
+    EndpointSpec("GET", "connected", "common"),
+    EndpointSpec("PUT", "connected", "common"),
+    EndpointSpec("GET", "connecting", "common"),
+    EndpointSpec("GET", "description", "common"),
+    EndpointSpec("GET", "devicestate", "common"),
+    EndpointSpec("PUT", "disconnect", "common"),
+    EndpointSpec("GET", "driverinfo", "common"),
+    EndpointSpec("GET", "driverversion", "common"),
+    EndpointSpec("GET", "interfaceversion", "common"),
+    EndpointSpec("GET", "name", "common"),
+    EndpointSpec("GET", "supportedactions", "common"),
+    EndpointSpec("GET", "bayeroffsetx", "camera"),
+    EndpointSpec("GET", "bayeroffsety", "camera"),
+    EndpointSpec("GET", "binx", "camera"),
+    EndpointSpec("PUT", "binx", "camera"),
+    EndpointSpec("GET", "biny", "camera"),
+    EndpointSpec("PUT", "biny", "camera"),
+    EndpointSpec("GET", "camerastate", "camera"),
+    EndpointSpec("GET", "cameraxsize", "camera"),
+    EndpointSpec("GET", "cameraysize", "camera"),
+    EndpointSpec("GET", "canabortexposure", "camera"),
+    EndpointSpec("GET", "canasymmetricbin", "camera"),
+    EndpointSpec("GET", "canfastreadout", "camera"),
+    EndpointSpec("GET", "cangetcoolerpower", "camera"),
+    EndpointSpec("GET", "canpulseguide", "camera"),
+    EndpointSpec("GET", "cansetccdtemperature", "camera"),
+    EndpointSpec("GET", "canstopexposure", "camera"),
+    EndpointSpec("GET", "ccdtemperature", "camera"),
+    EndpointSpec("GET", "cooleron", "camera"),
+    EndpointSpec("PUT", "cooleron", "camera"),
+    EndpointSpec("GET", "coolerpower", "camera"),
+    EndpointSpec("GET", "electronsperadu", "camera"),
+    EndpointSpec("GET", "exposuremax", "camera"),
+    EndpointSpec("GET", "exposuremin", "camera"),
+    EndpointSpec("GET", "exposureresolution", "camera"),
+    EndpointSpec("GET", "fastreadout", "camera"),
+    EndpointSpec("PUT", "fastreadout", "camera"),
+    EndpointSpec("GET", "fullwellcapacity", "camera"),
+    EndpointSpec("GET", "gain", "camera"),
+    EndpointSpec("PUT", "gain", "camera"),
+    EndpointSpec("GET", "gainmax", "camera"),
+    EndpointSpec("GET", "gainmin", "camera"),
+    EndpointSpec("GET", "gains", "camera"),
+    EndpointSpec("GET", "hasshutter", "camera"),
+    EndpointSpec("GET", "heatsinktemperature", "camera"),
+    EndpointSpec("GET", "imagearray", "image"),
+    EndpointSpec("GET", "imagearrayvariant", "image"),
+    EndpointSpec("GET", "imageready", "camera"),
+    EndpointSpec("GET", "ispulseguiding", "camera"),
+    EndpointSpec("GET", "lastexposureduration", "camera"),
+    EndpointSpec("GET", "lastexposurestarttime", "camera"),
+    EndpointSpec("GET", "maxadu", "camera"),
+    EndpointSpec("GET", "maxbinx", "camera"),
+    EndpointSpec("GET", "maxbiny", "camera"),
+    EndpointSpec("GET", "numx", "camera"),
+    EndpointSpec("PUT", "numx", "camera"),
+    EndpointSpec("GET", "numy", "camera"),
+    EndpointSpec("PUT", "numy", "camera"),
+    EndpointSpec("GET", "offset", "camera"),
+    EndpointSpec("PUT", "offset", "camera"),
+    EndpointSpec("GET", "offsetmax", "camera"),
+    EndpointSpec("GET", "offsetmin", "camera"),
+    EndpointSpec("GET", "offsets", "camera"),
+    EndpointSpec("GET", "percentcompleted", "camera"),
+    EndpointSpec("GET", "pixelsizex", "camera"),
+    EndpointSpec("GET", "pixelsizey", "camera"),
+    EndpointSpec("GET", "readoutmode", "camera"),
+    EndpointSpec("PUT", "readoutmode", "camera"),
+    EndpointSpec("GET", "readoutmodes", "camera"),
+    EndpointSpec("GET", "sensorname", "camera"),
+    EndpointSpec("GET", "sensortype", "camera"),
+    EndpointSpec("GET", "setccdtemperature", "camera"),
+    EndpointSpec("PUT", "setccdtemperature", "camera"),
+    EndpointSpec("GET", "startx", "camera"),
+    EndpointSpec("PUT", "startx", "camera"),
+    EndpointSpec("GET", "starty", "camera"),
+    EndpointSpec("PUT", "starty", "camera"),
+    EndpointSpec("GET", "subexposureduration", "camera"),
+    EndpointSpec("PUT", "subexposureduration", "camera"),
+    EndpointSpec("PUT", "abortexposure", "camera"),
+    EndpointSpec("PUT", "pulseguide", "camera"),
+    EndpointSpec("PUT", "startexposure", "camera"),
+    EndpointSpec("PUT", "stopexposure", "camera"),
+)
