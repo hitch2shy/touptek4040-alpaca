@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import multiprocessing
 from pathlib import Path
@@ -31,6 +31,7 @@ from .errors import (
     CameraNotConnectedError,
     CameraOperationCancelledError,
     CameraOwnerProtocolError,
+    CameraOwnerTerminationError,
     CameraTimeoutError,
     safe_camera_error,
 )
@@ -58,6 +59,19 @@ class OwnerProcessSession:
     process: Any
     command_connection: Any
     control_connection: Any
+
+
+@dataclass(slots=True)
+class _OwnerSession:
+    """All generation-bound resources captured as one lifecycle identity."""
+
+    generation: int
+    process: Any
+    command_connection: Any
+    control_connection: Any
+    registry: Any
+    response_tracker: OwnerResponseTracker
+    next_request_id: int = 0
 
 
 class OwnerProcessFactory:
@@ -129,12 +143,11 @@ class OwnerSupervisor:
         self._registry_factory = registry_factory
         self._termination_allowance_s = float(termination_allowance_s)
         self._command_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._generation = 0
-        self._next_request_id = 0
-        self._session: OwnerProcessSession | Any | None = None
-        self._registry: Any | None = None
-        self._response_tracker: OwnerResponseTracker | None = None
+        self._session: _OwnerSession | None = None
+        self._unsafe_session: _OwnerSession | None = None
         self._connected = False
         self._exposing = False
         self._confirmed_heater_level: int | None = None
@@ -142,7 +155,9 @@ class OwnerSupervisor:
         self._last_terminated_pid: int | None = None
         self._last_exit_code: int | None = None
         self._last_cleanup_error: CameraError | None = None
-        self._start_idle_owner()
+        self._last_termination_error: CameraOwnerTerminationError | None = None
+        with self._lifecycle_lock:
+            self._session = self._start_idle_owner_locked(attempts=2)
 
     @property
     def generation(self) -> int:
@@ -175,6 +190,10 @@ class OwnerSupervisor:
     def last_cleanup_error(self) -> CameraError | None:
         return self._last_cleanup_error
 
+    @property
+    def last_termination_error(self) -> CameraOwnerTerminationError | None:
+        return self._last_termination_error
+
     def deadline_for(
         self,
         operation: str,
@@ -191,43 +210,71 @@ class OwnerSupervisor:
             return self._config.disconnect_timeout_s
         if operation == "acquire":
             duration = _validated_exposure_duration(actual_duration_s)
-            return (
-                duration * self._config.exposure_multiplier
-                + self._config.exposure_overhead_s
-            )
+            try:
+                deadline = (
+                    duration * self._config.exposure_multiplier
+                    + self._config.exposure_overhead_s
+                )
+            except OverflowError as error:
+                raise CameraOwnerProtocolError(
+                    "owner acquire deadline overflowed"
+                ) from error
+            if not math.isfinite(deadline) or deadline <= 0:
+                raise CameraOwnerProtocolError(
+                    "owner acquire deadline must be finite and positive"
+                )
+            return deadline
         return self._config.command_timeout_s
 
     def connect(self) -> None:
         with self._command_lock:
             if self._connected:
                 return
-            response = self._request_locked(
+            session, response = self._request_locked(
                 "connect", {}, self.deadline_for("connect")
             )
             result = self.validate(
+                session,
                 lambda: _require_result_object(response, {"connected"})
             )
             if result["connected"] is not True:
-                self._protocol_failure("Connect response did not confirm connection")
-            with self._state_lock:
-                self._connected = True
-                self._confirmed_heater_level = None
+                self._protocol_failure(
+                    "Connect response did not confirm connection",
+                    failed_session=session,
+                )
+            with self._lifecycle_lock:
+                if self._session is not session:
+                    raise CameraNotConnectedError(
+                        "connect response belongs to a failed owner generation"
+                    )
+                with self._state_lock:
+                    self._connected = True
+                    self._confirmed_heater_level = None
 
     def disconnect(self) -> None:
         with self._command_lock:
             if not self._connected:
                 return
-            response = self._request_locked(
+            session, response = self._request_locked(
                 "disconnect", {}, self.deadline_for("disconnect")
             )
             result = self.validate(
+                session,
                 lambda: _require_result_object(response, {"connected"})
             )
             if result["connected"] is not False:
-                self._protocol_failure("Disconnect response did not confirm closure")
-            with self._state_lock:
-                self._connected = False
-                self._confirmed_heater_level = None
+                self._protocol_failure(
+                    "Disconnect response did not confirm closure",
+                    failed_session=session,
+                )
+            with self._lifecycle_lock:
+                if self._session is not session:
+                    raise CameraNotConnectedError(
+                        "disconnect response belongs to a failed owner generation"
+                    )
+                with self._state_lock:
+                    self._connected = False
+                    self._confirmed_heater_level = None
 
     def request(
         self,
@@ -235,7 +282,7 @@ class OwnerSupervisor:
         arguments: Mapping[str, object],
         *,
         require_connected: bool = True,
-    ) -> OwnerResponse:
+    ) -> tuple[_OwnerSession, OwnerResponse]:
         with self._command_lock:
             if require_connected:
                 self._require_connected()
@@ -256,14 +303,16 @@ class OwnerSupervisor:
         actual_duration_s = _validated_exposure_duration(duration_s)
         if not isinstance(roi, Roi):
             raise CameraInvalidValueError("roi must be a Roi")
-        if isinstance(binning, bool) or not isinstance(binning, int):
-            raise CameraInvalidValueError("binning must be an integer")
+        if roi.x < 0 or roi.y < 0 or roi.width <= 0 or roi.height <= 0:
+            raise CameraInvalidValueError(
+                "roi origin must be non-negative and dimensions must be positive"
+            )
+        if isinstance(binning, bool) or not isinstance(binning, int) or binning <= 0:
+            raise CameraInvalidValueError("binning must be a positive integer")
         if not isinstance(readout_mode, ReadoutMode):
             raise CameraInvalidValueError("readout_mode must be a ReadoutMode")
         with self._command_lock:
             self._require_connected()
-            acquire_session = self._session
-
             def claim() -> None:
                 with self._state_lock:
                     if not self._connected:
@@ -277,7 +326,7 @@ class OwnerSupervisor:
                     "exposure was cancelled before owner acquisition started"
                 )
             try:
-                response, acknowledged_duration_s = (
+                acquire_session, response, acknowledged_duration_s = (
                     self._acquire_request_locked(
                         {
                             "duration_s": actual_duration_s,
@@ -292,35 +341,37 @@ class OwnerSupervisor:
                         }
                     )
                 )
-                if self._session is not acquire_session:
-                    raise CameraOwnerProtocolError(
-                        "owner generation failed before frame reconstruction"
-                    )
                 descriptor, frame_values = self._frame_response(
                     response,
                     acknowledged_duration_s=acknowledged_duration_s,
                     failed_session=acquire_session,
+                    requested_roi=roi,
+                    requested_binning=binning,
+                    requested_mode=readout_mode,
                 )
                 try:
-                    pixels = self._registry.consume(descriptor)
-                except (SharedFrameError, OSError, ValueError) as error:
+                    pixels = acquire_session.registry.consume(descriptor)
+                except (SharedFrameError, OSError, TypeError, ValueError) as error:
                     self._protocol_failure(
                         f"owner frame could not be consumed: {error}",
                         failed_session=acquire_session,
                     )
-                if self._session is not acquire_session:
-                    raise CameraOwnerProtocolError(
-                        "owner generation failed before frame release"
+                try:
+                    release = self._exchange_session(
+                        acquire_session,
+                        "release_frame",
+                        {"descriptor": _descriptor_payload(descriptor)},
+                        self.deadline_for("release_frame"),
                     )
-                release = self._request_locked(
-                    "release_frame",
-                    {"descriptor": _descriptor_payload(descriptor)},
-                    self.deadline_for("release_frame"),
-                )
-                self.validate(lambda: _require_result_object(release, set()))
-                if self._session is not acquire_session:
-                    raise CameraOwnerProtocolError(
-                        "owner generation failed before frame completion"
+                    _require_result_object(release, set())
+                except (CameraTimeoutError, CameraOwnerProtocolError) as error:
+                    self._fail_owner(error, failed_session=acquire_session)
+                except CameraError as error:
+                    self._fail_owner(
+                        CameraOwnerProtocolError(
+                            f"owner frame release was not acknowledged: {error}"
+                        ),
+                        failed_session=acquire_session,
                     )
                 return Frame(pixels=pixels, **frame_values)
             finally:
@@ -330,7 +381,7 @@ class OwnerSupervisor:
     def abort(self) -> None:
         with self._state_lock:
             self._require_connected()
-        session = self._session
+        session = self._capture_session()
         if session is None:
             raise CameraNotConnectedError("camera owner is unavailable")
         deadline = time.monotonic() + self.deadline_for("abort")
@@ -374,9 +425,9 @@ class OwnerSupervisor:
             )
 
     def get_heater_level(self) -> int:
-        source_session = self._session
-        response = self.request("get_heater_level", {})
+        source_session, response = self.request("get_heater_level", {})
         value = self.validate(
+            source_session,
             lambda: _single_int_result(response, minimum=0)
         )
         with self._state_lock:
@@ -399,8 +450,12 @@ class OwnerSupervisor:
                     "heater level cannot be changed while an exposure is active"
                 )
             source_session = self._session
-        response = self.request("set_heater_level", {"value": value})
-        self.validate(lambda: _require_result_object(response, set()))
+        source_session, response = self.request(
+            "set_heater_level", {"value": value}
+        )
+        self.validate(
+            source_session, lambda: _require_result_object(response, set())
+        )
         with self._state_lock:
             if self._session is not source_session or not self._connected:
                 raise CameraNotConnectedError(
@@ -410,56 +465,72 @@ class OwnerSupervisor:
 
     def close(self) -> None:
         with self._command_lock:
-            if self._closed:
-                return
-            self._closed = True
-            session = self._session
-            if session is None:
-                return
-            try:
-                self._exchange(
-                    "shutdown",
-                    {},
-                    self._config.disconnect_timeout_s,
-                )
-            except CameraError:
-                pass
-            finally:
+            with self._lifecycle_lock:
+                self._closed = True
+                session = self._unsafe_session or self._session
+                self._session = None
                 with self._state_lock:
                     self._connected = False
+                    self._exposing = False
                     self._confirmed_heater_level = None
-                self._finish_or_terminate_exact_process()
-                self._cleanup_failed_generation_safely()
+                if session is None:
+                    return
+                if self._unsafe_session is None:
+                    try:
+                        self._exchange_session(
+                            session,
+                            "shutdown",
+                            {},
+                            self._config.disconnect_timeout_s,
+                        )
+                    except CameraError:
+                        pass
+                if not self._finish_or_terminate_session(session):
+                    self._unsafe_session = session
+                    assert self._last_termination_error is not None
+                    raise self._last_termination_error
+                self._unsafe_session = None
+                self._cleanup_session_safely(session)
 
-    def _start_idle_owner(self) -> None:
+    def _start_idle_owner_locked(self, *, attempts: int) -> _OwnerSession:
         last_error: CameraError | None = None
-        for _attempt in range(2):
+        for _attempt in range(attempts):
             if self._generation >= MAX_UINT64:
                 raise CameraOwnerProtocolError("owner generations are exhausted")
             self._generation += 1
-            self._next_request_id = 0
-            self._response_tracker = OwnerResponseTracker()
-            self._registry = self._registry_factory(
+            registry = self._registry_factory(
                 self._generation, self._registry_path
             )
+            raw_session: OwnerProcessSession | Any | None = None
+            session: _OwnerSession | None = None
             try:
-                self._session = self._process_factory.start(
+                raw_session = self._process_factory.start(
                     self._startup_spec,
                     self._generation,
                     self._registry_path,
                 )
-                response = self._exchange(
+                session = _OwnerSession(
+                    self._generation,
+                    raw_session.process,
+                    raw_session.command_connection,
+                    raw_session.control_connection,
+                    registry,
+                    OwnerResponseTracker(),
+                )
+                response = self._exchange_session(
+                    session,
                     "handshake",
                     {},
                     self._config.startup_timeout_s,
                 )
                 _require_result_object(response, {"pid", "generation"})
                 result = response.result
-                process_pid = self._session.process.pid
+                process_pid = session.process.pid
                 if (
                     type(result["pid"]) is not int
                     or result["pid"] != process_pid
-                    or result["generation"] != self._generation
+                    or type(result["generation"]) is not int
+                    or result["generation"] != session.generation
                 ):
                     raise CameraOwnerProtocolError(
                         "owner handshake identity does not match the exact child"
@@ -468,11 +539,18 @@ class OwnerSupervisor:
                     self._connected = False
                     self._exposing = False
                     self._confirmed_heater_level = None
-                return
+                return session
             except CameraError as error:
                 last_error = error
-                self._terminate_exact_process()
-                self._cleanup_failed_generation_safely()
+                if raw_session is None:
+                    continue
+                if session is None:
+                    continue
+                if not self._terminate_session(session):
+                    self._unsafe_session = session
+                    assert self._last_termination_error is not None
+                    raise self._last_termination_error
+                self._cleanup_session_safely(session)
         assert last_error is not None
         raise last_error
 
@@ -481,10 +559,15 @@ class OwnerSupervisor:
         operation: str,
         arguments: Mapping[str, object],
         timeout_s: float,
-    ) -> OwnerResponse:
-        failed_session = self._session
+    ) -> tuple[_OwnerSession, OwnerResponse]:
+        failed_session = self._capture_session()
         try:
-            return self._exchange(operation, arguments, timeout_s)
+            return (
+                failed_session,
+                self._exchange_session(
+                    failed_session, operation, arguments, timeout_s
+                ),
+            )
         except CameraTimeoutError as error:
             self._fail_owner(error, failed_session=failed_session)
         except CameraOwnerProtocolError as error:
@@ -494,10 +577,13 @@ class OwnerSupervisor:
     def _acquire_request_locked(
         self,
         arguments: Mapping[str, object],
-    ) -> tuple[OwnerResponse, float]:
-        failed_session = self._session
+    ) -> tuple[_OwnerSession, OwnerResponse, float]:
+        failed_session = self._capture_session()
         try:
-            return self._acquire_exchange(arguments)
+            response, duration = self._acquire_exchange(
+                failed_session, arguments
+            )
+            return failed_session, response, duration
         except CameraTimeoutError as error:
             self._fail_owner(error, failed_session=failed_session)
         except CameraOwnerProtocolError as error:
@@ -506,24 +592,19 @@ class OwnerSupervisor:
 
     def _acquire_exchange(
         self,
+        session: _OwnerSession,
         arguments: Mapping[str, object],
     ) -> tuple[OwnerResponse, float]:
-        session = self._session
-        tracker = self._response_tracker
-        if session is None or tracker is None:
-            raise CameraOwnerProtocolError(
-                "camera owner session is unavailable"
-            )
-        if self._next_request_id > MAX_UINT64:
+        if session.next_request_id > MAX_UINT64:
             raise CameraOwnerProtocolError("owner request IDs are exhausted")
         request = OwnerRequest(
             PROTOCOL_VERSION,
-            self._generation,
-            self._next_request_id,
+            session.generation,
+            session.next_request_id,
             "acquire",
             arguments,
         )
-        self._next_request_id += 1
+        session.next_request_id += 1
         start_deadline = (
             time.monotonic() + self._config.command_timeout_s
         )
@@ -559,7 +640,7 @@ class OwnerSupervisor:
                 f"camera owner transport failed during acquire: {error}"
             ) from error
         try:
-            response = tracker.decode(final_payload, request)
+            response = session.response_tracker.decode(final_payload, request)
         except OwnerProtocolError as error:
             raise CameraOwnerProtocolError(
                 f"camera owner returned an invalid acquire response: {error}"
@@ -572,7 +653,7 @@ class OwnerSupervisor:
 
     def _receive_until(
         self,
-        session: OwnerProcessSession | Any,
+        session: _OwnerSession,
         deadline: float,
         phase: str,
     ) -> object:
@@ -589,26 +670,23 @@ class OwnerSupervisor:
                     f"camera owner exited during {phase}"
                 )
 
-    def _exchange(
+    def _exchange_session(
         self,
+        session: _OwnerSession,
         operation: str,
         arguments: Mapping[str, object],
         timeout_s: float,
     ) -> OwnerResponse:
-        session = self._session
-        tracker = self._response_tracker
-        if session is None or tracker is None:
-            raise CameraOwnerProtocolError("camera owner session is unavailable")
-        if self._next_request_id > MAX_UINT64:
+        if session.next_request_id > MAX_UINT64:
             raise CameraOwnerProtocolError("owner request IDs are exhausted")
         request = OwnerRequest(
             PROTOCOL_VERSION,
-            self._generation,
-            self._next_request_id,
+            session.generation,
+            session.next_request_id,
             operation,
             arguments,
         )
-        self._next_request_id += 1
+        session.next_request_id += 1
         deadline = time.monotonic() + timeout_s
         try:
             session.command_connection.send(encode_request(request))
@@ -632,7 +710,7 @@ class OwnerSupervisor:
                 f"camera owner transport failed during {operation}: {error}"
             ) from error
         try:
-            response = tracker.decode(payload, request)
+            response = session.response_tracker.decode(payload, request)
         except OwnerProtocolError as error:
             raise CameraOwnerProtocolError(
                 f"camera owner returned an invalid {operation} response: {error}"
@@ -648,14 +726,17 @@ class OwnerSupervisor:
         response: OwnerResponse,
         *,
         acknowledged_duration_s: float,
-        failed_session: OwnerProcessSession | Any | None = None,
+        failed_session: _OwnerSession,
+        requested_roi: Roi,
+        requested_binning: int,
+        requested_mode: ReadoutMode,
     ) -> tuple[FrameDescriptor, dict[str, object]]:
-        result = _require_result_object(response, {"descriptor", "frame"})
-        descriptor_payload = result["descriptor"]
-        frame_payload = result["frame"]
         try:
+            result = _require_result_object(response, {"descriptor", "frame"})
+            descriptor_payload = result["descriptor"]
+            frame_payload = result["frame"]
             descriptor = _descriptor_from_payload(descriptor_payload)
-            if descriptor.owner_generation != self._generation:
+            if descriptor.owner_generation != failed_session.generation:
                 raise OwnerProtocolError(
                     "frame descriptor belongs to a stale generation"
                 )
@@ -664,7 +745,42 @@ class OwnerSupervisor:
                 raise OwnerProtocolError(
                     "frame duration does not match start acknowledgement"
                 )
-        except (OwnerProtocolError, TypeError, ValueError) as error:
+            if frame_values["roi"] != requested_roi:
+                raise OwnerProtocolError("frame ROI does not match the request")
+            if frame_values["binning"] != requested_binning:
+                raise OwnerProtocolError("frame binning does not match the request")
+            if frame_values["readout_mode"] != requested_mode:
+                raise OwnerProtocolError(
+                    "frame readout mode does not match the request"
+                )
+            expected_dtype, expected_max_adu, expected_pixel_format = {
+                ReadoutMode.RAW12: ("uint16", 4095, "RAW12"),
+                ReadoutMode.RAW8: ("uint8", 255, "RAW8"),
+            }[requested_mode]
+            expected_shape = (requested_roi.height, requested_roi.width)
+            expected_metadata = {
+                "pixel_format": expected_pixel_format,
+                "max_adu": expected_max_adu,
+            }
+            if descriptor.shape != expected_shape:
+                raise OwnerProtocolError(
+                    "frame descriptor shape does not match the requested ROI"
+                )
+            if (
+                descriptor.dtype != expected_dtype
+                or descriptor.max_adu != expected_max_adu
+                or dict(descriptor.metadata) != expected_metadata
+            ):
+                raise OwnerProtocolError(
+                    "frame descriptor does not match the requested readout mode"
+                )
+        except (
+            CameraOwnerProtocolError,
+            OwnerProtocolError,
+            OverflowError,
+            TypeError,
+            ValueError,
+        ) as error:
             self._protocol_failure(
                 f"owner frame response is invalid: {error}",
                 failed_session=failed_session,
@@ -675,108 +791,157 @@ class OwnerSupervisor:
         self,
         message: str,
         *,
-        failed_session: OwnerProcessSession | Any | None = None,
+        failed_session: _OwnerSession | None = None,
     ) -> None:
         self._fail_owner(
             CameraOwnerProtocolError(message),
             failed_session=failed_session,
         )
 
-    def validate(self, validator: Callable[[], Any]) -> Any:
+    def validate(
+        self, session: _OwnerSession, validator: Callable[[], Any]
+    ) -> Any:
         """Apply semantic response validation under generation supervision."""
         try:
-            return validator()
+            result = validator()
         except CameraOwnerProtocolError as error:
-            self._fail_owner(error)
-        raise AssertionError("unreachable")
+            self._fail_owner(error, failed_session=session)
+        with self._lifecycle_lock:
+            if self._session is not session:
+                raise CameraOwnerProtocolError(
+                    "owner response belongs to a failed generation"
+                )
+        return result
 
     def _fail_owner(
         self,
         error: CameraError,
         *,
-        failed_session: OwnerProcessSession | Any | None = None,
+        failed_session: _OwnerSession | None = None,
     ) -> None:
-        if failed_session is not None and self._session is not failed_session:
-            raise error
-        try:
-            self._terminate_exact_process()
-        finally:
+        with self._lifecycle_lock:
+            if failed_session is None:
+                failed_session = self._session
+            if failed_session is None or self._session is not failed_session:
+                raise error
+            self._session = None
             with self._state_lock:
                 self._connected = False
                 self._exposing = False
                 self._confirmed_heater_level = None
-        self._cleanup_failed_generation_safely()
-        if not self._closed:
-            self._start_idle_owner()
+            if not self._terminate_session(failed_session):
+                self._unsafe_session = failed_session
+                assert self._last_termination_error is not None
+                raise self._last_termination_error
+            self._cleanup_session_safely(failed_session)
+            if not self._closed:
+                self._session = self._start_idle_owner_locked(attempts=1)
         raise error
 
-    def _terminate_exact_process(self) -> None:
-        session = self._session
-        if session is None:
-            return
+    def _terminate_session(self, session: _OwnerSession) -> bool:
         process = session.process
-        self._last_terminated_pid = process.pid
+        try:
+            self._last_terminated_pid = process.pid
+        except BaseException:
+            self._last_terminated_pid = None
         for connection in (
             session.command_connection,
             session.control_connection,
         ):
             try:
                 connection.close()
-            except (EOFError, OSError):
+            except BaseException:
                 pass
         try:
             process.terminate()
-        except (OSError, ValueError):
+        except BaseException:
             pass
-        process.join(self._termination_allowance_s)
-        if process.is_alive():
-            process.kill()
+        try:
             process.join(self._termination_allowance_s)
-        self._last_exit_code = process.exitcode
-        self._session = None
-        self._response_tracker = None
+        except BaseException:
+            pass
+        alive = self._process_is_alive(process)
+        if alive:
+            try:
+                process.kill()
+            except BaseException:
+                pass
+            try:
+                process.join(self._termination_allowance_s)
+            except BaseException:
+                pass
+            alive = self._process_is_alive(process)
+        try:
+            self._last_exit_code = process.exitcode
+        except BaseException:
+            self._last_exit_code = None
+        if alive:
+            self._last_termination_error = CameraOwnerTerminationError(
+                "camera owner remained alive after terminate and kill"
+            )
+            return False
+        self._last_termination_error = None
+        return True
 
-    def _finish_or_terminate_exact_process(self) -> None:
-        session = self._session
-        if session is None:
-            return
+    def _finish_or_terminate_session(self, session: _OwnerSession) -> bool:
         process = session.process
-        process.join(self._termination_allowance_s)
-        if process.is_alive():
-            self._terminate_exact_process()
-            return
-        self._last_terminated_pid = process.pid
-        self._last_exit_code = process.exitcode
+        try:
+            process.join(self._termination_allowance_s)
+        except BaseException:
+            pass
+        if self._process_is_alive(process):
+            return self._terminate_session(session)
+        try:
+            self._last_terminated_pid = process.pid
+            self._last_exit_code = process.exitcode
+        except BaseException:
+            pass
         for connection in (
             session.command_connection,
             session.control_connection,
         ):
             try:
                 connection.close()
-            except (EOFError, OSError):
+            except BaseException:
                 pass
-        self._session = None
-        self._response_tracker = None
+        self._last_termination_error = None
+        return True
 
-    def _cleanup_failed_generation(self) -> None:
-        registry = self._registry
-        if registry is None:
-            return
+    @staticmethod
+    def _process_is_alive(process: Any) -> bool:
+        try:
+            return bool(process.is_alive())
+        except BaseException:
+            return True
+
+    def _cleanup_session(self, session: _OwnerSession) -> None:
+        registry = session.registry
         cleanup_generation = getattr(registry, "cleanup_generation", None)
         if callable(cleanup_generation):
-            cleanup_generation(self._generation)
+            cleanup_generation(session.generation)
             return
         # Constructing a registry after the exact child has exited invokes the
         # registry's dead-owner cleanup and only unlinks product-owned names.
-        self._registry_factory(self._generation, self._registry_path)
+        self._registry_factory(session.generation, self._registry_path)
 
-    def _cleanup_failed_generation_safely(self) -> None:
+    def _cleanup_session_safely(self, session: _OwnerSession) -> None:
         try:
-            self._cleanup_failed_generation()
+            self._cleanup_session(session)
         except BaseException as error:
             self._last_cleanup_error = safe_camera_error(
                 error, "clean failed owner generation"
             )
+
+    def _capture_session(self) -> _OwnerSession:
+        with self._lifecycle_lock:
+            session = self._session
+            if session is None:
+                if self._last_termination_error is not None:
+                    raise self._last_termination_error
+                raise CameraOwnerProtocolError(
+                    "camera owner session is unavailable"
+                )
+            return session
 
     def _require_connected(self) -> None:
         if not self._connected:
@@ -851,55 +1016,22 @@ class CameraOwnerProxy:
         return self._supervisor.last_cleanup_error
 
     @property
+    def last_termination_error(self) -> CameraOwnerTerminationError | None:
+        return self._supervisor.last_termination_error
+
+    @property
     def confirmed_heater_level(self) -> int | None:
         return self._supervisor.confirmed_heater_level
 
     @property
     def capabilities(self) -> CameraCapabilities:
-        response = self._supervisor.request(
+        session, response = self._supervisor.request(
             "capabilities", {}, require_connected=False
         )
-        result = self._supervisor.validate(
-            lambda: _require_result_object(
-                response,
-                {
-                    "width",
-                    "height",
-                    "pixel_size_x",
-                    "pixel_size_y",
-                    "readout_modes",
-                    "max_bin",
-                    "can_abort",
-                    "can_stop",
-                },
-            )
+        return self._supervisor.validate(
+            session,
+            lambda: _capabilities_result(response),
         )
-        try:
-            modes = result["readout_modes"]
-            if type(modes) is not list or not all(
-                isinstance(mode, str) and mode for mode in modes
-            ):
-                raise ValueError("readout_modes must be a list of strings")
-            if any(type(result[name]) is not int for name in ("width", "height", "max_bin")):
-                raise ValueError("capability dimensions must be integers")
-            if any(type(result[name]) not in (int, float) for name in ("pixel_size_x", "pixel_size_y")):
-                raise ValueError("pixel sizes must be finite numbers")
-            if any(type(result[name]) is not bool for name in ("can_abort", "can_stop")):
-                raise ValueError("abort/stop capabilities must be booleans")
-            return CameraCapabilities(
-                result["width"],
-                result["height"],
-                float(result["pixel_size_x"]),
-                float(result["pixel_size_y"]),
-                tuple(modes),
-                result["max_bin"],
-                result["can_abort"],
-                result["can_stop"],
-            )
-        except (TypeError, ValueError) as error:
-            self._supervisor._protocol_failure(
-                f"owner capabilities response is invalid: {error}"
-            )
 
     def connect(self) -> None:
         self._supervisor.connect()
@@ -927,85 +1059,84 @@ class CameraOwnerProxy:
 
     @property
     def gain(self) -> int:
-        response = self._supervisor.request("get_gain", {})
+        session, response = self._supervisor.request("get_gain", {})
         return self._supervisor.validate(
+            session,
             lambda: _single_int_result(response)
         )
 
     @gain.setter
     def gain(self, value: int) -> None:
         _require_exact_int(value, "gain")
-        response = self._supervisor.request("set_gain", {"value": value})
+        session, response = self._supervisor.request(
+            "set_gain", {"value": value}
+        )
         self._supervisor.validate(
+            session,
             lambda: _require_result_object(response, set())
         )
 
     @property
     def temperature_c(self) -> float:
-        response = self._supervisor.request("get_temperature", {})
+        session, response = self._supervisor.request("get_temperature", {})
         return self._supervisor.validate(
+            session,
             lambda: _single_float_result(response)
         )
 
     @property
     def target_temperature_c(self) -> float:
-        response = self._supervisor.request("get_target_temperature", {})
+        session, response = self._supervisor.request(
+            "get_target_temperature", {}
+        )
         return self._supervisor.validate(
+            session,
             lambda: _single_float_result(response)
         )
 
     @target_temperature_c.setter
     def target_temperature_c(self, value: float) -> None:
         value = _require_finite_number(value, "target temperature")
-        response = self._supervisor.request(
+        session, response = self._supervisor.request(
             "set_target_temperature", {"value": value}
         )
         self._supervisor.validate(
+            session,
             lambda: _require_result_object(response, set())
         )
 
     @property
     def cooler_on(self) -> bool:
-        response = self._supervisor.request("get_cooler_on", {})
-        result = self._supervisor.validate(
-            lambda: _require_result_object(response, {"value"})
+        session, response = self._supervisor.request("get_cooler_on", {})
+        return self._supervisor.validate(
+            session,
+            lambda: _single_bool_result(response),
         )
-        if type(result["value"]) is not bool:
-            self._supervisor._protocol_failure(
-                "owner cooler state is not a boolean"
-            )
-        return result["value"]
 
     @cooler_on.setter
     def cooler_on(self, enabled: bool) -> None:
         if type(enabled) is not bool:
             raise CameraInvalidValueError("cooler state must be a boolean")
-        response = self._supervisor.request(
+        session, response = self._supervisor.request(
             "set_cooler_on", {"value": enabled}
         )
         self._supervisor.validate(
+            session,
             lambda: _require_result_object(response, set())
         )
 
     def tec_voltage(self) -> tuple[float, float]:
-        response = self._supervisor.request("get_tec_voltage", {})
-        result = self._supervisor.validate(
-            lambda: _require_result_object(response, {"current", "maximum"})
+        session, response = self._supervisor.request("get_tec_voltage", {})
+        return self._supervisor.validate(
+            session,
+            lambda: _tec_voltage_result(response),
         )
-        try:
-            return (
-                _require_finite_response_number(result["current"]),
-                _require_finite_response_number(result["maximum"]),
-            )
-        except ValueError as error:
-            self._supervisor._protocol_failure(
-                f"owner TEC voltage response is invalid: {error}"
-            )
 
     @property
     def cooler_power_percent(self) -> float:
-        response = self._supervisor.request("get_cooler_power", {})
+        session, response = self._supervisor.request("get_cooler_power", {})
         return self._supervisor.validate(
+            session,
             lambda: _single_float_result(response)
         )
 
@@ -1028,38 +1159,28 @@ class CameraOwnerProxy:
         self._supervisor.set_heater_level(value)
 
     def _heater_capabilities(self) -> tuple[bool, int]:
-        response = self._supervisor.request(
+        session, response = self._supervisor.request(
             "get_heater_capabilities", {}, require_connected=False
         )
-        result = self._supervisor.validate(
-            lambda: _require_result_object(
-                response, {"supported", "max_level"}
-            )
+        return self._supervisor.validate(
+            session,
+            lambda: _heater_capabilities_result(response),
         )
-        if (
-            type(result["supported"]) is not bool
-            or type(result["max_level"]) is not int
-            or result["max_level"] < 0
-        ):
-            self._supervisor._protocol_failure(
-                "owner heater capabilities response is invalid"
-            )
-        return result["supported"], result["max_level"]
 
 
 def _validated_exposure_duration(value: object) -> float:
+    try:
+        converted = _finite_float(value)
+    except (OverflowError, TypeError, ValueError):
+        converted = None
     if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or not MIN_EXPOSURE_DURATION_S
-        <= float(value)
-        <= MAX_EXPOSURE_DURATION_S
+        converted is None
+        or not MIN_EXPOSURE_DURATION_S <= converted <= MAX_EXPOSURE_DURATION_S
     ):
         raise CameraInvalidValueError(
             "exposure duration must be finite and between 0.000012 and 3600 seconds"
         )
-    return float(value)
+    return converted
 
 
 def _require_result_object(
@@ -1080,23 +1201,26 @@ def _require_exact_int(value: object, field: str) -> int:
 
 
 def _require_finite_number(value: object, field: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
+    try:
+        return _finite_float(value)
+    except (OverflowError, TypeError, ValueError):
         raise CameraInvalidValueError(f"{field} must be a finite number")
-    return float(value)
 
 
 def _require_finite_response_number(value: object) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
+    try:
+        return _finite_float(value)
+    except (OverflowError, TypeError, ValueError):
         raise ValueError("value must be a finite number")
-    return float(value)
+
+
+def _finite_float(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("value must be numeric")
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError("value must be finite")
+    return converted
 
 
 def _single_int_result(
@@ -1121,6 +1245,89 @@ def _single_float_result(response: OwnerResponse) -> float:
     except ValueError as error:
         raise CameraOwnerProtocolError(
             f"owner {response.operation} returned a non-finite number"
+        ) from error
+
+
+def _single_bool_result(response: OwnerResponse) -> bool:
+    result = _require_result_object(response, {"value"})
+    if type(result["value"]) is not bool:
+        raise CameraOwnerProtocolError(
+            f"owner {response.operation} returned an invalid boolean"
+        )
+    return result["value"]
+
+
+def _tec_voltage_result(response: OwnerResponse) -> tuple[float, float]:
+    result = _require_result_object(response, {"current", "maximum"})
+    try:
+        return (
+            _require_finite_response_number(result["current"]),
+            _require_finite_response_number(result["maximum"]),
+        )
+    except ValueError as error:
+        raise CameraOwnerProtocolError(
+            "owner TEC voltage response contains an invalid number"
+        ) from error
+
+
+def _heater_capabilities_result(
+    response: OwnerResponse,
+) -> tuple[bool, int]:
+    result = _require_result_object(response, {"supported", "max_level"})
+    if (
+        type(result["supported"]) is not bool
+        or type(result["max_level"]) is not int
+        or result["max_level"] < 0
+    ):
+        raise CameraOwnerProtocolError(
+            "owner heater capabilities response is invalid"
+        )
+    return result["supported"], result["max_level"]
+
+
+def _capabilities_result(response: OwnerResponse) -> CameraCapabilities:
+    result = _require_result_object(
+        response,
+        {
+            "width",
+            "height",
+            "pixel_size_x",
+            "pixel_size_y",
+            "readout_modes",
+            "max_bin",
+            "can_abort",
+            "can_stop",
+        },
+    )
+    try:
+        modes = result["readout_modes"]
+        if type(modes) is not list or not all(
+            isinstance(mode, str) and mode for mode in modes
+        ):
+            raise ValueError("readout_modes must be a list of strings")
+        if any(
+            type(result[name]) is not int
+            for name in ("width", "height", "max_bin")
+        ):
+            raise ValueError("capability dimensions must be integers")
+        if any(
+            type(result[name]) is not bool
+            for name in ("can_abort", "can_stop")
+        ):
+            raise ValueError("abort/stop capabilities must be booleans")
+        return CameraCapabilities(
+            result["width"],
+            result["height"],
+            _require_finite_response_number(result["pixel_size_x"]),
+            _require_finite_response_number(result["pixel_size_y"]),
+            tuple(modes),
+            result["max_bin"],
+            result["can_abort"],
+            result["can_stop"],
+        )
+    except (TypeError, ValueError) as error:
+        raise CameraOwnerProtocolError(
+            f"owner capabilities response is invalid: {error}"
         ) from error
 
 
@@ -1181,14 +1388,22 @@ def _frame_values_from_payload(payload: object) -> dict[str, object]:
     if not isinstance(started, str):
         raise OwnerProtocolError("frame timestamp must be a string")
     started_utc = datetime.fromisoformat(started)
-    if started_utc.tzinfo is None or started_utc.utcoffset() is None:
-        raise OwnerProtocolError("frame timestamp must include a UTC offset")
+    if (
+        started_utc.tzinfo is None
+        or started_utc.utcoffset() is None
+        or started_utc.utcoffset() != timezone.utc.utcoffset(started_utc)
+    ):
+        raise OwnerProtocolError("frame timestamp must use UTC")
     duration_s = _require_finite_response_number(payload["duration_s"])
     if not MIN_EXPOSURE_DURATION_S <= duration_s <= MAX_EXPOSURE_DURATION_S:
         raise OwnerProtocolError("frame duration is outside the supported range")
     binning = payload["binning"]
     gain = payload["gain"]
-    if type(binning) is not int or type(gain) is not int:
+    if (
+        type(binning) is not int
+        or binning <= 0
+        or type(gain) is not int
+    ):
         raise OwnerProtocolError("frame binning and gain must be integers")
     roi_payload = payload["roi"]
     if type(roi_payload) is not dict or set(roi_payload) != {
@@ -1200,6 +1415,15 @@ def _frame_values_from_payload(payload: object) -> dict[str, object]:
         raise OwnerProtocolError("frame ROI has an invalid schema")
     if any(type(roi_payload[name]) is not int for name in roi_payload):
         raise OwnerProtocolError("frame ROI values must be integers")
+    if (
+        roi_payload["x"] < 0
+        or roi_payload["y"] < 0
+        or roi_payload["width"] <= 0
+        or roi_payload["height"] <= 0
+    ):
+        raise OwnerProtocolError(
+            "frame ROI origin and dimensions are invalid"
+        )
     try:
         readout_mode = ReadoutMode(payload["readout_mode"])
     except (TypeError, ValueError) as error:

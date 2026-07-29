@@ -113,6 +113,21 @@ class FakeConnection:
                 self.responses.append(dict(ack))
             self.responses.append(ack)
         result = self.factory.result_for(operation, payload)
+        if behavior == "error":
+            self.responses.append(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "owner_generation": self.generation,
+                    "request_id": payload["request_id"],
+                    "operation": operation,
+                    "error": {
+                        "code": "camera_error",
+                        "message": f"injected {operation} failure",
+                        "diagnostics": {},
+                    },
+                }
+            )
+            return
         response: dict[str, object] = {
             "protocol_version": PROTOCOL_VERSION,
             "owner_generation": self.generation,
@@ -251,13 +266,13 @@ def make_proxy(
     owner_config: OwnerConfig | None = None,
 ) -> CameraOwnerProxy:
     config = owner_config or OwnerConfig(
-        startup_timeout_s=0.01,
-        connect_timeout_s=0.01,
-        command_timeout_s=0.01,
-        exposure_overhead_s=0.01,
+        startup_timeout_s=0.05,
+        connect_timeout_s=0.05,
+        command_timeout_s=0.05,
+        exposure_overhead_s=0.05,
         exposure_multiplier=1.0,
-        abort_timeout_s=0.01,
-        disconnect_timeout_s=0.01,
+        abort_timeout_s=0.05,
+        disconnect_timeout_s=0.05,
     )
     supervisor = OwnerSupervisor(
         OwnerStartupSpec(),

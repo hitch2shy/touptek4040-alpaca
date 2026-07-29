@@ -29,6 +29,10 @@ class CameraOwnerProtocolError(CameraError):
     """Raised when an owner response cannot be trusted or correlated."""
 
 
+class CameraOwnerTerminationError(CameraError):
+    """Raised when an exact failed owner process cannot be proven dead."""
+
+
 class CameraOperationCancelledError(CameraError):
     """Raised when an in-flight operation is explicitly cancelled."""
 
@@ -77,6 +81,7 @@ def safe_exception_identity(error: BaseException) -> str:
         CameraNotConnectedError: "CameraNotConnectedError",
         CameraTimeoutError: "CameraTimeoutError",
         CameraOwnerProtocolError: "CameraOwnerProtocolError",
+        CameraOwnerTerminationError: "CameraOwnerTerminationError",
         CameraOperationCancelledError: "CameraOperationCancelledError",
         CameraBusyError: "CameraBusyError",
         CameraInvalidValueError: "CameraInvalidValueError",
@@ -114,6 +119,8 @@ def safe_camera_error(error: BaseException, operation: str) -> CameraError:
             error_type = CameraTimeoutError
         elif isinstance(error, CameraOwnerProtocolError):
             error_type = CameraOwnerProtocolError
+        elif isinstance(error, CameraOwnerTerminationError):
+            error_type = CameraOwnerTerminationError
         elif isinstance(error, CameraOperationCancelledError):
             error_type = CameraOperationCancelledError
         elif isinstance(error, CameraBusyError):

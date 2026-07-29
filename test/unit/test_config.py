@@ -2,7 +2,40 @@ from pathlib import Path
 
 import pytest
 
-from touptek4040.config import load_config
+from touptek4040.config import OwnerConfig, load_config
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "startup_timeout_s",
+        "connect_timeout_s",
+        "command_timeout_s",
+        "exposure_overhead_s",
+        "exposure_multiplier",
+        "abort_timeout_s",
+        "disconnect_timeout_s",
+    ],
+)
+@pytest.mark.parametrize(
+    "value", [True, 0, -1, float("nan"), float("inf"), "2", None]
+)
+def test_direct_owner_config_rejects_nonfinite_nonpositive_or_nonnumeric_values(
+    field, value
+):
+    values = {
+        "startup_timeout_s": 10.0,
+        "connect_timeout_s": 20.0,
+        "command_timeout_s": 5.0,
+        "exposure_overhead_s": 10.0,
+        "exposure_multiplier": 1.02,
+        "abort_timeout_s": 2.0,
+        "disconnect_timeout_s": 10.0,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        OwnerConfig(**values)
 
 
 def test_production_defaults_use_real_toupcam():

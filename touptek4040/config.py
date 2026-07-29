@@ -36,6 +36,36 @@ class OwnerConfig:
     abort_timeout_s: float = 2.0
     disconnect_timeout_s: float = 10.0
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "startup_timeout_s",
+            "connect_timeout_s",
+            "command_timeout_s",
+            "exposure_overhead_s",
+            "exposure_multiplier",
+            "abort_timeout_s",
+            "disconnect_timeout_s",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+            ):
+                raise ValueError(
+                    f"owner.{field_name} must be a positive finite number"
+                )
+            try:
+                normalized = float(value)
+            except (OverflowError, ValueError) as error:
+                raise ValueError(
+                    f"owner.{field_name} must be a positive finite number"
+                ) from error
+            if not math.isfinite(normalized) or normalized <= 0:
+                raise ValueError(
+                    f"owner.{field_name} must be a positive finite number"
+                )
+            object.__setattr__(self, field_name, normalized)
+
 
 @dataclass(frozen=True)
 class WebConfig:
