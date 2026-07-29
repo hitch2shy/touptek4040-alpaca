@@ -42,6 +42,10 @@ _UINT32_MAX = 0xFFFFFFFF
 _MANAGEMENT_QUERY_ERROR = "Invalid management query parameters"
 
 
+class _ConfigurationTargetUnavailable(Exception):
+    pass
+
+
 def stable_unique_id(serial: str | None, source: str | None = None) -> str:
     """Derive an ASCII UUID from stable camera identity, never process hash state."""
 
@@ -155,17 +159,20 @@ class MainSetupResource:
 
     def __init__(self, config: Any) -> None:
         self._config = config
-        config_path = getattr(config, "config_path", None)
-        self._config_path = Path(config_path) if config_path else None
+        self._config_path = _explicit_config_path(
+            getattr(config, "config_path", None)
+        )
+        self._write_target = _resolve_file_target(self._config_path)
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
         del request
         server = getattr(self._config, "server", None)
+        target = self._current_write_target()
         _setup_response(
             response,
             falcon.HTTP_200,
             _main_setup_body(
-                self._config_path,
+                target,
                 getattr(server, "host", ""),
                 getattr(server, "port", ""),
                 getattr(server, "discovery_port", ""),
@@ -182,6 +189,10 @@ class MainSetupResource:
                 "so server settings are read-only.</p>",
             )
             return
+        target = self._current_write_target()
+        if target is None:
+            _configuration_unavailable_response(response)
+            return
         try:
             values = _server_form_values(request)
         except (RequestParseError, falcon.HTTPError):
@@ -193,14 +204,9 @@ class MainSetupResource:
             )
             return
         try:
-            _write_server_config(self._config_path, values)
-        except FileNotFoundError:
-            _setup_response(
-                response,
-                falcon.HTTP_500,
-                "<h1>Configuration file is unavailable</h1>"
-                "<p>The configured file must already exist and be accessible.</p>",
-            )
+            _write_server_config(self._config_path, target, values)
+        except _ConfigurationTargetUnavailable:
+            _configuration_unavailable_response(response)
             return
         except OSError:
             _setup_response(
@@ -224,6 +230,12 @@ class MainSetupResource:
                 ),
             ),
         )
+
+    def _current_write_target(self) -> Path | None:
+        target = _resolve_file_target(self._config_path)
+        if target is None or target != self._write_target:
+            return None
+        return target
 
 
 class DeviceSetupResource:
@@ -355,16 +367,20 @@ def _validate_port(port: str) -> None:
         raise RequestParseError(INVALID_VALUE, "Invalid server configuration")
 
 
-def _write_server_config(config_path: Path, values: Mapping[str, str]) -> None:
-    if not config_path.is_file():
-        raise FileNotFoundError(config_path)
+def _write_server_config(
+    config_path: Path,
+    target: Path,
+    values: Mapping[str, str],
+) -> None:
+    if _resolve_file_target(config_path) != target:
+        raise _ConfigurationTargetUnavailable
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        with config_path.open("r", encoding="utf-8") as stream:
+        with target.open("r", encoding="utf-8") as stream:
             parser.read_file(stream)
-    except FileNotFoundError:
-        raise
-    except (OSError, configparser.Error) as error:
+    except OSError as error:
+        raise _ConfigurationTargetUnavailable from error
+    except configparser.Error as error:
         raise OSError("configuration could not be read") from error
     if not parser.has_section("server"):
         parser.add_section("server")
@@ -375,9 +391,9 @@ def _write_server_config(config_path: Path, values: Mapping[str, str]) -> None:
     temporary_path: Path | None = None
     try:
         descriptor, raw_path = tempfile.mkstemp(
-            prefix=f".{config_path.name}.",
+            prefix=f".{target.name}.",
             suffix=".tmp",
-            dir=config_path.parent,
+            dir=target.parent,
         )
         temporary_path = Path(raw_path)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
@@ -385,9 +401,11 @@ def _write_server_config(config_path: Path, values: Mapping[str, str]) -> None:
             parser.write(stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, config_path)
+        if _resolve_file_target(config_path) != target:
+            raise _ConfigurationTargetUnavailable
+        os.replace(temporary_path, target)
         temporary_path = None
-    except OSError:
+    except (OSError, _ConfigurationTargetUnavailable):
         raise
     finally:
         if descriptor >= 0:
@@ -395,8 +413,27 @@ def _write_server_config(config_path: Path, values: Mapping[str, str]) -> None:
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
+
+
+def _explicit_config_path(value: object) -> Path | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Path(value)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _resolve_file_target(config_path: Path | None) -> Path | None:
+    if config_path is None:
+        return None
+    try:
+        target = config_path.resolve(strict=True)
+        return target if target.is_file() else None
+    except (OSError, RuntimeError):
+        return None
 
 
 def _main_setup_body(
@@ -447,6 +484,16 @@ def _setup_response(
     response.status = status
     response.content_type = falcon.MEDIA_HTML
     response.text = _html_page(SERVER_NAME, body)
+
+
+def _configuration_unavailable_response(response: falcon.Response) -> None:
+    _setup_response(
+        response,
+        falcon.HTTP_403,
+        "<h1>Configuration file is unavailable</h1>"
+        "<p>Server settings are read-only because the configured path "
+        "does not resolve to the approved existing file.</p>",
+    )
 
 
 def _html_page(title: str, body: str) -> str:

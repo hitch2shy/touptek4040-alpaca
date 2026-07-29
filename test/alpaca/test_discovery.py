@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import socket
 import struct
 import threading
@@ -376,10 +377,10 @@ def test_ipv6_partial_join_failure_keeps_successful_interface(caplog):
         )
         _wait_until(lambda: ipv6.sent)
 
-    assert any(
-        "interface 3" in record.message
-        for record in caplog.records
-    )
+    assert not [
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
     assert responder.running is True
     responder.stop()
 
@@ -413,6 +414,82 @@ def test_ipv6_all_join_failures_degrade_to_ipv4_and_warn_only_once(caplog):
         for sock in factory.sockets
         if sock.family == socket.AF_INET6
     )
+
+
+def test_ipv6_many_join_failures_across_restarts_emit_one_warning(caplog):
+    module = _discovery_module()
+    indexes = list(range(1, 55))
+    factory = _SocketFactory(
+        ipv6_failure=False,
+        join_fail_indexes=indexes,
+    )
+    responder = module.DiscoveryResponder(
+        11111,
+        socket_factory=factory,
+        interface_enumerator=lambda: [
+            (index, f"adapter-{index}") for index in indexes
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            responder.start()
+            assert responder.running is True
+            responder.stop()
+
+    warnings = [
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "IPv6 Alpaca discovery is unavailable" in warnings[0].message
+
+
+class _LoopbackBoundSocket:
+    def __init__(self, family, socket_type):
+        self.family = family
+        self._socket = socket.socket(family, socket_type)
+
+    def bind(self, address):
+        host = "127.0.0.1" if self.family == socket.AF_INET else "::1"
+        self._socket.bind((host, address[1]))
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows loopback integration")
+def test_windows_loopback_start_never_floods_ipv6_warnings(caplog):
+    module = _discovery_module()
+    loopbacks = [
+        (index, name)
+        for index, name in socket.if_nameindex()
+        if "loopback" in name.casefold()
+    ]
+    if not loopbacks:
+        pytest.skip("Windows loopback interface name is unavailable")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    responder = module.DiscoveryResponder(
+        11111,
+        discovery_port=port,
+        socket_factory=_LoopbackBoundSocket,
+        interface_enumerator=lambda: loopbacks,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        responder.start()
+        assert responder.running is True
+        responder.stop()
+        responder.start()
+        assert responder.running is True
+        responder.stop()
+
+    assert len([
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]) <= 1
 
 
 def test_overlapping_stop_and_start_retire_old_generation_without_leaks():

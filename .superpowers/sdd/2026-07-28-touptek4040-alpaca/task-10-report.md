@@ -137,3 +137,83 @@ Fix commit subject:
 Fix commit reference: `HEAD`. The exact immutable hash is recorded in the
 Task 10 round-1 handoff after commit because a Git commit cannot contain its own
 final hash without changing that hash.
+
+## Review fix round 2/5
+
+The two remaining Important findings were closed. The listener busy-loop Minor
+remains intentionally unchanged.
+
+### Bounded IPv6 interface degradation logging
+
+IPv6 multicast membership still uses the injectable interface enumeration
+boundary, validates and deduplicates indexes, attempts every supplied
+applicable index, preserves all successful memberships, and replies to scoped
+IPv6 source tuples unchanged.
+
+Individual join failures no longer emit warnings. When at least one interface
+joins, failures are summarized at debug level and IPv6 remains active. When
+every supplied interface fails, the IPv6 socket closes, IPv4 remains active,
+and the responder's existing lifecycle warning gate emits at most one
+actionable degradation warning across every later stop and restart.
+
+A 54-interface fake failure probe repeated across three complete starts
+initially observed `163` warnings. The round-2 implementation emits exactly
+one. A partial failure with another successful membership emits no warning.
+A real Windows socket integration test binds both families to loopback only,
+performs no discovery send, repeats the responder lifecycle, and verifies at
+most one warning.
+
+### Resolved setup write target
+
+An explicit `config_path` enables the setup form only when it resolves at
+application construction to an existing regular file. Every GET confirms that
+the path still resolves to that same approved target. Missing paths,
+directories, broken or non-file symlink targets, and resolution failures render
+the root page read-only without a form.
+
+POST checks the same resolved target before parsing or writing, again at the
+write boundary, and once more immediately before atomic replacement. If the
+path disappears or resolves elsewhere, the request receives the stable HTML
+403 unavailable response. No file is created, no temporary file remains, and
+the condition is never reported as an internal 500. Successful writes and
+genuine replacement failures retain the round-1 atomic-write behavior.
+
+The round-2 RED focused result was `7 failed, 39 passed`: two warning-bound
+failures, two read-only GET failures, and three unavailable-target POST
+failures. The focused Discovery and Setup GREEN result is `46 passed`.
+
+## Round-2 verification
+
+Focused Management, Setup, Discovery, protocol-error, and version set:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/alpaca/test_management.py test/alpaca/test_setup_pages.py test/alpaca/test_discovery.py test/alpaca/test_protocol_errors.py test/unit/test_version_metadata.py -q
+```
+
+Result: `140 passed`.
+
+Complete test tree:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test -q
+```
+
+Result: `733 passed, 4 skipped`. The skips remain the existing hardware opt-in
+tests; no hardware access was attempted.
+
+Compilation and whitespace validation both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+No listener busy-loop Minor, ledger, approved plan, or approved design file was
+modified.
+
+Round-2 fix commit subject:
+
+`fix: bound discovery warnings and setup writes`
+
+Round-2 commit reference: `HEAD`; its exact immutable hash is recorded in the
+handoff after commit.

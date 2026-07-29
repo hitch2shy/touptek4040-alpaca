@@ -202,6 +202,7 @@ class DiscoveryResponder:
             sock.bind(("::", self._discovery_port))
             group = socket.inet_pton(socket.AF_INET6, IPV6_MULTICAST_GROUP)
             joined = 0
+            rejected = 0
             seen_indexes: set[int] = set()
             for index, _name in self._interface_enumerator():
                 if (
@@ -219,16 +220,18 @@ class DiscoveryResponder:
                         group + struct.pack("@I", index),
                     )
                     joined += 1
-                except OSError as error:
-                    self._logger.warning(
-                        "IPv6 Alpaca discovery could not join interface %s "
-                        "(%s); trying remaining interfaces",
-                        index,
-                        type(error).__name__,
-                    )
+                except OSError:
+                    rejected += 1
             if joined == 0:
                 raise OSError(
                     "no IPv6 interface could join Alpaca discovery multicast"
+                )
+            if rejected:
+                self._logger.debug(
+                    "IPv6 Alpaca discovery joined %s interface(s); "
+                    "%s inapplicable interface(s) were skipped",
+                    joined,
+                    rejected,
                 )
             sock.settimeout(0.2)
             return sock

@@ -159,6 +159,25 @@ def test_root_setup_get_escapes_configured_values_and_offers_server_form(
     assert 'name="discovery_port"' in response.text
 
 
+@pytest.mark.parametrize("target_kind", ["missing", "directory"])
+def test_root_setup_get_with_unusable_config_target_is_read_only(
+    coordinator,
+    tmp_path,
+    target_kind,
+):
+    config_path = tmp_path / "camera.ini"
+    if target_kind == "directory":
+        config_path.mkdir()
+    client = _configurable_client(coordinator, config_path)
+
+    response = client.simulate_get("/setup")
+
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/html")
+    assert "read-only" in response.text.casefold()
+    assert "<form" not in response.text.casefold()
+
+
 def test_root_setup_post_atomically_updates_only_server_fields(
     coordinator,
     api_camera,
@@ -280,9 +299,53 @@ def test_root_setup_missing_config_file_has_stable_error_without_creation(
         headers={"content-type": "application/x-www-form-urlencoded"},
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 403
     assert response.content_type.startswith("text/html")
     assert "configuration file is unavailable" in response.text.casefold()
+    assert config_path.exists() is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_root_setup_directory_config_target_is_never_written(
+    coordinator,
+    tmp_path,
+):
+    config_path = tmp_path / "camera.ini"
+    config_path.mkdir()
+    client = _configurable_client(coordinator, config_path)
+
+    response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 403
+    assert "configuration file is unavailable" in response.text.casefold()
+    assert config_path.is_dir()
+    assert list(config_path.iterdir()) == []
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_root_setup_file_disappearing_after_get_is_not_recreated(
+    coordinator,
+    tmp_path,
+):
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    client = _configurable_client(coordinator, config_path)
+    get_response = client.simulate_get("/setup")
+    assert '<form method="post" action="/setup">' in get_response.text
+
+    config_path.unlink()
+    post_response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert post_response.status_code == 403
+    assert "configuration file is unavailable" in post_response.text.casefold()
     assert config_path.exists() is False
     assert list(tmp_path.iterdir()) == []
 
