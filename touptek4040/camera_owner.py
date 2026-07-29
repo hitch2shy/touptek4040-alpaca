@@ -125,6 +125,10 @@ def camera_owner_main(
                 control_connection.send({"operation": "rejected", "ok": False, "error": "control message must be an object"})
                 continue
             operation = message.get("operation")
+            if set(message) != {"operation"}:
+                response_operation = operation if isinstance(operation, str) else "invalid_control"
+                control_connection.send({"operation": response_operation, "ok": False, "error": "control message has an invalid schema"})
+                continue
             if not isinstance(operation, str):
                 control_connection.send({"operation": "rejected", "ok": False, "error": "control operation is required"})
                 continue

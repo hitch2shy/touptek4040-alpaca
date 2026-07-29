@@ -17,7 +17,7 @@ from touptek4040.errors import CameraInvalidValueError, CameraNotConnectedError
 class FakeOwnerBackend:
     """Small deterministic backend whose process identity is observable."""
 
-    def __init__(self, serial: str | None = None, restore_log_path: str | None = None, block_acquire: bool = False, fail_snapshot: bool = False, fail_disconnects: int = 0) -> None:
+    def __init__(self, serial: str | None = None, restore_log_path: str | None = None, block_acquire: bool = False, fail_snapshot: bool = False, fail_disconnects: int = 0, fail_abort: bool = False) -> None:
         self.serial = serial or "FAKE-OWNER"
         self.backend_pid = os.getpid()
         self.connected = False
@@ -32,6 +32,7 @@ class FakeOwnerBackend:
         self._fail_snapshot = fail_snapshot
         self._abort_requested = Event()
         self._fail_disconnects = fail_disconnects
+        self._fail_abort = fail_abort
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -63,6 +64,8 @@ class FakeOwnerBackend:
     def abort(self) -> None:
         self.abort_calls += 1
         self._abort_requested.set()
+        if self._fail_abort:
+            raise RuntimeError("fake abort failed")
 
     @property
     def gain(self) -> int:
@@ -139,4 +142,4 @@ def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBack
     restore_log_path = kwargs.get("restore_log_path")
     if restore_log_path is not None and not isinstance(restore_log_path, str):
         raise TypeError("restore_log_path must be a string")
-    return FakeOwnerBackend(serial, restore_log_path, bool(kwargs.get("block_acquire", False)), bool(kwargs.get("fail_snapshot", False)), int(kwargs.get("fail_disconnects", 0)))
+    return FakeOwnerBackend(serial, restore_log_path, bool(kwargs.get("block_acquire", False)), bool(kwargs.get("fail_snapshot", False)), int(kwargs.get("fail_disconnects", 0)), bool(kwargs.get("fail_abort", False)))

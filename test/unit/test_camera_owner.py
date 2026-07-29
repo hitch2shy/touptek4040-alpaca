@@ -201,6 +201,27 @@ def test_control_messages_always_receive_a_bounded_response(owner_harness: Owner
         assert len(response["error"]) <= 256
 
 
+@pytest.mark.parametrize("operation", ["abort", "shutdown"])
+def test_control_extra_key_never_executes_the_requested_operation(owner_harness: OwnerHarness, operation: str):
+    owner_harness._control_parent.send({"operation": operation, "extra": True})
+    assert owner_harness._control_parent.poll(3)
+    response = owner_harness._control_parent.recv()
+    assert response == {"operation": operation, "ok": False, "error": "control message has an invalid schema"}
+    assert owner_harness.process.is_alive()
+
+
+def test_control_abort_failure_is_returned_to_the_parent(tmp_path: Path):
+    harness = OwnerHarness(tmp_path, {"fail_abort": True})
+    try:
+        harness.request("connect", {})
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        response = harness._control_parent.recv()
+        assert response["operation"] == "abort" and response["ok"] is False
+    finally:
+        harness.close()
+
+
 def test_fresh_interpreter_import_of_owner_does_not_import_sdk_loader(tmp_path: Path):
     result = subprocess.run(
         [sys.executable, "-c", "import sys; import touptek4040.camera_owner; assert 'touptek4040.toupcam_loader' not in sys.modules"],
