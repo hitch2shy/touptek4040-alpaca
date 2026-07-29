@@ -164,15 +164,18 @@ class GuiCloseController:
         self._workers = workers
         self._cleanup = cleanup
         self._finalizer: threading.Thread | None = None
+        self._root_destroyed = False
         self.cleanup_error: BaseException | None = None
         self.closing = False
+
+    @property
+    def finalizer(self) -> threading.Thread | None:
+        return self._finalizer
 
     def request_close(self) -> None:
         if self.closing:
             return
         self.closing = True
-        for child in self._buttons.winfo_children():
-            child.configure(state="disabled")
 
         def guarded_cleanup() -> None:
             try:
@@ -181,16 +184,25 @@ class GuiCloseController:
                 self.cleanup_error = error
 
         self._finalizer = self._workers.close(guarded_cleanup)
-        self._root.after(20, self._poll)
+        try:
+            for child in self._buttons.winfo_children():
+                child.configure(state="disabled")
+        finally:
+            # Scheduling may fail, or the callback may never run after a
+            # mainloop failure. The main-thread final cleanup joins and
+            # destroys explicitly in either case.
+            self._root.after(20, self._poll)
 
     def _poll(self) -> None:
         finalizer = self._finalizer
         if finalizer is not None and finalizer.is_alive():
             self._root.after(20, self._poll)
             return
-        self._root.destroy()
+        self.destroy_root()
 
     def join(self) -> None:
+        # There is no safe way to kill a Python worker that may own the camera.
+        # Deliberately keep resource ownership until every accepted action ends.
         finalizer = self._finalizer
         if finalizer is not None:
             finalizer.join()
@@ -199,6 +211,14 @@ class GuiCloseController:
                 "Diagnostic final cleanup failed: %s",
                 safe_exception_text(self.cleanup_error),
             )
+
+    def destroy_root(self) -> None:
+        """Destroy Tk exactly once; callers must invoke this on the Tk thread."""
+
+        if self._root_destroyed:
+            return
+        self._root.destroy()
+        self._root_destroyed = True
 
 
 def run_mainloop_with_cleanup(root: Any, cleanup) -> None:
@@ -474,8 +494,8 @@ def _run_diagnostic_window(
     )
 
     def close() -> None:
-        close_controller.request_close()
         cleanup_scheduled[0] = True
+        close_controller.request_close()
 
     root.protocol("WM_DELETE_WINDOW", close)
     append("Diagnostics ready; camera remains unopened until Connect")
@@ -485,11 +505,13 @@ def _run_diagnostic_window(
             try:
                 close_controller.request_close()
             except BaseException:
-                # The Tk loop may itself have failed; cleanup still must finish.
-                if not workers.closing:
-                    workers.close(camera_cleanup)
-            cleanup_scheduled[0] = True
+                # The controller starts and owns cleanup before touching Tk.
+                _LOG.exception("Diagnostic window close request failed")
+        cleanup_scheduled[0] = True
         close_controller.join()
+        # A callback scheduled with ``after`` cannot run once mainloop failed.
+        # We are back on the Tk thread here, so finish destruction explicitly.
+        close_controller.destroy_root()
         package_logger.removeHandler(queue_handler)
         queue_handler.close()
         logging_session.close()

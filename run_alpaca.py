@@ -15,7 +15,6 @@ from threading import Lock
 from typing import Any
 
 from waitress import create_server
-from waitress.task import ThreadedTaskDispatcher
 
 from touptek4040.alpaca.app import create_app
 from touptek4040.alpaca.discovery import DiscoveryResponder
@@ -167,7 +166,7 @@ class RuntimeServer:
         logging_session: LoggingSession | None,
         port: int | None = None,
     ) -> None:
-        self.http = http
+        self.http = _OwnedWaitressServer.adopt(http)
         self.discovery = discovery
         self.coordinator = coordinator
         self.config = config
@@ -181,7 +180,6 @@ class RuntimeServer:
         self._logging_session = logging_session
         self._cleaned = {
             "http": False,
-            "dispatcher": False,
             "discovery": False,
             "camera": False,
             "logging": logging_session is None,
@@ -201,11 +199,6 @@ class RuntimeServer:
     def shutdown(self) -> None:
         with self._shutdown_lock:
             self._cleanup_step("http", self.http.close)
-            dispatcher = getattr(self.http, "task_dispatcher", None)
-            self._cleanup_step(
-                "dispatcher",
-                (dispatcher.shutdown if dispatcher is not None else lambda: None),
-            )
             self._cleanup_step("discovery", self.discovery.stop)
             self._cleanup_step(
                 "camera",
@@ -213,7 +206,7 @@ class RuntimeServer:
             )
             if all(
                 self._cleaned[name]
-                for name in ("http", "dispatcher", "discovery", "camera")
+                for name in ("http", "discovery", "camera")
             ):
                 _LOG.info("Alpaca server stopped")
             if self._logging_session is not None:
@@ -331,41 +324,190 @@ def _http_listener_metadata(http: Any) -> tuple[int, frozenset[int]]:
 
 
 def _cleanup_bootstrap_http(http: Any) -> None:
-    for action in (
-        getattr(http, "close", lambda: None),
-        getattr(getattr(http, "task_dispatcher", None), "shutdown", lambda: None),
-    ):
+    try:
+        _OwnedWaitressServer.adopt(http).close()
+    except BaseException:
+        _LOG.exception("HTTP bootstrap cleanup failed")
+
+
+def _contains_identity(values, candidate: Any) -> bool:
+    return any(value is candidate for value in values)
+
+
+def _unique_identities(values) -> list[Any]:
+    unique: list[Any] = []
+    for value in values:
+        if not _contains_identity(unique, value):
+            unique.append(value)
+    return unique
+
+
+def _remove_map_identity(socket_map: dict[Any, Any], entry: Any) -> None:
+    for key, value in tuple(socket_map.items()):
+        if value is entry:
+            socket_map.pop(key, None)
+
+
+def _close_waitress_map_once(
+    socket_map: dict[Any, Any],
+    closed_entries: list[Any] | None = None,
+) -> list[BaseException]:
+    """Close listener owners first, then only entries still left in the map."""
+
+    closed = closed_entries if closed_entries is not None else []
+    attempted: list[Any] = []
+    errors: list[BaseException] = []
+
+    def close_entry(entry: Any) -> None:
+        if (
+            _contains_identity(attempted, entry)
+            or _contains_identity(closed, entry)
+        ):
+            return
+        attempted.append(entry)
         try:
-            action()
-        except BaseException:
-            _LOG.exception("HTTP bootstrap cleanup failed")
+            entry.close()
+        except BaseException as error:
+            errors.append(error)
+        else:
+            closed.append(entry)
+            _remove_map_identity(socket_map, entry)
+
+    entries = _unique_identities(tuple(socket_map.values()))
+    for entry in entries:
+        if _contains_identity(entries, getattr(entry, "trigger", None)):
+            close_entry(entry)
+    for entry in _unique_identities(tuple(socket_map.values())):
+        close_entry(entry)
+    return errors
+
+
+def _map_dispatchers(socket_map: dict[Any, Any]) -> list[Any]:
+    return _unique_identities(
+        dispatcher
+        for entry in tuple(socket_map.values())
+        if (dispatcher := getattr(entry, "task_dispatcher", None)) is not None
+    )
+
+
+class _OwnedWaitressServer:
+    """Own Waitress's socket map and dispatcher as one close operation."""
+
+    def __init__(
+        self,
+        server: Any,
+        socket_map: dict[Any, Any] | None = None,
+        dispatcher: Any | None = None,
+    ) -> None:
+        self._server = server
+        self._socket_map = socket_map if socket_map is not None else {}
+        self._dispatcher = (
+            dispatcher
+            if dispatcher is not None
+            else getattr(server, "task_dispatcher", None)
+        )
+        self._standalone_server = not self._socket_map
+        self._standalone_closed = False
+        self._closed_entries: list[Any] = []
+        self._dispatcher_closed = self._dispatcher is None
+        self._close_lock = Lock()
+
+    @classmethod
+    def adopt(cls, server: Any) -> _OwnedWaitressServer:
+        if isinstance(server, cls):
+            return server
+        socket_map = getattr(server, "map", None)
+        return cls(
+            server,
+            socket_map if isinstance(socket_map, dict) else None,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._server, name)
+
+    def run(self) -> None:
+        self._server.run()
+
+    def close(self) -> None:
+        errors: list[BaseException] = []
+        with self._close_lock:
+            if self._standalone_server and not self._standalone_closed:
+                try:
+                    self._server.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._standalone_closed = True
+            else:
+                errors.extend(
+                    _close_waitress_map_once(
+                        self._socket_map,
+                        self._closed_entries,
+                    )
+                )
+            if not self._dispatcher_closed:
+                try:
+                    self._dispatcher.shutdown()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._dispatcher_closed = True
+        if errors:
+            for extra in errors[1:]:
+                _LOG.error(
+                    "Additional Waitress shutdown failure: %s",
+                    extra,
+                    exc_info=(
+                        type(extra),
+                        extra,
+                        extra.__traceback__,
+                    ),
+                )
+            raise errors[0]
 
 
 def _create_owned_http(application: Any, **kwargs: Any) -> Any:
-    """Create Waitress with caller-owned map/dispatcher for failure cleanup."""
+    """Construct every listener before starting Waitress worker threads."""
 
     socket_map: dict[Any, Any] = {}
-    dispatcher = ThreadedTaskDispatcher()
+    requested_threads = int(kwargs.pop("threads", 4))
+    http = None
     try:
         http = create_server(
             application,
             map=socket_map,
-            _dispatcher=dispatcher,
+            threads=0,
             **kwargs,
         )
-        if getattr(http, "task_dispatcher", None) is dispatcher:
-            dispatcher.set_thread_count(int(kwargs.get("threads", 4)))
-        return http
+        dispatcher = getattr(http, "task_dispatcher")
+        dispatcher.set_thread_count(requested_threads)
+        return _OwnedWaitressServer(http, socket_map, dispatcher)
     except BaseException:
-        for listener in tuple(socket_map.values()):
+        dispatchers = _map_dispatchers(socket_map)
+        if http is not None:
+            dispatcher = getattr(http, "task_dispatcher", None)
+            if (
+                dispatcher is not None
+                and not _contains_identity(dispatchers, dispatcher)
+            ):
+                dispatchers.append(dispatcher)
+        errors = _close_waitress_map_once(socket_map)
+        if http is not None and not socket_map and not dispatchers:
             try:
-                listener.close()
-            except BaseException:
-                _LOG.exception("Partial Waitress listener cleanup failed")
-        try:
-            dispatcher.shutdown()
-        except BaseException:
-            _LOG.exception("Partial Waitress dispatcher cleanup failed")
+                http.close()
+            except BaseException as error:
+                errors.append(error)
+        for dispatcher in dispatchers:
+            try:
+                dispatcher.shutdown()
+            except BaseException as error:
+                errors.append(error)
+        for error in errors:
+            _LOG.error(
+                "Partial Waitress construction cleanup failed: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
         raise
 
 

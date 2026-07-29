@@ -491,24 +491,130 @@ def test_gui_close_waits_for_final_cleanup_before_destroy(cleanup_raises) -> Non
     assert bool(controller.cleanup_error) is cleanup_raises
 
 
-def test_waitress_partial_multisocket_creation_closes_owned_resources(monkeypatch) -> None:
-    closed = []
-    dispatcher = SimpleNamespace(
-        set_thread_count=lambda _count: None,
-        shutdown=lambda: closed.append("dispatcher"),
+def test_gui_button_failure_still_joins_cleanup_before_destroy() -> None:
+    events: list[str] = []
+    root = _PollingRoot(events)
+    buttons = SimpleNamespace(
+        winfo_children=lambda: [
+            SimpleNamespace(
+                configure=lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("button is broken")
+                )
+            )
+        ]
     )
-    listener = SimpleNamespace(close=lambda: closed.append("listener"))
+    controller = GuiCloseController(
+        root,
+        buttons,
+        DiagnosticWorkerPool(),
+        lambda: events.append("camera-cleanup"),
+    )
 
-    def partial_failure(_app, *, map, _dispatcher, **_kwargs):
-        assert _dispatcher is dispatcher
-        map[1] = listener
+    with pytest.raises(RuntimeError, match="button is broken"):
+        controller.request_close()
+    controller.join()
+    controller.destroy_root()
+    events.append("logging-close")
+
+    assert events == ["camera-cleanup", "root-destroy", "logging-close"]
+    assert root.destroy_threads == [threading.get_ident()]
+    assert controller.finalizer is not None
+    assert not controller.finalizer.is_alive()
+
+
+def test_gui_mainloop_failure_joins_cleanup_and_destroys_on_tk_thread() -> None:
+    events: list[str] = []
+    root = _PollingRoot(events, mainloop_error=RuntimeError("Tk failed"))
+    buttons = SimpleNamespace(winfo_children=lambda: [])
+    controller = GuiCloseController(
+        root,
+        buttons,
+        DiagnosticWorkerPool(),
+        lambda: events.append("camera-cleanup"),
+    )
+
+    def final_cleanup() -> None:
+        controller.request_close()
+        controller.join()
+        controller.destroy_root()
+        events.append("logging-close")
+
+    with pytest.raises(RuntimeError, match="Tk failed"):
+        run_mainloop_with_cleanup(root, final_cleanup)
+
+    assert events == ["camera-cleanup", "root-destroy", "logging-close"]
+    assert root.destroy_threads == [threading.get_ident()]
+    assert controller.finalizer is not None
+    assert not controller.finalizer.is_alive()
+
+
+def test_waitress_partial_multisocket_creation_closes_each_owned_resource_once(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    dispatcher = _CountingDispatcher(events)
+
+    def partial_failure(_app, *, map, threads, **kwargs):
+        assert threads == 0
+        assert "_dispatcher" not in kwargs
+        _add_owned_listener(map, 10, "first", dispatcher, events)
+        map[20] = _MapEntry(map, 20, "second-trigger", events)
         raise OSError("second bind failed")
 
-    monkeypatch.setattr(run_alpaca, "ThreadedTaskDispatcher", lambda: dispatcher)
     monkeypatch.setattr(run_alpaca, "create_server", partial_failure)
     with pytest.raises(OSError, match="second bind failed"):
-        run_alpaca._create_owned_http(object(), host="localhost", port=11111)
-    assert closed == ["listener", "dispatcher"]
+        run_alpaca._create_owned_http(
+            object(), host="localhost", port=11111, threads=8
+        )
+
+    assert events == [
+        "first-server-close",
+        "first-trigger-close",
+        "second-trigger-close",
+        "dispatcher-shutdown",
+    ]
+    assert dispatcher.started == []
+    assert dispatcher.shutdown_count == 1
+
+
+def test_waitress_multisocket_runtime_has_one_shutdown_owner(monkeypatch) -> None:
+    events: list[str] = []
+    dispatcher = _CountingDispatcher(events)
+    returned = SimpleNamespace(
+        effective_listen=[("127.0.0.1", 11111), ("::1", 11111)],
+        task_dispatcher=dispatcher,
+        run=lambda: None,
+        close=lambda: events.append("returned-multisocket-close"),
+    )
+
+    def successful_create(_app, *, map, threads, **kwargs):
+        assert threads == 0
+        assert "_dispatcher" not in kwargs
+        _add_owned_listener(map, 10, "first", dispatcher, events)
+        _add_owned_listener(map, 20, "second", dispatcher, events)
+        return returned
+
+    monkeypatch.setattr(run_alpaca, "create_server", successful_create)
+    http = run_alpaca._create_owned_http(
+        object(), host="localhost", port=11111, threads=8
+    )
+    server = run_alpaca.RuntimeServer(
+        http=http,
+        discovery=_DiscoveryStub(events),
+        coordinator=_CoordinatorStub(events),
+        config=_config("sim"),
+        start_discovery=False,
+        logging_session=None,
+    )
+
+    server.shutdown()
+    server.shutdown()
+
+    assert dispatcher.started == [8]
+    assert dispatcher.shutdown_count == 1
+    assert "returned-multisocket-close" not in events
+    for name in ("first-server", "first-trigger", "second-server", "second-trigger"):
+        assert events.count(f"{name}-close") == 1
 
 
 def test_gui_cli_delegates_to_diagnostic_application(monkeypatch) -> None:
@@ -546,7 +652,12 @@ class _WaitressStub:
         self.fail_close_once = False
         events_ref = self.events
         self.task_dispatcher = type(
-            "Dispatcher", (), {"shutdown": lambda self: events_ref.append("http-drain")}
+            "Dispatcher",
+            (),
+            {
+                "set_thread_count": lambda self, _count: None,
+                "shutdown": lambda self: events_ref.append("http-drain"),
+            },
         )()
 
     def run(self) -> None:
@@ -588,6 +699,7 @@ class _MultiSocketStub:
         self.closed = False
         self.drained = False
         self.task_dispatcher = SimpleNamespace(
+            set_thread_count=lambda _count: None,
             shutdown=lambda: setattr(self, "drained", True)
         )
 
@@ -598,15 +710,92 @@ class _MultiSocketStub:
         return None
 
 
+class _MapEntry:
+    def __init__(self, socket_map, key: int, name: str, events: list[str]) -> None:
+        self.socket_map = socket_map
+        self.key = key
+        self.name = name
+        self.events = events
+        # Real Waitress trigger channels also expose a non-channel ``trigger``
+        # write handle; only a server's trigger points back into the map.
+        self.trigger = object()
+
+    def close(self) -> None:
+        self.events.append(f"{self.name}-close")
+        self.socket_map.pop(self.key, None)
+
+
+class _OwningMapEntry(_MapEntry):
+    def __init__(
+        self,
+        socket_map,
+        key: int,
+        name: str,
+        events: list[str],
+        trigger: _MapEntry,
+        dispatcher,
+    ) -> None:
+        super().__init__(socket_map, key, name, events)
+        self.trigger = trigger
+        self.task_dispatcher = dispatcher
+
+    def close(self) -> None:
+        super().close()
+        self.trigger.close()
+
+
+class _CountingDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.started: list[int] = []
+        self.shutdown_count = 0
+
+    def set_thread_count(self, count: int) -> None:
+        self.started.append(count)
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+        self.events.append("dispatcher-shutdown")
+
+
+def _add_owned_listener(
+    socket_map,
+    key: int,
+    name: str,
+    dispatcher,
+    events: list[str],
+) -> None:
+    trigger = _MapEntry(socket_map, key, f"{name}-trigger", events)
+    server = _OwningMapEntry(
+        socket_map,
+        key + 1,
+        f"{name}-server",
+        events,
+        trigger,
+        dispatcher,
+    )
+    socket_map[key] = trigger
+    socket_map[key + 1] = server
+
+
 class _PollingRoot:
-    def __init__(self) -> None:
+    def __init__(self, events=None, mainloop_error=None) -> None:
         self.callbacks = []
         self.destroyed = False
+        self.destroy_threads = []
+        self.events = events if events is not None else []
+        self.mainloop_error = mainloop_error
+
+    def mainloop(self) -> None:
+        if self.mainloop_error is not None:
+            raise self.mainloop_error
 
     def after(self, _delay, callback) -> None:
         self.callbacks.append(callback)
 
     def destroy(self) -> None:
+        self.events.append("root-destroy")
+        self.destroy_threads.append(threading.get_ident())
         self.destroyed = True
 
     def run_one_callback(self) -> None:
