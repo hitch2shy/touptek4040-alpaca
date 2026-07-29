@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
 import signal
 import socket
 import threading
@@ -20,10 +21,10 @@ from touptek4040.alpaca.app import create_app
 from touptek4040.alpaca.discovery import DiscoveryResponder
 from touptek4040.alpaca.management import SIMULATOR_SERIAL
 from touptek4040.camera_coordinator import CameraCoordinator
+from touptek4040.camera_proxy import CameraOwnerProxy
 from touptek4040.config import AppConfig, load_config, runtime_base_dir
-from touptek4040.errors import CameraError, CameraInvalidValueError, CameraNotConnectedError
+from touptek4040.errors import CameraInvalidValueError
 from touptek4040.sim_camera import SimCamera
-from touptek4040.toupcam_camera import ToupTekCamera, enumerate_cameras
 
 _LOG = logging.getLogger("touptek4040.runtime")
 _LOGGING_LOCK = Lock()
@@ -62,8 +63,49 @@ def config_from_args(argv: Sequence[str] | None = None) -> AppConfig:
     return config
 
 
+class _OwnerProxyFactory:
+    """Lazily create and retain the one proxy whose supervisor runtime owns."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self._proxy: CameraOwnerProxy | None = None
+        self._lock = Lock()
+
+    def __call__(self, _source: str) -> CameraOwnerProxy:
+        with self._lock:
+            if self._proxy is None:
+                self._proxy = CameraOwnerProxy(
+                    serial=self._config.camera.serial,
+                    owner_config=self._config.owner,
+                    runtime_directory=self._config.logging.directory,
+                )
+            return self._proxy
+
+    def close(self) -> None:
+        with self._lock:
+            proxy = self._proxy
+        if proxy is not None:
+            proxy.close()
+            with self._lock:
+                if self._proxy is proxy:
+                    self._proxy = None
+
+
+class RuntimeCameraCoordinator(CameraCoordinator):
+    """Coordinator with an explicit runtime-owned proxy-supervisor boundary."""
+
+    def __init__(self, factory, source: str, *, supervisor_close=None) -> None:
+        super().__init__(factory, source)
+        self._supervisor_close = supervisor_close
+
+    def close_camera_supervisor(self) -> None:
+        close = self._supervisor_close
+        if close is not None:
+            close()
+
+
 def build_coordinator(config: AppConfig) -> tuple[CameraCoordinator, AppConfig]:
-    """Resolve stable identity, then create the single camera lifecycle owner."""
+    """Resolve configured identity without touching the SDK in this process."""
 
     source = config.camera.source.strip().casefold()
     if source == "sim":
@@ -75,7 +117,7 @@ def build_coordinator(config: AppConfig) -> tuple[CameraCoordinator, AppConfig]:
                 serial=SIMULATOR_SERIAL,
             ),
         )
-        coordinator = CameraCoordinator(
+        coordinator = RuntimeCameraCoordinator(
             lambda _source: SimCamera(SIMULATOR_SERIAL),
             "sim",
         )
@@ -83,36 +125,47 @@ def build_coordinator(config: AppConfig) -> tuple[CameraCoordinator, AppConfig]:
     if source != "toupcam":
         raise CameraInvalidValueError("camera source must be 'toupcam' or explicit 'sim'")
 
-    identities = enumerate_cameras()
     configured_serial = config.camera.serial
-    if configured_serial:
-        selected = next(
-            (identity for identity in identities if identity.serial == configured_serial),
-            None,
-        )
-        if selected is None:
-            raise CameraNotConnectedError(
-                f"camera with serial {configured_serial!r} is not attached"
-            )
-    elif len(identities) == 1:
-        selected = identities[0]
-    elif not identities:
-        raise CameraNotConnectedError("no ToupTek camera is attached")
-    else:
+    if not isinstance(configured_serial, str) or not configured_serial.strip():
         raise CameraInvalidValueError(
-            "multiple ToupTek cameras are attached; select one with --serial"
+            "a non-empty camera serial is required for the real camera"
         )
-    serial = str(selected.serial).strip()
-    if not serial:
-        raise CameraNotConnectedError("attached ToupTek camera has no stable serial")
+    serial = configured_serial.strip()
     resolved = replace(
         config,
         camera=replace(config.camera, source="toupcam", serial=serial),
     )
+    factory = _OwnerProxyFactory(resolved)
     return (
-        CameraCoordinator(lambda _source: ToupTekCamera(serial), "toupcam"),
+        RuntimeCameraCoordinator(
+            factory,
+            "toupcam",
+            supervisor_close=factory.close,
+        ),
         resolved,
     )
+
+
+def close_camera_coordinator(coordinator: CameraCoordinator) -> None:
+    """Disconnect first, then always close the retained owner supervisor."""
+
+    disconnect_error: BaseException | None = None
+    try:
+        coordinator.set_connected_sync(False)
+    except BaseException as error:
+        disconnect_error = error
+    try:
+        close = getattr(coordinator, "close_camera_supervisor", None)
+        if callable(close):
+            close()
+    except BaseException:
+        if disconnect_error is None:
+            raise
+        _LOG.exception(
+            "Camera owner supervisor close also failed after disconnect failure"
+        )
+    if disconnect_error is not None:
+        raise disconnect_error
 
 
 def build_server(
@@ -186,6 +239,7 @@ class RuntimeServer:
             "http": False,
             "discovery": False,
             "camera": False,
+            "camera_owner": False,
             "logging": logging_session is None,
         }
 
@@ -208,9 +262,13 @@ class RuntimeServer:
                 "camera",
                 lambda: self.coordinator.set_connected_sync(False),
             )
+            self._cleanup_step(
+                "camera_owner",
+                lambda: _close_camera_supervisor(self.coordinator),
+            )
             if all(
                 self._cleaned[name]
-                for name in ("http", "discovery", "camera")
+                for name in ("http", "discovery", "camera_owner")
             ):
                 _LOG.info("Alpaca server stopped")
             if self._logging_session is not None:
@@ -550,7 +608,14 @@ def install_termination_handlers(termination: threading.Event):
     return restore
 
 
+def _close_camera_supervisor(coordinator: CameraCoordinator) -> None:
+    close = getattr(coordinator, "close_camera_supervisor", None)
+    if callable(close):
+        close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    multiprocessing.freeze_support()
     server = build_server(config_from_args(argv))
     restore_handlers = lambda: None
     termination = threading.Event()

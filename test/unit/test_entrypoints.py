@@ -14,7 +14,7 @@ import run_gui
 from touptek4040.alpaca.management import SIMULATOR_SERIAL
 from touptek4040.camera_contract import ReadoutMode
 from touptek4040.config import AppConfig, CameraConfig, LoggingConfig, ServerConfig, WebConfig
-from touptek4040.errors import CameraNotConnectedError
+from touptek4040.errors import CameraInvalidValueError
 from touptek4040.gui import (
     GuiCloseController,
     DiagnosticWorkerPool,
@@ -69,42 +69,91 @@ def test_production_defaults_to_real_camera() -> None:
     assert config.camera.source == "toupcam"
 
 
-def test_real_bootstrap_resolves_serial_before_app_creation(monkeypatch) -> None:
-    seen: list[str | None] = []
-    identity = type("Identity", (), {"serial": "SERIAL-1"})()
-    monkeypatch.setattr(run_alpaca, "enumerate_cameras", lambda: [identity])
+def test_real_runtime_constructs_lazy_owner_proxy_from_resolved_config(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class ProxyStub:
+        def connect(self) -> None:
+            events.append("connect")
+
+        def disconnect(self) -> None:
+            events.append("disconnect")
+
+        def abort(self) -> None:
+            events.append("abort")
+
+        def close(self) -> None:
+            events.append("close")
+
+    def construct_proxy(**kwargs):
+        events.append(kwargs)
+        return ProxyStub()
+
+    monkeypatch.setattr(run_alpaca, "CameraOwnerProxy", construct_proxy)
+    config = replace(
+        _config(source="toupcam", serial=" SERIAL-1 "),
+        logging=LoggingConfig("INFO", tmp_path),
+    )
+
+    coordinator, resolved = run_alpaca.build_coordinator(config)
+
+    assert events == []
+    assert resolved.camera.serial == "SERIAL-1"
+    coordinator.set_connected_sync(True)
+    assert events[0] == {
+        "serial": "SERIAL-1",
+        "owner_config": resolved.owner,
+        "runtime_directory": tmp_path,
+    }
+    run_alpaca.close_camera_coordinator(coordinator)
+    assert events[1:] == ["connect", "abort", "disconnect", "close"]
+
+
+def test_owner_proxy_close_failure_retains_exact_supervisor_for_retry(
+    monkeypatch,
+) -> None:
+    close_calls: list[int] = []
+
+    class ProxyStub:
+        def connect(self) -> None:
+            return None
+
+        def disconnect(self) -> None:
+            return None
+
+        def abort(self) -> None:
+            return None
+
+        def close(self) -> None:
+            close_calls.append(len(close_calls) + 1)
+            if len(close_calls) == 1:
+                raise RuntimeError("exact owner still alive")
+
     monkeypatch.setattr(
         run_alpaca,
-        "create_app",
-        lambda coordinator, config: seen.append(config.camera.serial) or object(),
+        "CameraOwnerProxy",
+        lambda **_kwargs: ProxyStub(),
     )
-    monkeypatch.setattr(run_alpaca, "create_server", lambda *args, **kwargs: _WaitressStub())
-    monkeypatch.setattr(run_alpaca, "DiscoveryResponder", _DiscoveryStub)
-
-    server = run_alpaca.build_server(_config(source="toupcam"))
-
-    assert seen == ["SERIAL-1"]
-    assert server.config.camera.serial == "SERIAL-1"
-    server.shutdown()
-
-
-def test_real_failure_never_falls_back(monkeypatch) -> None:
-    monkeypatch.setattr(
-        run_alpaca,
-        "enumerate_cameras",
-        lambda: (_ for _ in ()).throw(CameraNotConnectedError("USB unavailable")),
+    coordinator, _resolved = run_alpaca.build_coordinator(
+        _config(source="toupcam", serial="SERIAL-1")
     )
+    coordinator.set_connected_sync(True)
+    coordinator.set_connected_sync(False)
 
-    with pytest.raises(CameraNotConnectedError, match="USB unavailable"):
-        run_alpaca.build_server(_config(source="toupcam"))
+    with pytest.raises(RuntimeError, match="still alive"):
+        coordinator.close_camera_supervisor()
+    coordinator.close_camera_supervisor()
+
+    assert close_calls == [1, 2]
 
 
-def test_selected_serial_must_be_present(monkeypatch) -> None:
-    identity = type("Identity", (), {"serial": "OTHER"})()
-    monkeypatch.setattr(run_alpaca, "enumerate_cameras", lambda: [identity])
-
-    with pytest.raises(CameraNotConnectedError, match="EXPECTED"):
-        run_alpaca.build_server(_config(source="toupcam", serial="EXPECTED"))
+@pytest.mark.parametrize("serial", [None, "", "   "])
+def test_real_runtime_requires_a_configured_serial(serial) -> None:
+    with pytest.raises(CameraInvalidValueError, match="camera serial"):
+        run_alpaca.build_coordinator(_config(source="toupcam", serial=serial))
 
 
 def test_server_shutdown_stops_discovery_and_camera(monkeypatch) -> None:
@@ -134,6 +183,7 @@ def test_server_stops_and_drains_http_before_camera_disconnect(monkeypatch) -> N
     )
     server.shutdown()
     assert events.index("http-close") < events.index("http-drain") < events.index("camera-disconnect")
+    assert events.index("camera-disconnect") < events.index("camera-owner-close")
 
 
 def test_shutdown_attempts_all_cleanup_and_retries_only_failed_step() -> None:
@@ -187,17 +237,13 @@ def test_shutdown_drains_inflight_connected_put_before_disconnect() -> None:
 def test_bootstrap_failure_closes_runtime_logging(monkeypatch) -> None:
     session = type("Session", (), {"closed": False, "close": lambda self: setattr(self, "closed", True)})()
     monkeypatch.setattr(run_alpaca, "configure_logging", lambda _config: session)
-    monkeypatch.setattr(
-        run_alpaca,
-        "enumerate_cameras",
-        lambda: (_ for _ in ()).throw(CameraNotConnectedError("missing")),
-    )
-    with pytest.raises(CameraNotConnectedError):
+    with pytest.raises(CameraInvalidValueError, match="camera serial"):
         run_alpaca.build_server(_config("toupcam"))
     assert session.closed
 
 
 def test_main_always_shuts_server_down(monkeypatch) -> None:
+    events: list[str] = []
     stub = type(
         "RuntimeStub",
         (),
@@ -208,10 +254,25 @@ def test_main_always_shuts_server_down(monkeypatch) -> None:
             "shutdown": lambda self: setattr(self, "stopped", True),
         },
     )()
-    monkeypatch.setattr(run_alpaca, "build_server", lambda _config: stub)
+    monkeypatch.setattr(
+        run_alpaca.multiprocessing,
+        "freeze_support",
+        lambda: events.append("freeze"),
+    )
+    monkeypatch.setattr(
+        run_alpaca,
+        "config_from_args",
+        lambda _argv: events.append("config") or _config("sim"),
+    )
+    monkeypatch.setattr(
+        run_alpaca,
+        "build_server",
+        lambda _config: events.append("server") or stub,
+    )
 
     assert run_alpaca.main(["--source", "sim"]) == 0
     assert stub.served and stub.stopped
+    assert events == ["freeze", "config", "server"]
 
 
 def test_signal_handler_uses_same_shutdown_path(monkeypatch) -> None:
@@ -416,6 +477,7 @@ def test_gui_partial_widget_construction_cleans_all_resources(monkeypatch) -> No
         preview_active=False,
         abort_exposure=lambda: None,
         set_connected_sync=lambda value: disconnects.append(value),
+        close_camera_supervisor=lambda: disconnects.append("close"),
     )
     monkeypatch.setattr(run_alpaca, "configure_logging", lambda _config: session)
     monkeypatch.setattr(
@@ -451,7 +513,7 @@ def test_gui_partial_widget_construction_cleans_all_resources(monkeypatch) -> No
             _ui_modules=(Tk, messagebox, Ttk),
         )
     assert session.closed
-    assert disconnects == [False]
+    assert disconnects == [False, "close"]
     assert tuple(logger.handlers) == before
 
 
@@ -619,10 +681,22 @@ def test_waitress_multisocket_runtime_has_one_shutdown_owner(monkeypatch) -> Non
 
 def test_gui_cli_delegates_to_diagnostic_application(monkeypatch) -> None:
     seen = {}
+    events: list[str] = []
     def launch(config) -> int:
+        events.append("gui")
         seen["config"] = config
         return 0
 
+    monkeypatch.setattr(
+        run_gui.multiprocessing,
+        "freeze_support",
+        lambda: events.append("freeze"),
+    )
+    monkeypatch.setattr(
+        run_gui,
+        "config_from_args",
+        lambda _argv: events.append("config") or _config("sim"),
+    )
     monkeypatch.setattr(
         run_gui,
         "run_diagnostic_gui",
@@ -631,6 +705,7 @@ def test_gui_cli_delegates_to_diagnostic_application(monkeypatch) -> None:
 
     assert run_gui.main(["--source", "sim"]) == 0
     assert seen["config"].camera.source == "sim"
+    assert events == ["freeze", "config", "gui"]
 
 
 def _config(source: str, serial: str | None = None) -> AppConfig:
@@ -691,6 +766,9 @@ class _CoordinatorStub:
     def set_connected_sync(self, connected: bool) -> None:
         assert connected is False
         self.events.append("camera-disconnect")
+
+    def close_camera_supervisor(self) -> None:
+        self.events.append("camera-owner-close")
 
 
 class _MultiSocketStub:

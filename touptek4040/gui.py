@@ -520,10 +520,16 @@ def _run_diagnostic_window(
 
 
 def _cleanup_coordinator(coordinator: CameraCoordinator) -> None:
+    close_supervisor = getattr(
+        coordinator,
+        "close_camera_supervisor",
+        lambda: None,
+    )
     operations = (
         lambda: coordinator.stop_preview() if coordinator.preview_active else None,
         coordinator.abort_exposure,
         lambda: coordinator.set_connected_sync(False),
+        close_supervisor,
     )
     for operation in operations:
         try:
