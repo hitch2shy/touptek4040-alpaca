@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -30,6 +31,130 @@ class DiagnosticSettings:
     roi: Roi
 
 
+_DISPLAY_MODES = {
+    "RAW 12-bit": ReadoutMode.RAW12,
+    "RAW 8-bit": ReadoutMode.RAW8,
+}
+
+
+def parse_diagnostic_settings(
+    *,
+    duration: str,
+    gain: str,
+    binning: str,
+    mode: str,
+    roi_x: str,
+    roi_y: str,
+    roi_width: str,
+    roi_height: str,
+) -> DiagnosticSettings:
+    """Translate stable display labels and user fields without leaking parser errors."""
+
+    try:
+        readout_mode = _DISPLAY_MODES[mode]
+        parsed = DiagnosticSettings(
+            duration=float(duration),
+            gain=int(gain),
+            binning=int(binning),
+            mode=readout_mode,
+            roi=Roi(
+                int(roi_x),
+                int(roi_y),
+                int(roi_width),
+                int(roi_height),
+            ),
+        )
+        if parsed.duration < 0 or parsed.gain < 0 or not 1 <= parsed.binning <= 8:
+            raise ValueError
+        if parsed.roi.width <= 0 or parsed.roi.height <= 0:
+            raise ValueError
+        return parsed
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Check the camera setting fields and try again."
+        ) from error
+
+
+class QueueLogHandler(logging.Handler):
+    """Forward formatted package logs to a thread-safe UI queue sink."""
+
+    def __init__(self, sink) -> None:
+        super().__init__()
+        self._sink = sink
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._sink(self.format(record))
+        except BaseException:
+            self.handleError(record)
+
+
+class DiagnosticWorkerPool:
+    """Track diagnostic actions and make close win over queued camera opens."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._closing = False
+        self._workers: set[threading.Thread] = set()
+        self._cleanup = None
+
+    @property
+    def closing(self) -> bool:
+        with self._lock:
+            return self._closing
+
+    def submit(self, action, callback) -> bool:
+        with self._lock:
+            if self._closing:
+                return False
+
+            def run() -> None:
+                try:
+                    callback("ok", action())
+                except BaseException as error:
+                    callback("error", error)
+                finally:
+                    cleanup = None
+                    with self._lock:
+                        self._workers.discard(threading.current_thread())
+                        if self._closing:
+                            cleanup = self._cleanup
+                    if cleanup is not None:
+                        try:
+                            cleanup()
+                        except BaseException:
+                            _LOG.exception("Late diagnostic worker cleanup failed")
+
+            worker = threading.Thread(
+                target=run,
+                name="diagnostic-action",
+                daemon=True,
+            )
+            self._workers.add(worker)
+            worker.start()
+            return True
+
+    def close(self, cleanup, timeout: float = 0.25) -> None:
+        with self._lock:
+            self._closing = True
+            self._cleanup = cleanup
+            workers = tuple(self._workers)
+        deadline = time.monotonic() + max(0.0, timeout)
+        for worker in workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        cleanup()
+
+
+def run_mainloop_with_cleanup(root: Any, cleanup) -> None:
+    """Guarantee cleanup for normal exit, Tk failures, and KeyboardInterrupt."""
+
+    try:
+        root.mainloop()
+    finally:
+        cleanup()
+
+
 def run_diagnostic_gui(config: AppConfig) -> int:
     """Open a compact diagnostics window; no camera is touched before Connect."""
 
@@ -38,20 +163,31 @@ def run_diagnostic_gui(config: AppConfig) -> int:
 
     from run_alpaca import build_coordinator, configure_logging
 
-    configure_logging(config)
+    logging_session = configure_logging(config)
     try:
         coordinator, resolved = build_coordinator(config)
-    except CameraError as error:
+    except BaseException as error:
+        logging_session.close()
         messagebox.showerror(
             "ToupTek 4040 diagnostics",
             f"Camera enumeration failed.\n\n{safe_exception_text(error)}\n\n{_OWNER_WARNING}",
         )
         return 2
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except BaseException:
+        logging_session.close()
+        raise
     root.title("ToupTek 4040 Diagnostics")
     root.minsize(760, 560)
     events: queue.Queue[tuple[str, object]] = queue.Queue()
+    workers = DiagnosticWorkerPool()
+    package_logger = logging.getLogger("touptek4040")
+    queue_handler = QueueLogHandler(
+        lambda text: events.put(("log", text))
+    )
+    package_logger.addHandler(queue_handler)
     status = tk.StringVar(value="Not connected")
     identity = tk.StringVar(
         value=(
@@ -119,25 +255,25 @@ def run_diagnostic_gui(config: AppConfig) -> int:
         log.insert("end", f"{datetime.now():%H:%M:%S}  {message}\n")
         log.see("end")
         log.configure(state="disabled")
-        _LOG.info(message)
 
     def background(label: str, action) -> None:
-        def worker() -> None:
-            try:
-                result = action()
-                events.put(("ok", (label, result)))
-            except BaseException as error:
-                events.put(("error", (label, error)))
-
-        threading.Thread(target=worker, name=f"diagnostic-{label}", daemon=True).start()
+        accepted = workers.submit(
+            action,
+            lambda kind, payload: events.put((kind, (label, payload))),
+        )
+        if not accepted:
+            append(f"{label} ignored because diagnostics are closing")
 
     def settings() -> DiagnosticSettings:
-        return DiagnosticSettings(
-            duration=float(duration.get()),
-            gain=int(gain.get()),
-            binning=int(binning.get()),
-            mode=ReadoutMode(mode.get()),
-            roi=Roi(int(roi_x.get()), int(roi_y.get()), int(roi_w.get()), int(roi_h.get())),
+        return parse_diagnostic_settings(
+            duration=duration.get(),
+            gain=gain.get(),
+            binning=binning.get(),
+            mode=mode.get(),
+            roi_x=roi_x.get(),
+            roi_y=roi_y.get(),
+            roi_width=roi_w.get(),
+            roi_height=roi_h.get(),
         )
 
     def connect() -> None:
@@ -147,7 +283,12 @@ def run_diagnostic_gui(config: AppConfig) -> int:
         background("Disconnect", lambda: coordinator.set_connected_sync(False))
 
     def expose() -> None:
-        selected = settings()
+        try:
+            selected = settings()
+        except ValueError as error:
+            append(str(error))
+            messagebox.showerror("Invalid settings", str(error))
+            return
         def start() -> None:
             coordinator.start_exposure(
                 selected.duration,
@@ -173,7 +314,13 @@ def run_diagnostic_gui(config: AppConfig) -> int:
             background("Stop preview", coordinator.stop_preview)
 
     def apply_cooling() -> None:
-        value, enabled = float(target.get()), cooler.get()
+        try:
+            value, enabled = float(target.get()), cooler.get()
+        except ValueError:
+            message = "Check the target temperature and try again."
+            append(message)
+            messagebox.showerror("Invalid settings", message)
+            return
         def apply() -> None:
             coordinator.set_target_temperature_if_idle(value)
             coordinator.set_cooler_on_if_idle(enabled)
@@ -205,6 +352,8 @@ def run_diagnostic_gui(config: AppConfig) -> int:
                     f"Preview: {frame.pixels.shape[1]} × {frame.pixels.shape[0]}, "
                     f"range {int(frame.pixels.min())}–{int(frame.pixels.max())}"
                 )
+            elif kind == "log":
+                append(str(payload))
             else:
                 label, _result = payload
                 append(f"{label} accepted")
@@ -222,15 +371,40 @@ def run_diagnostic_gui(config: AppConfig) -> int:
                 temperature.set("Unavailable")
         root.after(200, poll)
 
+    closed = False
+
+    def camera_cleanup() -> None:
+        operations = (
+            lambda: coordinator.stop_preview() if coordinator.preview_active else None,
+            coordinator.abort_exposure,
+            lambda: coordinator.set_connected_sync(False),
+        )
+        for operation in operations:
+            try:
+                operation()
+            except CameraError:
+                _LOG.exception("Diagnostic camera cleanup step failed")
+            except BaseException:
+                _LOG.exception("Unexpected diagnostic camera cleanup failure")
+
     def close() -> None:
-        try:
-            coordinator.set_connected_sync(False)
-        except CameraError:
-            _LOG.exception("Diagnostic camera cleanup failed")
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        for child in buttons.winfo_children():
+            child.configure(state="disabled")
+        workers.close(camera_cleanup)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
     append("Diagnostics ready; camera remains unopened until Connect")
     poll()
-    root.mainloop()
+    def final_cleanup() -> None:
+        if not closed:
+            workers.close(camera_cleanup)
+        package_logger.removeHandler(queue_handler)
+        queue_handler.close()
+        logging_session.close()
+    run_mainloop_with_cleanup(root, final_cleanup)
     return 0

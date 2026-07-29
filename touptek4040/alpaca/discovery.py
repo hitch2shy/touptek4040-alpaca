@@ -58,6 +58,7 @@ class DiscoveryResponder:
             [], list[tuple[int, str]]
         ] = socket.if_nameindex,
         logger: logging.Logger | None = None,
+        families: frozenset[int] | None = None,
     ) -> None:
         _validate_port(alpaca_port, "alpaca_port")
         _validate_port(discovery_port, "discovery_port")
@@ -70,6 +71,16 @@ class DiscoveryResponder:
         self._socket_factory = socket_factory
         self._interface_enumerator = interface_enumerator
         self._logger = logger or _LOG
+        self._families = (
+            frozenset({socket.AF_INET, socket.AF_INET6})
+            if families is None
+            else frozenset(families)
+        )
+        if not self._families or not self._families <= {
+            socket.AF_INET,
+            socket.AF_INET6,
+        }:
+            raise ValueError("families must contain AF_INET and/or AF_INET6")
         self._operation_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._generation = 0
@@ -91,21 +102,26 @@ class DiscoveryResponder:
         with self._operation_lock:
             with self._lifecycle_lock:
                 current = self._run
-                if self._run_has_healthy_ipv4(current):
+                if self._run_is_healthy(current):
                     return
                 self._run = None
             self._stop_and_join(current)
 
             sockets: dict[int, Any] = {}
-            try:
-                sockets[socket.AF_INET] = self._open_ipv4()
-            except BaseException:
-                _close_all(sockets.values())
-                raise
-            try:
-                sockets[socket.AF_INET6] = self._open_ipv6()
-            except BaseException as error:
-                self._warn_ipv6_once(error)
+            if socket.AF_INET in self._families:
+                try:
+                    sockets[socket.AF_INET] = self._open_ipv4()
+                except BaseException:
+                    _close_all(sockets.values())
+                    raise
+            if socket.AF_INET6 in self._families:
+                try:
+                    sockets[socket.AF_INET6] = self._open_ipv6()
+                except BaseException as error:
+                    if socket.AF_INET not in self._families:
+                        _close_all(sockets.values())
+                        raise
+                    self._warn_ipv6_once(error)
 
             stop_event = threading.Event()
             self._generation += 1
@@ -154,11 +170,11 @@ class DiscoveryResponder:
                 self._run = None
             self._stop_and_join(run)
 
-    @staticmethod
-    def _run_has_healthy_ipv4(run: _DiscoveryRun | None) -> bool:
+    def _run_is_healthy(self, run: _DiscoveryRun | None) -> bool:
         if run is None or run.stop_event.is_set():
             return False
-        thread = run.threads.get(socket.AF_INET)
+        required = socket.AF_INET if socket.AF_INET in self._families else socket.AF_INET6
+        thread = run.threads.get(required)
         return thread is not None and thread.is_alive()
 
     @staticmethod
@@ -174,7 +190,12 @@ class DiscoveryResponder:
             run = self._run
             if run is None or run.generation != generation:
                 return
-            if family == socket.AF_INET:
+            required = (
+                socket.AF_INET
+                if socket.AF_INET in self._families
+                else socket.AF_INET6
+            )
+            if family == required:
                 run.stop_event.set()
                 _close_all(run.sockets.values())
             else:

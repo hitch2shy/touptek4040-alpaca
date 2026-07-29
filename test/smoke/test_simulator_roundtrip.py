@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import struct
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from urllib.parse import urlencode
 import pytest
 
 import run_alpaca
+from touptek4040.alpaca.management import stable_unique_id
 from touptek4040.config import AppConfig, CameraConfig, LoggingConfig, ServerConfig, WebConfig
 
 
@@ -26,9 +28,13 @@ def test_complete_simulator_http_roundtrip() -> None:
     thread.start()
     base = _Client(server.port)
     try:
-        assert base.get_json("/management/apiversions")["Value"] == [1]
+        versions = base.get_json("/management/apiversions?ClientTransactionID=41")
+        assert versions["Value"] == [1]
+        assert versions["ClientTransactionID"] == 41
+        assert isinstance(versions["ServerTransactionID"], int)
         devices = base.get_json("/management/v1/configureddevices")["Value"]
         assert devices[0]["DeviceType"] == "Camera"
+        assert devices[0]["UniqueID"] == stable_unique_id(None, "sim")
 
         assert base.put_alpaca("connected", Connected="true")["ErrorNumber"] == 0
         _wait_until(lambda: base.get_alpaca("connected")["Value"] is True)
@@ -52,10 +58,17 @@ def test_complete_simulator_http_roundtrip() -> None:
         )
         assert binary_status == 200
         assert binary_headers["content-type"].startswith("application/imagebytes")
-        assert len(binary) > 44
+        metadata = struct.unpack_from("<iiIIiiiiiii", binary)
+        assert metadata[0:2] == (1, 0)
+        assert metadata[2] == 0
+        assert metadata[3] > 0
+        assert metadata[4:] == (44, 8, 8, 2, 32, 24, 0)
+        assert len(binary) == 44 + 32 * 24 * 2
 
         image_json = base.get_alpaca("imagearray")
         assert image_json["ErrorNumber"] == 0
+        assert image_json["ClientTransactionID"] == base.transaction
+        assert image_json["ServerTransactionID"] > 0
         assert len(image_json["Value"]) == 32
         assert len(image_json["Value"][0]) == 24
 
@@ -67,13 +80,40 @@ def test_complete_simulator_http_roundtrip() -> None:
             f"/web/v1/viewport.png?generation={generation}&maxWidth=64&maxHeight=64",
         )
         assert status == 200 and headers["content-type"].startswith("image/png")
+        assert headers["x-content-type-options"] == "nosniff"
+        assert "default-src 'self'" in headers["content-security-policy"]
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack(">II", png[16:24]) == (32, 24)
 
         status, headers, fits = base.request(
             "GET", f"/web/v1/image.fits?generation={generation}"
         )
         assert status == 200 and "fits" in headers["content-type"]
         assert fits.startswith(b"SIMPLE")
+        assert len(fits) % 2880 == 0
+        header_end = next(
+            offset + 80
+            for offset in range(0, len(fits), 80)
+            if fits[offset : offset + 8].strip() == b"END"
+        )
+        data_start = ((header_end + 2879) // 2880) * 2880
+        cards = [fits[offset : offset + 80] for offset in range(0, header_end, 80)]
+        assert any(card.startswith(b"NAXIS1  =") and b"32" in card for card in cards)
+        assert any(card.startswith(b"NAXIS2  =") and b"24" in card for card in cards)
+        assert len(fits[data_start : data_start + 32 * 24 * 2]) == 32 * 24 * 2
+
+        assert base.put_alpaca("startexposure", Duration="0.001", Light="true")["ErrorNumber"] == 0
+        _wait_until(lambda: base.get_alpaca("imageready")["Value"] is True)
+        current_generation = base.get_json("/web/v1/state")["generation"]
+        assert current_generation > generation
+        stale_status, _stale_headers, _stale = base.request(
+            "GET", f"/web/v1/viewport.png?generation={generation}"
+        )
+        assert stale_status == 409
+        current_status, _current_headers, _current = base.request(
+            "GET", f"/web/v1/viewport.png?generation={current_generation}"
+        )
+        assert current_status == 200
 
         assert base.put_alpaca("startexposure", Duration="1", Light="true")["ErrorNumber"] == 0
         assert base.put_alpaca("abortexposure")["ErrorNumber"] == 0
