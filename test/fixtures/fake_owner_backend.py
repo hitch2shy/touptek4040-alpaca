@@ -68,6 +68,12 @@ class FakeOwnerBackend:
         fail_disconnects: int = 0,
         fail_abort: bool = False,
         malformed_frame: bool = False,
+        disconnect_barrier_entered_path: str | None = None,
+        disconnect_barrier_release_path: str | None = None,
+        block_disconnects: int = 0,
+        abort_barrier_entered_path: str | None = None,
+        abort_barrier_release_path: str | None = None,
+        block_aborts: int = 0,
     ) -> None:
         self.serial = serial or "FAKE-OWNER"
         self.backend_pid = os.getpid()
@@ -85,6 +91,12 @@ class FakeOwnerBackend:
         self._fail_disconnects = fail_disconnects
         self._fail_abort = fail_abort
         self._malformed_frame = malformed_frame
+        self._disconnect_barrier_entered_path = disconnect_barrier_entered_path
+        self._disconnect_barrier_release_path = disconnect_barrier_release_path
+        self._block_disconnects = block_disconnects
+        self._abort_barrier_entered_path = abort_barrier_entered_path
+        self._abort_barrier_release_path = abort_barrier_release_path
+        self._block_aborts = block_aborts
         self._state_path = Path(state_path) if state_path is not None else None
         self._lifecycle_path = (
             Path(lifecycle_path) if lifecycle_path is not None else None
@@ -106,6 +118,11 @@ class FakeOwnerBackend:
     def disconnect(self) -> None:
         self.disconnect_calls += 1
         self._append_lifecycle("disconnect", serial=self.serial)
+        if self.disconnect_calls <= self._block_disconnects:
+            _wait_on_file_barrier(
+                self._disconnect_barrier_entered_path,
+                self._disconnect_barrier_release_path,
+            )
         if self._fail_disconnects:
             self._fail_disconnects -= 1
             self._record("disconnect", outcome="failed")
@@ -135,6 +152,11 @@ class FakeOwnerBackend:
 
     def abort(self) -> None:
         self.abort_calls += 1
+        if self.abort_calls <= self._block_aborts:
+            _wait_on_file_barrier(
+                self._abort_barrier_entered_path,
+                self._abort_barrier_release_path,
+            )
         self._abort_requested.set()
         self._record("abort", outcome="failed" if self._fail_abort else "succeeded")
         if self._fail_abort:
@@ -266,6 +288,18 @@ def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBack
     lifecycle_path = kwargs.get("lifecycle_path")
     if lifecycle_path is not None and not isinstance(lifecycle_path, str):
         raise TypeError("lifecycle_path must be a string")
+    disconnect_barrier_entered_path = _optional_path_argument(
+        kwargs, "disconnect_barrier_entered_path"
+    )
+    disconnect_barrier_release_path = _optional_path_argument(
+        kwargs, "disconnect_barrier_release_path"
+    )
+    abort_barrier_entered_path = _optional_path_argument(
+        kwargs, "abort_barrier_entered_path"
+    )
+    abort_barrier_release_path = _optional_path_argument(
+        kwargs, "abort_barrier_release_path"
+    )
     return FakeOwnerBackend(
         serial,
         restore_log_path=restore_log_path,
@@ -276,6 +310,12 @@ def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBack
         fail_disconnects=int(kwargs.get("fail_disconnects", 0)),
         fail_abort=bool(kwargs.get("fail_abort", False)),
         malformed_frame=bool(kwargs.get("malformed_frame", False)),
+        disconnect_barrier_entered_path=disconnect_barrier_entered_path,
+        disconnect_barrier_release_path=disconnect_barrier_release_path,
+        block_disconnects=int(kwargs.get("block_disconnects", 0)),
+        abort_barrier_entered_path=abort_barrier_entered_path,
+        abort_barrier_release_path=abort_barrier_release_path,
+        block_aborts=int(kwargs.get("block_aborts", 0)),
     )
 
 
@@ -330,6 +370,10 @@ def validate_identity_probe_backend(
     serial: str | None = None,
     **_kwargs: object,
 ) -> None:
+    _wait_on_file_barrier(
+        _optional_path_argument(_kwargs, "validation_barrier_entered_path"),
+        _optional_path_argument(_kwargs, "validation_barrier_release_path"),
+    )
     backend._append_lifecycle("identity_read")
     model = backend.identity.model
     if backend.serial != serial or model != "approved-model":
@@ -344,3 +388,32 @@ def validate_identity_probe_backend(
         reported_serial=backend.serial,
         reported_model=model,
     )
+
+
+def _optional_path_argument(
+    arguments: Mapping[str, object],
+    name: str,
+) -> str | None:
+    value = arguments.get(name)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    return value
+
+
+def _wait_on_file_barrier(
+    entered_path: str | None,
+    release_path: str | None,
+) -> None:
+    if entered_path is None and release_path is None:
+        return
+    if entered_path is None or release_path is None:
+        raise ValueError("both file barrier paths are required")
+    entered = Path(entered_path)
+    release = Path(release_path)
+    entered.parent.mkdir(parents=True, exist_ok=True)
+    entered.touch()
+    deadline = time.monotonic() + 5
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fake owner file barrier timed out")
+        time.sleep(0.005)

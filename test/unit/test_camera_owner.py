@@ -275,7 +275,7 @@ def test_identity_rejection_retains_opened_candidate_for_outer_cleanup_retry(
         state = _read_fake_backend_state(state_path)
         assert state["counts"]["connect"] == 1
         assert state["counts"]["disconnect"] == 2
-        assert state["counts"]["abort"] == 1
+        assert state["counts"].get("abort", 0) == 0
         assert state["connected"] is False
         assert [
             event["operation"] for event in _read_lifecycle(lifecycle_path)
@@ -333,7 +333,7 @@ def test_identity_property_failure_preserves_original_error_and_bounds_cleanup(
         state = _read_fake_backend_state(state_path)
         assert state["counts"]["connect"] == 1
         assert state["counts"]["disconnect"] == 2
-        assert state["counts"]["abort"] == 1
+        assert state["counts"].get("abort", 0) == 0
         assert state["connected"] is cleanup_connected
         assert [
             event["operation"] for event in _read_lifecycle(lifecycle_path)
@@ -628,6 +628,241 @@ def test_control_shutdown_before_connect_responds_then_closes_without_factory_ev
         harness.close()
 
 
+def test_control_rejects_abort_and_accepts_shutdown_while_candidate_validates(
+    tmp_path: Path,
+) -> None:
+    validation_entered = tmp_path / "validation-entered"
+    validation_release = tmp_path / "validation-release"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "state_path": str(state_path),
+            "validation_barrier_entered_path": str(validation_entered),
+            "validation_barrier_release_path": str(validation_release),
+        },
+        backend_factory="create_open_identity_probe_backend",
+        backend_validator="validate_identity_probe_backend",
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.raw_request(1, "connect", {}))
+    )
+    try:
+        worker.start()
+        _wait_for_path(validation_entered)
+
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "abort",
+            "ok": False,
+            "error": "camera is not connected",
+        }
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        assert _read_fake_backend_state(state_path)["counts"].get("abort", 0) == 0
+
+        validation_release.touch()
+        worker.join(3)
+        harness.process.join(3)
+
+        assert not worker.is_alive()
+        assert len(responses) == 1
+        assert responses[0].error is not None
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 1
+        assert state["counts"].get("abort", 0) == 0
+        assert state["connected"] is False
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        validation_release.touch()
+        worker.join(3)
+        harness.close()
+
+
+def test_control_rejects_abort_and_accepts_shutdown_during_command_cleanup(
+    tmp_path: Path,
+) -> None:
+    disconnect_entered = tmp_path / "disconnect-entered"
+    disconnect_release = tmp_path / "disconnect-release"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "block_disconnects": 1,
+            "disconnect_barrier_entered_path": str(disconnect_entered),
+            "disconnect_barrier_release_path": str(disconnect_release),
+            "state_path": str(state_path),
+        },
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.request("disconnect", {}))
+    )
+    try:
+        harness.request("connect", {})
+        worker.start()
+        _wait_for_path(disconnect_entered)
+
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "abort",
+            "ok": False,
+            "error": "camera is not connected",
+        }
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        assert _read_fake_backend_state(state_path)["counts"].get("abort", 0) == 0
+
+        disconnect_release.touch()
+        worker.join(3)
+        harness.process.join(3)
+
+        assert not worker.is_alive()
+        assert responses == [{"connected": False}]
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["disconnect"] == 1
+        assert state["counts"].get("abort", 0) == 0
+        assert state["connected"] is False
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        disconnect_release.touch()
+        worker.join(3)
+        harness.close()
+
+
+def test_control_shutdown_during_blocked_failed_rollback_is_stable_and_bounded(
+    tmp_path: Path,
+) -> None:
+    disconnect_entered = tmp_path / "rollback-entered"
+    disconnect_release = tmp_path / "rollback-release"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "block_disconnects": 1,
+            "disconnect_barrier_entered_path": str(disconnect_entered),
+            "disconnect_barrier_release_path": str(disconnect_release),
+            "fail_disconnects": 1,
+            "fail_snapshot": True,
+            "state_path": str(state_path),
+        },
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.raw_request(1, "connect", {}))
+    )
+    try:
+        worker.start()
+        _wait_for_path(disconnect_entered)
+
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "abort",
+            "ok": False,
+            "error": "camera is not connected",
+        }
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        assert _read_fake_backend_state(state_path)["counts"].get("abort", 0) == 0
+
+        disconnect_release.touch()
+        worker.join(3)
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        assert not worker.is_alive()
+        assert len(responses) == 1
+        assert responses[0].error is not None
+        assert responses[0].error.message == "snapshot failed"
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        assert diagnostic["error"]["diagnostics"]["errors"].count(
+            "fake disconnect failed"
+        ) == 1
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["disconnect"] == 2
+        assert state["counts"].get("abort", 0) == 0
+        assert state["connected"] is False
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        disconnect_release.touch()
+        worker.join(3)
+        harness.close()
+
+
+def test_control_shutdown_uses_captured_backend_if_command_clears_owner_reference(
+    tmp_path: Path,
+) -> None:
+    abort_entered = tmp_path / "abort-entered"
+    abort_release = tmp_path / "abort-release"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "abort_barrier_entered_path": str(abort_entered),
+            "abort_barrier_release_path": str(abort_release),
+            "block_aborts": 1,
+            "state_path": str(state_path),
+        },
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.request("disconnect", {}))
+    )
+    try:
+        harness.request("connect", {})
+        harness._control_parent.send({"operation": "shutdown"})
+        _wait_for_path(abort_entered)
+
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert responses == [{"connected": False}]
+        abort_release.touch()
+
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        harness.process.join(3)
+
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["abort"] == 1
+        assert state["counts"]["disconnect"] == 1
+        assert state["connected"] is False
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        abort_release.touch()
+        worker.join(3)
+        harness.close()
+
+
 def test_request_id_zero_then_one_are_accepted_and_zero_replay_is_rejected(owner_harness: OwnerHarness):
     first = owner_harness.raw_request(0, "handshake", {})
     second = owner_harness.raw_request(1, "diagnostics", {})
@@ -779,7 +1014,7 @@ def test_outer_cleanup_retries_snapshot_rollback_and_preserves_original_error(
 
         assert harness.process.exitcode == 0
         state = _read_fake_backend_state(state_path)
-        assert state["counts"]["abort"] == 1
+        assert state["counts"].get("abort", 0) == 0
         assert state["counts"]["disconnect"] == 2
         assert state["connected"] is cleanup_connected
     finally:
@@ -812,7 +1047,7 @@ def test_snapshot_rollback_failure_is_reported_separately_on_outer_exit(
         assert "fake disconnect failed" in errors
         assert harness.process.exitcode == 0
         state = _read_fake_backend_state(state_path)
-        assert state["counts"]["abort"] == 1
+        assert state["counts"].get("abort", 0) == 0
         assert state["counts"]["disconnect"] == 2
     finally:
         harness.close()
@@ -921,6 +1156,14 @@ def _read_lifecycle(path: Path) -> list[dict[str, object]]:
         except (FileNotFoundError, json.JSONDecodeError):
             time.sleep(0.01)
     raise AssertionError("fake backend lifecycle was not published")
+
+
+def _wait_for_path(path: Path) -> None:
+    deadline = time.monotonic() + 3
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"owner barrier was not reached: {path.name}")
+        time.sleep(0.005)
 
 
 def _heater_write_count(state: dict[str, object], value: int) -> int:
