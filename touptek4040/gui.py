@@ -149,10 +149,56 @@ class DiagnosticWorkerPool:
             self._finalizer = threading.Thread(
                 target=quiesce,
                 name="diagnostic-final-cleanup",
-                daemon=True,
+                daemon=False,
             )
             self._finalizer.start()
             return self._finalizer
+
+
+class GuiCloseController:
+    """Keep Tk responsive until camera workers and final cleanup have ended."""
+
+    def __init__(self, root: Any, buttons: Any, workers: DiagnosticWorkerPool, cleanup) -> None:
+        self._root = root
+        self._buttons = buttons
+        self._workers = workers
+        self._cleanup = cleanup
+        self._finalizer: threading.Thread | None = None
+        self.cleanup_error: BaseException | None = None
+        self.closing = False
+
+    def request_close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
+        for child in self._buttons.winfo_children():
+            child.configure(state="disabled")
+
+        def guarded_cleanup() -> None:
+            try:
+                self._cleanup()
+            except BaseException as error:
+                self.cleanup_error = error
+
+        self._finalizer = self._workers.close(guarded_cleanup)
+        self._root.after(20, self._poll)
+
+    def _poll(self) -> None:
+        finalizer = self._finalizer
+        if finalizer is not None and finalizer.is_alive():
+            self._root.after(20, self._poll)
+            return
+        self._root.destroy()
+
+    def join(self) -> None:
+        finalizer = self._finalizer
+        if finalizer is not None:
+            finalizer.join()
+        if self.cleanup_error is not None:
+            _LOG.error(
+                "Diagnostic final cleanup failed: %s",
+                safe_exception_text(self.cleanup_error),
+            )
 
 
 def run_mainloop_with_cleanup(root: Any, cleanup) -> None:
@@ -417,29 +463,33 @@ def _run_diagnostic_window(
                 temperature.set("Unavailable")
         root.after(200, poll)
 
-    closed = False
-
     def camera_cleanup() -> None:
         _cleanup_coordinator(coordinator)
 
+    close_controller = GuiCloseController(
+        root,
+        buttons,
+        workers,
+        camera_cleanup,
+    )
+
     def close() -> None:
-        nonlocal closed
-        if closed:
-            return
-        closed = True
-        for child in buttons.winfo_children():
-            child.configure(state="disabled")
-        workers.close(camera_cleanup)
+        close_controller.request_close()
         cleanup_scheduled[0] = True
-        root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
     append("Diagnostics ready; camera remains unopened until Connect")
     poll()
     def final_cleanup() -> None:
-        if not closed:
-            workers.close(camera_cleanup)
+        if not close_controller.closing:
+            try:
+                close_controller.request_close()
+            except BaseException:
+                # The Tk loop may itself have failed; cleanup still must finish.
+                if not workers.closing:
+                    workers.close(camera_cleanup)
             cleanup_scheduled[0] = True
+        close_controller.join()
         package_logger.removeHandler(queue_handler)
         queue_handler.close()
         logging_session.close()

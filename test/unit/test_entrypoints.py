@@ -16,6 +16,7 @@ from touptek4040.camera_contract import ReadoutMode
 from touptek4040.config import AppConfig, CameraConfig, LoggingConfig, ServerConfig, WebConfig
 from touptek4040.errors import CameraNotConnectedError
 from touptek4040.gui import (
+    GuiCloseController,
     DiagnosticWorkerPool,
     QueueLogHandler,
     parse_diagnostic_settings,
@@ -454,6 +455,62 @@ def test_gui_partial_widget_construction_cleans_all_resources(monkeypatch) -> No
     assert tuple(logger.handlers) == before
 
 
+@pytest.mark.parametrize("cleanup_raises", [False, True])
+def test_gui_close_waits_for_final_cleanup_before_destroy(cleanup_raises) -> None:
+    release = threading.Event()
+    action_started = threading.Event()
+    cleanup_finished = threading.Event()
+    root = _PollingRoot()
+    buttons = SimpleNamespace(
+        winfo_children=lambda: [
+            SimpleNamespace(configure=lambda **_kwargs: None)
+        ]
+    )
+    pool = DiagnosticWorkerPool()
+    assert pool.submit(
+        lambda: (action_started.set(), release.wait()),
+        lambda *_: None,
+    )
+    assert action_started.wait(1)
+
+    def cleanup() -> None:
+        cleanup_finished.set()
+        if cleanup_raises:
+            raise RuntimeError("cleanup failed")
+
+    controller = GuiCloseController(root, buttons, pool, cleanup)
+    controller.request_close()
+    assert root.destroyed is False
+    root.run_one_callback()
+    assert root.destroyed is False
+    release.set()
+    controller.join()
+    root.run_all_callbacks()
+    assert cleanup_finished.is_set()
+    assert root.destroyed is True
+    assert bool(controller.cleanup_error) is cleanup_raises
+
+
+def test_waitress_partial_multisocket_creation_closes_owned_resources(monkeypatch) -> None:
+    closed = []
+    dispatcher = SimpleNamespace(
+        set_thread_count=lambda _count: None,
+        shutdown=lambda: closed.append("dispatcher"),
+    )
+    listener = SimpleNamespace(close=lambda: closed.append("listener"))
+
+    def partial_failure(_app, *, map, _dispatcher, **_kwargs):
+        assert _dispatcher is dispatcher
+        map[1] = listener
+        raise OSError("second bind failed")
+
+    monkeypatch.setattr(run_alpaca, "ThreadedTaskDispatcher", lambda: dispatcher)
+    monkeypatch.setattr(run_alpaca, "create_server", partial_failure)
+    with pytest.raises(OSError, match="second bind failed"):
+        run_alpaca._create_owned_http(object(), host="localhost", port=11111)
+    assert closed == ["listener", "dispatcher"]
+
+
 def test_gui_cli_delegates_to_diagnostic_application(monkeypatch) -> None:
     seen = {}
     def launch(config) -> int:
@@ -539,3 +596,23 @@ class _MultiSocketStub:
 
     def run(self) -> None:
         return None
+
+
+class _PollingRoot:
+    def __init__(self) -> None:
+        self.callbacks = []
+        self.destroyed = False
+
+    def after(self, _delay, callback) -> None:
+        self.callbacks.append(callback)
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+    def run_one_callback(self) -> None:
+        callback = self.callbacks.pop(0)
+        callback()
+
+    def run_all_callbacks(self) -> None:
+        while self.callbacks and not self.destroyed:
+            self.run_one_callback()

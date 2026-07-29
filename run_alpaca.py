@@ -15,6 +15,7 @@ from threading import Lock
 from typing import Any
 
 from waitress import create_server
+from waitress.task import ThreadedTaskDispatcher
 
 from touptek4040.alpaca.app import create_app
 from touptek4040.alpaca.discovery import DiscoveryResponder
@@ -123,7 +124,7 @@ def build_server(
     try:
         coordinator, resolved = build_coordinator(config)
         app = create_app(coordinator, resolved)
-        http = create_server(
+        http = _create_owned_http(
             app,
             host=resolved.server.host,
             port=resolved.server.port,
@@ -338,6 +339,34 @@ def _cleanup_bootstrap_http(http: Any) -> None:
             action()
         except BaseException:
             _LOG.exception("HTTP bootstrap cleanup failed")
+
+
+def _create_owned_http(application: Any, **kwargs: Any) -> Any:
+    """Create Waitress with caller-owned map/dispatcher for failure cleanup."""
+
+    socket_map: dict[Any, Any] = {}
+    dispatcher = ThreadedTaskDispatcher()
+    try:
+        http = create_server(
+            application,
+            map=socket_map,
+            _dispatcher=dispatcher,
+            **kwargs,
+        )
+        if getattr(http, "task_dispatcher", None) is dispatcher:
+            dispatcher.set_thread_count(int(kwargs.get("threads", 4)))
+        return http
+    except BaseException:
+        for listener in tuple(socket_map.values()):
+            try:
+                listener.close()
+            except BaseException:
+                _LOG.exception("Partial Waitress listener cleanup failed")
+        try:
+            dispatcher.shutdown()
+        except BaseException:
+            _LOG.exception("Partial Waitress dispatcher cleanup failed")
+        raise
 
 
 class ServiceTermination(Exception):
