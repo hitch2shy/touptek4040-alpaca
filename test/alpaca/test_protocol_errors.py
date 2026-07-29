@@ -47,6 +47,36 @@ def test_missing_required_parameter_is_http_400_with_transaction_envelope(client
     assert response.json["ErrorMessage"] == "Missing required parameter: Duration"
 
 
+@pytest.mark.parametrize("invalid_client_id", ["", " ", "-1", "not-an-integer"])
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_invalid_supplied_client_id_is_http_400_for_get_and_put(
+    client,
+    method,
+    invalid_client_id,
+):
+    if method == "GET":
+        response = client.simulate_get(
+            "/api/v1/camera/0/connected",
+            params={
+                "ClientID": invalid_client_id,
+                "ClientTransactionID": "67890",
+            },
+        )
+    else:
+        response = client.simulate_put(
+            "/api/v1/camera/0/connected",
+            json={
+                "Connected": True,
+                "ClientID": invalid_client_id,
+                "ClientTransactionID": "67890",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json["ClientTransactionID"] == 67890
+    assert response.json["ErrorNumber"] == 0x401
+
+
 def test_malformed_json_is_stable_http_400_without_parser_or_input_leak(client):
     response = client.simulate_put(
         "/api/v1/camera/0/gain",

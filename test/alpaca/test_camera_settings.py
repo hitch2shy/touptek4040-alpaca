@@ -236,10 +236,10 @@ def test_binning_rejects_invalid_values_without_changing_state(
 @pytest.mark.parametrize(
     ("command", "parameter", "valid", "invalid"),
     [
-        ("startx", "StartX", 4095, 4096),
+        ("startx", "StartX", 4095, -1),
         ("starty", "StartY", 4095, -1),
         ("numx", "NumX", 1, 0),
-        ("numy", "NumY", 4096, 4097),
+        ("numy", "NumY", 4096, 0),
     ],
 )
 def test_roi_fields_enforce_individual_ranges_but_defer_combination_validation(
@@ -251,6 +251,33 @@ def test_roi_fields_enforce_individual_ranges_but_defer_combination_validation(
         put_value(client, command, parameter, invalid).json["ErrorNumber"]
         == INVALID_VALUE
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "parameter", "value"),
+    [
+        ("startx", "StartX", 4097),
+        ("starty", "StartY", 4097),
+        ("numx", "NumX", 4097),
+        ("numy", "NumY", 4097),
+    ],
+)
+def test_roi_upper_bounds_are_deferred_until_start_exposure(
+    command,
+    parameter,
+    value,
+    client,
+):
+    assert put_value(client, command, parameter, value).json["ErrorNumber"] == 0
+    assert get_value(client, command) == value
+
+    response = client.simulate_put(
+        "/api/v1/camera/0/startexposure",
+        json={"Duration": "0.1", "Light": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json["ErrorNumber"] == INVALID_VALUE
 
 
 def test_binning_write_does_not_reject_temporarily_invalid_roi_combination(client):
@@ -507,10 +534,10 @@ def test_abort_exposure_delegates_to_coordinator(client, coordinator, api_camera
     assert api_camera.abort_calls >= 1
 
 
-def test_stop_exposure_is_idle_noop_and_canstop_is_false(client):
+def test_stop_exposure_is_not_implemented_and_canstop_is_false(client):
     assert get_value(client, "canstopexposure") is False
     response = client.simulate_put("/api/v1/camera/0/stopexposure")
-    assert response.json["ErrorNumber"] == 0
+    assert response.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
 
 
 def test_start_exposure_validates_parameters_without_native_exceptions(client):

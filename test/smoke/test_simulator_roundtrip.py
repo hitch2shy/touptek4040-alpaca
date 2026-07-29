@@ -62,7 +62,7 @@ def test_complete_simulator_http_roundtrip() -> None:
         assert metadata[0:2] == (1, 0)
         assert metadata[2] == 0
         assert metadata[3] > 0
-        assert metadata[4:] == (44, 8, 8, 2, 32, 24, 0)
+        assert metadata[4:] == (44, 2, 8, 2, 32, 24, 0)
         assert len(binary) == 44 + 32 * 24 * 2
 
         image_json = base.get_alpaca("imagearray")

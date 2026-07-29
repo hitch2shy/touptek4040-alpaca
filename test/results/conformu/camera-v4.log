@@ -1,0 +1,253 @@
+14:12:56.379 ASCOM Universal Device Conformance Checker Version 2.0.0.16486, Build time: 周一 29 五月 2023 07:03:52          
+14:12:56.380                                              
+14:12:56.380 Operating system is Microsoft Windows 10.0.26200 64bit, Application is 64bit.          
+14:12:56.380                                              
+14:12:56.383 Alpaca device: RMP-Driven Telescope (127.0.0.1:11114 Camera/0)          
+14:12:56.384                                              
+14:12:56.387 CreateDevice                        INFO     Creating Alpaca device: IP address: 127.0.0.1, IP Port: 11114, Alpaca device number: 0
+14:12:56.397 CreateDevice                        INFO     Alpaca device created OK
+14:12:57.400 CreateDevice                        INFO     Successfully created driver
+14:12:57.400 ConformanceCheck                    OK       Driver instance created successfully
+14:12:57.400                                              
+14:12:57.401 Connect to device                            
+14:12:58.529 Connected                           OK       True
+14:12:58.529                                              
+14:12:58.535 Common Driver Methods                        
+14:12:58.601 InterfaceVersion                    OK       4
+14:12:58.603 Connected                           OK       True
+14:12:58.607 Description                         OK       ToupTek sMAX16AM-U3-CL-GPS 4096x4096 mono camera
+14:12:58.610 DriverInfo                          OK       ToupTek4040 0.1.0; SDK 20250623; firmware 4.6.7.20240903; hardware 1.0; FPGA 3.17
+14:12:58.612 DriverVersion                       OK       0.1.0
+14:12:58.614 Name                                OK       ToupTek 4040 Alpaca Camera
+14:12:58.614 Action                              INFO     Conform cannot test the Action method
+14:12:58.619 SupportedActions                    OK       Driver returned an empty action list
+14:12:58.620                                              
+14:12:58.620 Can Properties                               
+14:12:58.642 CanAbortExposure                    OK       True
+14:12:58.643 CanAsymmetricBin                    OK       False
+14:12:58.644 CanGetCoolerPower                   OK       True
+14:12:58.646 CanPulseGuide                       OK       False
+14:12:58.647 CanSetCCDTemperature                OK       True
+14:12:58.648 CanStopExposure                     OK       False
+14:12:58.649 CanFastReadout                      OK       False
+14:12:58.650                                              
+14:12:58.650 Pre-run Checks                               
+14:12:58.651                                              
+14:12:58.651 Last Tests                                   
+14:12:58.680 LastExposureDuration                OK       LastExposureDuration returned an error before an exposure was made: No completed exposure is available get - no value has been set.
+14:12:58.682 LastExposureStartTime               OK       LastExposureStartTime returned an error before an exposure was made: No completed exposure is available get - no value has been set.
+14:12:58.682                                              
+14:12:58.682 Properties                                   
+14:12:58.692 MaxBinX                             OK       8
+14:12:58.694 MaxBinY                             OK       8
+14:12:58.695 BinX Read                           OK       1
+14:12:58.696 BinY Read                           OK       1
+14:12:58.698 BinX Write                          OK       Received error on setting BinX to 0: binx must be between 1 and 8
+14:12:58.700 BinX Write                          OK       Received error on setting BinX to 9: binx must be between 1 and 8
+14:12:58.702 BinY Write                          OK       Received error on setting BinY to 0: biny must be between 1 and 8
+14:12:58.703 BinY Write                          OK       Received error on setting BinY to 9: biny must be between 1 and 8
+14:12:58.706 BinXY Write                         OK       Successfully set symmetric XY binning: 1 x 1
+14:12:58.708 BinXY Write                         OK       Successfully set symmetric XY binning: 2 x 2
+14:12:58.710 BinXY Write                         OK       Successfully set symmetric XY binning: 3 x 3
+14:12:58.712 BinXY Write                         OK       Successfully set symmetric XY binning: 4 x 4
+14:12:58.714 BinXY Write                         OK       Successfully set symmetric XY binning: 5 x 5
+14:12:58.715 BinXY Write                         OK       Successfully set symmetric XY binning: 6 x 6
+14:12:58.717 BinXY Write                         OK       Successfully set symmetric XY binning: 7 x 7
+14:12:58.718 BinXY Write                         OK       Successfully set symmetric XY binning: 8 x 8
+14:12:58.735 CameraState                         OK       Idle
+14:12:58.748 CameraXSize                         OK       4096
+14:12:58.749 CameraYSize                         OK       4096
+14:12:58.799 CCDTemperature                      OK       23.9
+14:12:58.802 CoolerOn Read                       OK       True
+14:12:58.807 CoolerOn Write                      OK       Successfully changed CoolerOn state
+14:12:58.845 CoolerPower                         OK       2.5
+14:12:58.847 ElectronsPerADU                     OK       Optional member returned a PropertyNotImplementedException error.
+14:12:58.851 FullWellCapacity                    OK       Optional member returned a PropertyNotImplementedException error.
+14:12:58.852 HasShutter                          OK       False
+14:12:58.854 HeatSinkTemperature                 OK       Optional member returned a PropertyNotImplementedException error.
+14:12:58.855 ImageReady                          OK       False
+14:12:58.866 ImageArray                          OK       Received error when ImageReady is false: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:12:58.874 ImageArrayVariant                   OK       Received error when ImageReady is false: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:12:58.878 IsPulseGuiding                      OK       False
+14:12:58.879 MaxADU                              OK       4095
+14:12:58.880 NumX Read                           OK       4096
+14:12:58.882 NumX write                          OK       Successfully wrote 2048
+14:12:58.883 NumY Read                           OK       4096
+14:12:58.884 NumY write                          OK       Successfully wrote 2048
+14:12:58.885 PixelSizeX                          OK       9
+14:12:58.886 PixelSizeY                          OK       9
+14:12:58.888 SetCCDTemperature Read              OK       10
+14:12:58.924 SetCCDTemperature Write             OK       Successfully wrote 0.0
+14:12:59.331 SetCCDTemperature Write             INFO     Set point lower limit found in the range -50.00 to -54.99 degrees
+14:12:59.581 SetCCDTemperature Write             INFO     Set point upper limit found in the range +40.00 to +44.99 degrees
+14:12:59.613 StartX Read                         OK       0
+14:12:59.615 StartX write                        OK       Successfully wrote 2048
+14:12:59.616 StartY Read                         OK       0
+14:12:59.617 StartY write                        OK       Successfully wrote 2048
+14:12:59.636 SensorType Read                     OK       Monochrome
+14:12:59.639 BayerOffsetX Read                   OK       Sensor type is Monochrome and a PropertyNotImplementedException error was generated as expected
+14:12:59.640 BayerOffsetY Read                   OK       Sensor type is Monochrome and a PropertyNotImplementedException error was generated as expected
+14:12:59.642 ExposureMax Read                    OK       3600
+14:12:59.643 ExposureMin Read                    OK       1.2E-05
+14:12:59.643 ExposureMin                         OK       ExposureMin is less than or equal to ExposureMax
+14:12:59.644 ExposureResolution Read             OK       1E-06
+14:12:59.644 ExposureResolution                  OK       ExposureResolution is less than or equal to ExposureMax
+14:12:59.646 FastReadout Read                    OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.648 FastReadout Write                   OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.650 GainMin Read                        OK       100
+14:12:59.651 GainMax Read                        OK       1650
+14:12:59.653 Gains Read                          OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.654 Gain Read                           OK       100
+14:12:59.655 Gain Read                           OK       Gain, GainMin and GainMax can be read OK while Gains returns an error - the driver is in "Gain Value" mode.
+14:12:59.656 Gain Write                          OK       Successfully set gain minimum value 100.
+14:12:59.658 Gain Write                          OK       Successfully set gain maximum value 1650.
+14:12:59.659 Gain Write                          OK       InvalidValue Received error for gain 99, which is lower than the minimum value.
+14:12:59.661 Gain Write                          OK       InvalidValue Received error for gain 1651 which is higher than the maximum value.
+14:12:59.663 PercentCompleted Read               ISSUE    Unexpected error: PercentCompleted is unavailable outside an exposure
+14:12:59.666 ReadoutModes Read                   OK       RAW 12-bit
+14:12:59.666 ReadoutModes Read                   OK       RAW 8-bit
+14:12:59.668 ReadoutMode Read                    OK       0
+14:12:59.668 ReadoutMode Index                   OK       ReadReadoutMode is within the bounds of the ReadoutModes ArrayList
+14:12:59.668 ReadoutMode Index                   INFO     Current value: RAW 12-bit
+14:12:59.671 SensorName Read                     OK       sMAX16AM-U3-CL-GPS
+14:12:59.675 OffsetMin Read                      OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.677 OffsetMax Read                      OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.679 Offsets Read                        OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.681 Offset Read                         OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.681 Offset Read                         OK       All four offset properties return errors - the driver is in "Offset Not Implemented" mode.
+14:12:59.683 Offset Write                        OK       PropertyNotImplemented error is expected and a PropertyNotImplementedException error was generated as expected
+14:12:59.684 SubExposureDuration                 OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.686 SubExposureDuration write           OK       Optional member returned a PropertyNotImplementedException error.
+14:12:59.687                                              
+14:12:59.687 Methods                                      
+14:12:59.693 AbortExposure                       OK       No error returned when camera is already idle
+14:12:59.695 PulseGuide                          OK       CanPulseGuide is false and PulseGuide is not implemented in this driver
+14:12:59.698 StopExposure                        OK       CanStopExposure is false and an error was returned: StopExposure is not supported; use AbortExposure
+14:12:59.705                                              
+14:12:59.705 Taking full frame image 1 x 1 bin (4096 x 4096) - 16.8 MPix          
+14:13:02.242 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:02.244 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:02.245 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:12:59.930407Z UTC
+14:13:02.564 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 4096 x 4096 pixels in 315ms.
+14:13:02.591 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:02.591 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:02.601                                              
+14:13:02.601 Taking full frame image 2 x 2 bin (2048 x 2048) - 4.2 MPix          
+14:13:06.134 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:06.136 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:06.137 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:03.522147Z UTC
+14:13:06.213 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 2048 x 2048 pixels in 75ms.
+14:13:06.222 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:06.222 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:06.227                                              
+14:13:06.227 Taking full frame image 3 x 3 bin (1365 x 1365) - 1.9 MPix          
+14:13:09.751 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:09.752 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:09.753 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:07.171945Z UTC
+14:13:09.773 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 1365 x 1365 pixels in 17ms.
+14:13:09.778 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:09.778 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:09.782                                              
+14:13:09.782 Taking full frame image 4 x 4 bin (1024 x 1024) - 1.0 MPix          
+14:13:13.299 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:13.300 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:13.302 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:10.703734Z UTC
+14:13:13.321 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 1024 x 1024 pixels in 13ms.
+14:13:13.330 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:13.330 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:13.335                                              
+14:13:13.335 Taking full frame image 5 x 5 bin (819 x 819) - 0.7 MPix          
+14:13:16.868 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:16.870 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:16.871 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:14.283548Z UTC
+14:13:16.881 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 819 x 819 pixels in 8ms.
+14:13:16.886 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:16.886 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:16.890                                              
+14:13:16.890 Taking full frame image 6 x 6 bin (682 x 682) - 0.5 MPix          
+14:13:20.414 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:20.415 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:20.417 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:17.822433Z UTC
+14:13:20.423 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 682 x 682 pixels in 5ms.
+14:13:20.428 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:20.428 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:20.433                                              
+14:13:20.433 Taking full frame image 7 x 7 bin (585 x 585) - 0.3 MPix          
+14:13:23.968 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:23.970 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:23.971 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:21.387330Z UTC
+14:13:23.977 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 585 x 585 pixels in 4ms.
+14:13:23.986 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:23.986 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:23.990                                              
+14:13:23.990 Taking full frame image 8 x 8 bin (512 x 512) - 0.3 MPix          
+14:13:27.516 StartExposure                       OK       Asynchronous exposure found OK: 2 seconds
+14:13:27.517 LastExposureDuration                OK       Last exposure duration is: 2.000 seconds
+14:13:27.519 LastExposureStartTime               OK       LastExposureStartTime is correct to within 2 seconds: 2026-07-29T06:13:24.918095Z UTC
+14:13:27.527 ImageArray                          OK       Successfully read 32 bit integer array (1 plane) 512 x 512 pixels in 4ms.
+14:13:27.531 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:27.532 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:27.537                                              
+14:13:27.537 StartExposure error cases                    
+14:13:27.543 Reject Negative Duration            OK       Received error: duration_s must quantize to between 12 and 3600000000 microseconds
+14:13:27.548 Reject Bad XSize (bin 1 x 1)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.553 Reject Bad YSize (bin 1 x 1)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.558 Reject Bad XStart (bin 1 x 1)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.562 Reject Bad YStart (bin 1 x 1)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.566 Reject Bad XSize (bin 2 x 2)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.572 Reject Bad YSize (bin 2 x 2)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.578 Reject Bad XStart (bin 2 x 2)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.583 Reject Bad YStart (bin 2 x 2)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.589 Reject Bad XSize (bin 3 x 3)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.595 Reject Bad YSize (bin 3 x 3)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.609 Reject Bad XStart (bin 3 x 3)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.616 Reject Bad YStart (bin 3 x 3)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.623 Reject Bad XSize (bin 4 x 4)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.629 Reject Bad YSize (bin 4 x 4)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.634 Reject Bad XStart (bin 4 x 4)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.641 Reject Bad YStart (bin 4 x 4)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.646 Reject Bad XSize (bin 5 x 5)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.653 Reject Bad YSize (bin 5 x 5)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.658 Reject Bad XStart (bin 5 x 5)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.664 Reject Bad YStart (bin 5 x 5)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.670 Reject Bad XSize (bin 6 x 6)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.675 Reject Bad YSize (bin 6 x 6)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.680 Reject Bad XStart (bin 6 x 6)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.687 Reject Bad YStart (bin 6 x 6)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.692 Reject Bad XSize (bin 7 x 7)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.699 Reject Bad YSize (bin 7 x 7)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.707 Reject Bad XStart (bin 7 x 7)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.712 Reject Bad YStart (bin 7 x 7)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:27.719 Reject Bad XSize (bin 8 x 8)        OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:27.725 Reject Bad YSize (bin 8 x 8)        OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:28.469 Reject Bad XStart (bin 8 x 8)       OK       Received error: NumX is invalid: horizontal ROI extends outside the sensor
+14:13:28.484 Reject Bad YStart (bin 8 x 8)       OK       Received error: NumY is invalid: vertical ROI extends outside the sensor
+14:13:28.484                                              
+14:13:28.484 Post-run Checks                              
+14:13:28.488 PostRunCheck                        OK       Camera returned to initial cooler temperature
+14:13:28.496                                              
+14:13:28.496 Disconnect from device                       
+14:13:28.822 Connected                           OK       False
+14:13:28.822                                              
+14:13:28.822 Conformance test has finished                
+14:13:28.822                                              
+14:13:28.822 Your device had 17 issues, 0 errors and 0 configuration alerts          
+14:13:28.822                                              
+14:13:28.822 Issue Summary                                
+14:13:28.822 PercentCompleted Read               ISSUE    Unexpected error: PercentCompleted is unavailable outside an exposure
+14:13:28.822 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.822 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.822 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.
+14:13:28.823 ImageArrayVariant                   ISSUE    Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown
+14:13:28.823 ImageArrayVariant                   ISSUE    Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object.

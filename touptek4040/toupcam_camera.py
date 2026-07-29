@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import math
 import sys
+import time
 from contextlib import contextmanager
 from ctypes import ArgumentError
 from dataclasses import dataclass
@@ -56,6 +57,14 @@ class AppliedSettings:
     height: int
     dtype: np.dtype
     gain: int
+    capture_width: int
+    capture_height: int
+    crop_x: int
+    crop_y: int
+    prebin_width: int
+    prebin_height: int
+    hardware_binning: int
+    software_binning: int
 
 
 @dataclass(frozen=True)
@@ -95,8 +104,29 @@ def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentit
 class ToupTekCamera:
     """Stable ToupTek selection with one synchronized hardware handle."""
 
-    def __init__(self, serial: str | None, sdk: ModuleType | Any | None = None) -> None:
+    def __init__(
+        self,
+        serial: str | None,
+        sdk: ModuleType | Any | None = None,
+        *,
+        monotonic: Any = time.monotonic,
+        sleeper: Any = time.sleep,
+        trigger_recovery_s: float = 0.015,
+    ) -> None:
+        if (
+            isinstance(trigger_recovery_s, bool)
+            or not isinstance(trigger_recovery_s, (int, float))
+            or not math.isfinite(trigger_recovery_s)
+            or trigger_recovery_s < 0
+        ):
+            raise CameraInvalidValueError(
+                "trigger_recovery_s must be a finite non-negative number"
+            )
         self._sdk = sdk if sdk is not None else load_default_toupcam_module()
+        self._monotonic = monotonic
+        self._sleeper = sleeper
+        self._trigger_recovery_s = float(trigger_recovery_s)
+        self._last_trigger_completed_monotonic: float | None = None
         identities = enumerate_cameras(self._sdk)
         if serial is None:
             if len(identities) != 1:
@@ -123,6 +153,9 @@ class ToupTekCamera:
         self._stop_in_flight = False
         self._cancel_requested = False
         self._abort_generation = 0
+        self._configured_structure: tuple[
+            tuple[int, int, int, int], int, ReadoutMode
+        ] | None = None
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -147,6 +180,9 @@ class ToupTekCamera:
             self._handle = handle
             self._unusable = False
             self._disconnecting = False
+            self._configured_structure = None
+            self._camera_started = False
+            self._last_trigger_completed_monotonic = None
 
     def disconnect(self) -> None:
         with self._condition:
@@ -164,6 +200,11 @@ class ToupTekCamera:
             while self._acquiring or self._native_calls or self._stop_in_flight:
                 self._condition.wait()
             handle = self._handle
+        stream_stop_error = self._stop_persistent_stream()
+        with self._condition:
+            while self._native_calls or self._stop_in_flight:
+                self._condition.wait()
+            handle = self._handle
         close_error: CameraError | None = None
         if handle is not None:
             try:
@@ -175,12 +216,15 @@ class ToupTekCamera:
                 self._handle = None
                 self._disconnecting = False
                 self._unusable = False
+                self._configured_structure = None
             elif close_error is not None:
                 self._disconnecting = True
                 self._unusable = True
             self._condition.notify_all()
         disconnect_errors = tuple(
-            error for error in (abort_error, close_error) if error is not None
+            error
+            for error in (abort_error, stream_stop_error, close_error)
+            if error is not None
         )
         if len(disconnect_errors) > 1:
             raise CameraCleanupError(
@@ -218,10 +262,13 @@ class ToupTekCamera:
                 self._require_connected_locked()
             with self._native_lease(during_acquisition=True) as handle:
                 applied = self._apply_settings_locked(handle, settings)
+                with self._condition:
+                    handle = self._require_connected_locked()
                 buffer = _allocate_buffer(applied)
                 frame_info = self._sdk.ToupcamFrameInfoV4()
                 timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
                 claim_state: dict[str, int] = {}
+                self._pace_reused_trigger()
 
                 def claim() -> None:
                     with self._condition:
@@ -242,36 +289,67 @@ class ToupTekCamera:
                 generation = claim_state["generation"]
                 operation_errors: list[CameraError] = []
                 try:
-                    handle.StartPullModeWithCallback(None, None)
+                    with self._condition:
+                        stream_started = self._camera_started
+                    if not stream_started:
+                        handle.StartPullModeWithCallback(None, None)
                     with self._condition:
                         self._camera_started = True
                         cancelled = generation != self._abort_generation
                     if not cancelled:
                         started_utc = datetime.now(timezone.utc)
                         handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
+                        self._last_trigger_completed_monotonic = self._monotonic()
                 except BaseException as error:
                     operation_errors.append(_translate_sdk_error(error, "acquire frame"))
-                stop_error = self._stop_if_claimed_by_caller()
-                if stop_error is not None:
-                    operation_errors.append(stop_error)
+                with self._condition:
+                    must_stop = (
+                        bool(operation_errors)
+                        or generation != self._abort_generation
+                    )
+                if must_stop:
+                    stop_error = self._stop_if_claimed_by_caller()
+                    if stop_error is not None:
+                        operation_errors.append(stop_error)
                 self._raise_acquisition_errors(generation, operation_errors)
                 info_width = frame_info.v3.width
                 info_height = frame_info.v3.height
-                if (info_width, info_height) != (applied.width, applied.height):
-                    raise self._complete_error(
-                        generation,
-                        CameraError(
+                if (info_width, info_height) != (
+                    applied.capture_width,
+                    applied.capture_height,
+                ):
+                    dimension_error = CameraError(
                             "SDK frame dimensions "
                             f"{info_width}x{info_height} do not match configured "
-                            f"{applied.width}x{applied.height}"
-                        ),
+                            f"{applied.capture_width}x{applied.capture_height}"
                     )
+                    stop_error = self._stop_if_claimed_by_caller()
+                    errors = [dimension_error]
+                    if stop_error is not None:
+                        errors.append(stop_error)
+                    self._raise_acquisition_errors(generation, errors)
                 try:
-                    pixels = np.frombuffer(
+                    captured = np.frombuffer(
                         buffer,
                         dtype=applied.dtype,
-                        count=applied.width * applied.height,
-                    ).reshape(applied.height, applied.width).copy()
+                        count=applied.capture_width * applied.capture_height,
+                    ).reshape(
+                        applied.capture_height,
+                        applied.capture_width,
+                    )[
+                        applied.crop_y : applied.crop_y + applied.prebin_height,
+                        applied.crop_x : applied.crop_x + applied.prebin_width,
+                    ]
+                    if applied.software_binning > 1:
+                        pixels = _software_bin_saturating(
+                            captured,
+                            applied.software_binning,
+                            4095
+                            if readout_mode is ReadoutMode.RAW12
+                            else 255,
+                        )
+                    else:
+                        pixels = captured.copy()
                     frame = Frame(
                         pixels=pixels,
                         started_utc=started_utc,
@@ -282,6 +360,15 @@ class ToupTekCamera:
                         gain=applied.gain,
                     )
                 except BaseException as error:
+                    stop_error = self._stop_if_claimed_by_caller()
+                    if stop_error is not None:
+                        error = CameraCleanupError(
+                            "frame construction and stream stop both failed",
+                            (
+                                safe_camera_error(error, "construct frame"),
+                                stop_error,
+                            ),
+                        )
                     completed = self._complete_error(generation, error)
                     if isinstance(completed, CameraOperationCancelledError):
                         raise completed from error
@@ -291,7 +378,6 @@ class ToupTekCamera:
             with self._condition:
                 if not self._frame_committed:
                     self._acquiring = False
-                self._camera_started = False
                 self._cancel_requested = False
                 self._condition.notify_all()
             self._acquisition_lock.release()
@@ -369,6 +455,20 @@ class ToupTekCamera:
             self._stop_in_flight = False
             self._native_calls -= 1
             self._condition.notify_all()
+
+    def _stop_persistent_stream(self) -> CameraError | None:
+        """Stop an idle pull stream before close without racing acquisition."""
+        should_stop, handle = self._claim_stop()
+        if not should_stop:
+            return None
+        error: CameraError | None = None
+        try:
+            handle.Stop()
+        except BaseException as native_error:
+            error = _translate_sdk_error(native_error, "stop camera stream")
+        finally:
+            self._finish_stop(error)
+        return error
 
     def _stop_if_claimed_by_caller(self) -> CameraError | None:
         should_stop, handle = self._claim_stop()
@@ -528,38 +628,134 @@ class ToupTekCamera:
     def _apply_settings_locked(
         self, handle: Any, settings: CaptureSettings
     ) -> AppliedSettings:
-        exposure_us, sdk_roi, dtype = self._validated_sdk_settings(settings)
+        (
+            exposure_us,
+            sdk_roi,
+            dtype,
+            crop_x,
+            crop_y,
+            capture_width,
+            capture_height,
+            prebin_width,
+            prebin_height,
+            hardware_binning,
+            software_binning,
+        ) = self._validated_sdk_settings(settings)
+        structure = (sdk_roi, hardware_binning, settings.readout_mode)
+        with self._condition:
+            structure_changed = self._configured_structure != structure
+            stream_started = self._camera_started
+        if structure_changed and stream_started:
+            try:
+                handle.Stop()
+            except BaseException as error:
+                with self._condition:
+                    self._unusable = True
+                    self._configured_structure = None
+                raise _translate_sdk_error(
+                    error, "stop camera for reconfiguration"
+                ) from error
+            with self._condition:
+                self._camera_started = False
+                self._stop_claimed = False
+                self._last_trigger_completed_monotonic = None
+            try:
+                handle.Close()
+            except BaseException as error:
+                with self._condition:
+                    self._unusable = True
+                    self._configured_structure = None
+                raise _translate_sdk_error(
+                    error, "close camera for reconfiguration"
+                ) from error
+            with self._condition:
+                if self._handle is handle:
+                    self._handle = None
+                self._configured_structure = None
+            try:
+                handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
+            except BaseException as error:
+                raise _translate_sdk_error(
+                    error, "reopen camera for reconfiguration"
+                ) from error
+            if handle is None:
+                raise CameraNotConnectedError(
+                    "could not reopen camera for reconfiguration"
+                )
+            with self._condition:
+                self._handle = handle
+                self._unusable = False
         try:
-            handle.put_Option(self._sdk.TOUPCAM_OPTION_RAW, 1)
-            handle.put_Option(
-                self._sdk.TOUPCAM_OPTION_BITDEPTH,
-                1 if settings.readout_mode is ReadoutMode.RAW12 else 0,
-            )
-            handle.put_Option(self._sdk.TOUPCAM_OPTION_BINNING, settings.binning)
-            handle.put_Roi(*sdk_roi)
+            if structure_changed:
+                handle.put_AutoExpoEnable(False)
+                handle.put_Option(self._sdk.TOUPCAM_OPTION_RAW, 1)
+                handle.put_Option(
+                    self._sdk.TOUPCAM_OPTION_BITDEPTH,
+                    1 if settings.readout_mode is ReadoutMode.RAW12 else 0,
+                )
+                handle.put_Option(
+                    self._sdk.TOUPCAM_OPTION_BINNING, hardware_binning
+                )
+                handle.put_Roi(*sdk_roi)
             handle.put_ExpoTime(exposure_us)
-            handle.put_Option(self._sdk.TOUPCAM_OPTION_TRIGGER, 1)
+            if structure_changed:
+                handle.put_Option(self._sdk.TOUPCAM_OPTION_TRIGGER, 1)
             width, height = handle.get_FinalSize()
             gain = handle.get_ExpoAGain()
         except BaseException as error:
+            if structure_changed:
+                with self._condition:
+                    self._configured_structure = None
             raise _translate_sdk_error(error, "apply capture settings") from error
         if width <= 0 or height <= 0:
             raise CameraError(f"SDK returned invalid final size {width}x{height}")
-        if (width, height) != (settings.roi.width, settings.roi.height):
+        if (width, height) != (capture_width, capture_height):
             raise CameraInvalidValueError(
-                "requested ROI does not produce the same final SDK dimensions"
+                "padded ROI does not produce the expected final SDK dimensions"
             )
+        if structure_changed:
+            with self._condition:
+                self._configured_structure = structure
         return AppliedSettings(
             exposure_us / 1_000_000.0,
-            width,
-            height,
+            settings.roi.width,
+            settings.roi.height,
             dtype,
             gain,
+            capture_width,
+            capture_height,
+            crop_x,
+            crop_y,
+            prebin_width,
+            prebin_height,
+            hardware_binning,
+            software_binning,
         )
+
+    def _pace_reused_trigger(self) -> None:
+        """Allow the device's completed-frame pipeline to accept the next trigger."""
+        completed = self._last_trigger_completed_monotonic
+        if completed is None or self._trigger_recovery_s == 0:
+            return
+        remaining = self._trigger_recovery_s - (self._monotonic() - completed)
+        if remaining > 0:
+            self._sleeper(remaining)
 
     def _validated_sdk_settings(
         self, settings: CaptureSettings
-    ) -> tuple[int, tuple[int, int, int, int], np.dtype]:
+    ) -> tuple[
+        int,
+        tuple[int, int, int, int],
+        np.dtype,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+    ]:
         if isinstance(settings.duration_s, bool) or not isinstance(
             settings.duration_s, (int, float)
         ):
@@ -586,27 +782,72 @@ class ToupTekCamera:
         if roi.x < 0 or roi.y < 0 or roi.width <= 0 or roi.height <= 0:
             raise CameraInvalidValueError("ROI must have a non-negative origin and positive size")
         scale = settings.binning
-        sdk_roi = (
-            roi.x * scale,
-            roi.y * scale,
-            roi.width * scale,
-            roi.height * scale,
-        )
-        x, y, width, height = sdk_roi
-        if width < 16 or height < 16 or any(value % 2 for value in sdk_roi):
-            raise CameraInvalidValueError(
-                "scaled SDK ROI coordinates and dimensions must be even and at least 16 pixels"
-            )
-        if x + width > self.capabilities.width or y + height > self.capabilities.height:
+        if (
+            (roi.x + roi.width) * scale > self.capabilities.width
+            or (roi.y + roi.height) * scale > self.capabilities.height
+        ):
             raise CameraInvalidValueError("ROI extends outside the sensor")
-        if roi.width % 2 or roi.height % 2:
-            raise CameraInvalidValueError("final SDK image dimensions must be even")
+        hardware_binning = scale
+        software_binning = 1
+        prebin_width = roi.width
+        prebin_height = roi.height
+        try:
+            sdk_x, sdk_width, crop_x, capture_width = _padded_sdk_axis(
+                roi.x,
+                roi.width,
+                scale,
+                self.capabilities.width,
+            )
+            sdk_y, sdk_height, crop_y, capture_height = _padded_sdk_axis(
+                roi.y,
+                roi.height,
+                scale,
+                self.capabilities.height,
+            )
+        except CameraInvalidValueError:
+            if scale == 1:
+                raise
+            # The SDK rounds a binned final dimension down to an even number,
+            # so some valid ASCOM dimensions (for example 4096 // 3 == 1365)
+            # cannot be produced by native binning. Capture only the covering
+            # unbinned physical interval, crop it, then bin in bounded memory.
+            hardware_binning = 1
+            software_binning = scale
+            physical_x = roi.x * scale
+            physical_y = roi.y * scale
+            prebin_width = roi.width * scale
+            prebin_height = roi.height * scale
+            sdk_x, sdk_width, crop_x, capture_width = _padded_sdk_axis(
+                physical_x,
+                prebin_width,
+                1,
+                self.capabilities.width,
+            )
+            sdk_y, sdk_height, crop_y, capture_height = _padded_sdk_axis(
+                physical_y,
+                prebin_height,
+                1,
+                self.capabilities.height,
+            )
+        sdk_roi = (sdk_x, sdk_y, sdk_width, sdk_height)
         dtype = np.dtype(
             np.uint16
             if settings.readout_mode is ReadoutMode.RAW12
             else np.uint8
         )
-        return exposure_us, sdk_roi, dtype
+        return (
+            exposure_us,
+            sdk_roi,
+            dtype,
+            crop_x,
+            crop_y,
+            capture_width,
+            capture_height,
+            prebin_width,
+            prebin_height,
+            hardware_binning,
+            software_binning,
+        )
 
     def _require_connected_locked(self) -> Any:
         if self._handle is None:
@@ -635,8 +876,62 @@ class ToupTekCamera:
 
 
 def _allocate_buffer(settings: AppliedSettings) -> Any:
-    byte_count = settings.width * settings.height * settings.dtype.itemsize
+    byte_count = (
+        settings.capture_width
+        * settings.capture_height
+        * settings.dtype.itemsize
+    )
     return ctypes.create_string_buffer(byte_count)
+
+
+def _software_bin_saturating(
+    pixels: np.ndarray,
+    binning: int,
+    maximum: int,
+) -> np.ndarray:
+    """Saturating n*n sum using one output-sized accumulator.
+
+    ``pixels`` is a view into the SDK buffer. Each source phase is added
+    directly into the accumulator, avoiding any full-size intermediate copy.
+    """
+
+    output_height = pixels.shape[0] // binning
+    output_width = pixels.shape[1] // binning
+    accumulator = np.zeros((output_height, output_width), dtype=np.uint64)
+    for y_phase in range(binning):
+        for x_phase in range(binning):
+            np.add(
+                accumulator,
+                pixels[y_phase::binning, x_phase::binning],
+                out=accumulator,
+                casting="unsafe",
+            )
+    np.minimum(accumulator, maximum, out=accumulator)
+    return accumulator.astype(pixels.dtype)
+
+
+def _padded_sdk_axis(
+    start: int,
+    count: int,
+    binning: int,
+    sensor_size: int,
+) -> tuple[int, int, int, int]:
+    """Map one binned ASCOM axis to an even, >=16-pixel SDK interval."""
+
+    minimum_capture = math.ceil(16 / binning)
+    for crop_start in range(start + 1):
+        sdk_start = (start - crop_start) * binning
+        if sdk_start % 2:
+            continue
+        capture_count = max(crop_start + count, minimum_capture)
+        if (capture_count * binning) % 2:
+            capture_count += 1
+        sdk_count = capture_count * binning
+        if sdk_start + sdk_count <= sensor_size:
+            return sdk_start, sdk_count, crop_start, capture_count
+    raise CameraInvalidValueError(
+        "ROI cannot be represented by an SDK-compatible padded interval"
+    )
 
 
 def _translate_sdk_error(error: BaseException, operation: str) -> CameraError:

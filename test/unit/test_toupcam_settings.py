@@ -35,7 +35,8 @@ def test_settings_are_applied_before_the_synchronous_trigger(camera: ToupTekCame
     """Wrong order would configure an SDK option after acquisition has begun."""
     camera.acquire(0.25, Roi(10, 12, 100, 80), 2, ReadoutMode.RAW12)
 
-    assert camera._sdk.calls[:6] == [
+    assert camera._sdk.calls[:7] == [
+        ("put_AutoExpoEnable", False),
         ("put_Option", OPTION_RAW, 1),
         ("put_Option", OPTION_BITDEPTH, 1),
         ("put_Option", OPTION_BINNING, 2),
@@ -262,7 +263,7 @@ def test_apply_settings_returns_final_sdk_dimensions(camera: ToupTekCamera) -> N
         CaptureSettings(0.1, Roi(0, 0, 64, 64), 0, ReadoutMode.RAW12),
         CaptureSettings(0.1, Roi(0, 0, 64, 64), 9, ReadoutMode.RAW12),
         CaptureSettings(0.1, Roi(-1, 0, 64, 64), 1, ReadoutMode.RAW12),
-        CaptureSettings(0.1, Roi(0, 0, 15, 64), 1, ReadoutMode.RAW12),
+        CaptureSettings(0.1, Roi(0, 0, 0, 64), 1, ReadoutMode.RAW12),
         CaptureSettings(0.1, Roi(0, 0, 4097, 64), 1, ReadoutMode.RAW12),
     ],
 )

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from touptek4040.alpaca.request import client_transaction_id, get_parameter
+from touptek4040.alpaca.request import client_id, client_transaction_id, get_parameter
 from touptek4040.alpaca.responses import INVALID_VALUE, AlpacaError
 
 
@@ -36,6 +36,39 @@ def test_client_transaction_id_is_case_insensitive_for_get_and_put(
 @pytest.mark.parametrize("method", ["GET", "PUT"])
 def test_missing_client_transaction_id_defaults_to_zero(method: str) -> None:
     assert client_transaction_id(FakeRequest(method)) == 0
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_missing_client_id_is_allowed_and_defaults_to_zero(method: str) -> None:
+    assert client_id(FakeRequest(method)) == 0
+
+
+@pytest.mark.parametrize(
+    ("valid", "expected"),
+    [
+        (0, 0),
+        (0xFFFFFFFF, 0xFFFFFFFF),
+        ("0", 0),
+        ("4294967295", 0xFFFFFFFF),
+    ],
+)
+def test_client_id_accepts_unsigned_32_bit_values(
+    valid: int | str,
+    expected: int,
+) -> None:
+    assert client_id(FakeRequest("GET", {"ClientID": valid})) == expected
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["", " ", -1, "-1", "not-an-integer", 0x100000000, "4294967296", True],
+)
+def test_supplied_invalid_client_id_is_rejected(invalid: Any) -> None:
+    with pytest.raises(AlpacaError) as exc_info:
+        client_id(FakeRequest("GET", {"ClientID": invalid}))
+
+    assert exc_info.value.number == INVALID_VALUE
+    assert "ClientID" in exc_info.value.message
 
 
 @pytest.mark.parametrize(

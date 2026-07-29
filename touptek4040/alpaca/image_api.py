@@ -20,7 +20,7 @@ from ..errors import (
     safe_exception_text,
 )
 from ..image_workspace import ImageGeneration
-from .request import client_transaction_id
+from .request import client_id as parse_client_id, client_transaction_id
 from .responses import (
     INVALID_OPERATION,
     INVALID_VALUE,
@@ -35,6 +35,7 @@ from .responses import (
 IMAGEBYTES_MEDIA_TYPE = "application/imagebytes"
 _METADATA_V1 = struct.Struct("<iiIIiiiiiii")
 _METADATA_SIZE = 44
+_INT32_ELEMENT_TYPE = 2
 _BYTE_ELEMENT_TYPE = 6
 _UINT16_ELEMENT_TYPE = 8
 _DRIVER_ERROR = 0x500
@@ -122,7 +123,7 @@ def stream_imagebytes(
     yield _metadata(
         error_number=0,
         transactions=transactions,
-        image_element_type=element_type,
+        image_element_type=_INT32_ELEMENT_TYPE,
         transmission_element_type=element_type,
         rank=2,
         dimension1=generation.width,
@@ -179,6 +180,7 @@ class ImageApiResource:
         client_id = 0
         try:
             client_id = client_transaction_id(request)
+            parse_client_id(request)
             transactions = ImageTransactions(client_id, server_id)
             if self._command == "imagearrayvariant":
                 raise AlpacaError(

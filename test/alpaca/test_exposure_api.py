@@ -141,10 +141,13 @@ def test_duration_validation_and_settings_snapshot_share_one_linearization(
         writer.join(1.0)
 
 
-def test_stop_exposure_is_idle_noop_but_not_implemented_while_exposing(
+def test_stop_exposure_is_not_implemented_when_capability_is_false(
     client, coordinator, api_camera
 ):
-    assert _put(client, "stopexposure").json["ErrorNumber"] == 0
+    assert (
+        _put(client, "stopexposure").json["ErrorNumber"]
+        == METHOD_NOT_IMPLEMENTED
+    )
     api_camera.release_acquisition.clear()
     assert (
         _put(client, "startexposure", Duration="1", Light="true").json[
@@ -176,6 +179,28 @@ def test_percent_completed_is_only_available_during_an_exposure(
     assert 0 <= percent <= 100
     coordinator.abort_exposure()
     assert _get(client, "percentcompleted").json["ErrorNumber"] == INVALID_OPERATION
+
+
+def test_ascom_one_pixel_odd_origin_roi_reaches_camera_adapter(
+    client,
+    api_camera,
+):
+    for command, value in (
+        ("startx", 1),
+        ("starty", 1),
+        ("numx", 1),
+        ("numy", 1),
+    ):
+        assert _put(client, command, **{command: value}).json["ErrorNumber"] == 0
+
+    assert (
+        _put(client, "startexposure", Duration="0.01", Light="true").json[
+            "ErrorNumber"
+        ]
+        == 0
+    )
+    assert api_camera.acquisition_started.wait(1.0)
+    assert api_camera.requested_acquisitions[0][1] == Roi(1, 1, 1, 1)
 
 
 def test_abort_invalidates_a_late_frame_and_returns_to_idle(

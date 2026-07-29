@@ -40,7 +40,7 @@ def _complete_small_exposure(client, coordinator) -> None:
     _wait_until(lambda: coordinator.snapshot().image_ready)
 
 
-def test_raw12_imagebytes_has_official_v1_metadata_and_x_first_uint16_payload():
+def test_raw12_imagebytes_declares_ascom_int32_image_with_uint16_transmission():
     generation = ImageWorkspace().publish(reference_frame())
 
     payload = b"".join(
@@ -60,7 +60,7 @@ def test_raw12_imagebytes_has_official_v1_metadata_and_x_first_uint16_payload():
         17,
         23,
         44,
-        8,
+        2,
         8,
         2,
         3,
@@ -70,7 +70,7 @@ def test_raw12_imagebytes_has_official_v1_metadata_and_x_first_uint16_payload():
     assert payload[44:] == struct.pack("<6H", 1, 10, 2, 20, 3, 30)
 
 
-def test_raw8_imagebytes_uses_byte_element_types_and_one_byte_pixels():
+def test_raw8_imagebytes_declares_ascom_int32_image_with_byte_transmission():
     generation = ImageWorkspace().publish(
         reference_frame(readout_mode=ReadoutMode.RAW8)
     )
@@ -85,7 +85,7 @@ def test_raw8_imagebytes_uses_byte_element_types_and_one_byte_pixels():
         )
     )
 
-    assert _decode_metadata(payload)[5:7] == (6, 6)
+    assert _decode_metadata(payload)[5:7] == (2, 6)
     assert payload[44:] == bytes((1, 10, 2, 20, 3, 30))
 
 

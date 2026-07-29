@@ -1,0 +1,77 @@
+{
+  "ErrorCount": 0,
+  "IssueCount": 17,
+  "ConfigurationAlertCount": 0,
+  "Errors": [],
+  "Issues": [
+    {
+      "Key": "PercentCompleted Read",
+      "Value": "Unexpected error: PercentCompleted is unavailable outside an exposure"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Error when reading ImageArrayVariant: ToImageArray - ImageArrayElementType is 0, meaning ImageArrayElementTypes.Unknown"
+    },
+    {
+      "Key": "ImageArrayVariant",
+      "Value": "Unexpected error while processing ImageArrayVariant: Object reference not set to an instance of an object."
+    }
+  ],
+  "ConfigurationAlerts": []
+}

@@ -105,3 +105,35 @@ def client_transaction_id(request: Any) -> int:
             "ClientTransactionID must be an integer from 1 through 4294967295",
         )
     return transaction_id
+
+
+def client_id(request: Any) -> int:
+    """Validate the optional unsigned 32-bit Alpaca ClientID."""
+
+    value = _request_fields(request).get("clientid", _MISSING)
+    if value is _MISSING:
+        return 0
+
+    if isinstance(value, bool):
+        parsed = -1
+    elif isinstance(value, int):
+        parsed = value
+    elif (
+        isinstance(value, str)
+        and len(value) <= 10
+        and value.isascii()
+        and value.isdecimal()
+    ):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            parsed = -1
+    else:
+        parsed = -1
+
+    if not 0 <= parsed <= _UINT32_MAX:
+        raise RequestParseError(
+            INVALID_VALUE,
+            "ClientID must be an unsigned 32-bit integer",
+        )
+    return parsed

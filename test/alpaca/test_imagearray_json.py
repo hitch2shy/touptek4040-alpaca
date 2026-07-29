@@ -145,6 +145,26 @@ def test_imagearrayvariant_is_a_transactional_not_implemented_error(client):
     assert response.json["ErrorNumber"] == 0x400
 
 
+@pytest.mark.parametrize("command", ["imagearray", "imagearrayvariant"])
+@pytest.mark.parametrize("invalid_client_id", ["", " ", "-1", "not-an-integer"])
+def test_image_routes_reject_invalid_supplied_client_id(
+    client,
+    command,
+    invalid_client_id,
+):
+    response = client.simulate_get(
+        f"/api/v1/camera/0/{command}",
+        params={
+            "ClientID": invalid_client_id,
+            "ClientTransactionID": "67890",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json["ClientTransactionID"] == 67890
+    assert response.json["ErrorNumber"] == 0x401
+
+
 def _image_error_number(response, imagebytes: bool) -> int:
     if imagebytes:
         return struct.unpack_from("<i", response.content, 4)[0]

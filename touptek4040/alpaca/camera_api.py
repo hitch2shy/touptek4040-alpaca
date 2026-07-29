@@ -235,7 +235,8 @@ class CameraApi:
             return
         if command == "startx":
             def commit_start_x(capabilities):
-                _require_int_range(value, "StartX", 0, capabilities.width - 1)
+                del capabilities
+                _require_int_range(value, "StartX", 0, 0x7FFFFFFF)
                 with self._lock:
                     self._settings.start_x = value
 
@@ -243,7 +244,8 @@ class CameraApi:
             return
         if command == "starty":
             def commit_start_y(capabilities):
-                _require_int_range(value, "StartY", 0, capabilities.height - 1)
+                del capabilities
+                _require_int_range(value, "StartY", 0, 0x7FFFFFFF)
                 with self._lock:
                     self._settings.start_y = value
 
@@ -251,7 +253,8 @@ class CameraApi:
             return
         if command == "numx":
             def commit_num_x(capabilities):
-                _require_int_range(value, "NumX", 1, capabilities.width)
+                del capabilities
+                _require_int_range(value, "NumX", 1, 0x7FFFFFFF)
                 with self._lock:
                     self._settings.num_x = value
 
@@ -259,7 +262,8 @@ class CameraApi:
             return
         if command == "numy":
             def commit_num_y(capabilities):
-                _require_int_range(value, "NumY", 1, capabilities.height)
+                del capabilities
+                _require_int_range(value, "NumY", 1, 0x7FFFFFFF)
                 with self._lock:
                     self._settings.num_y = value
 
@@ -415,28 +419,6 @@ class CameraApi:
                 "NumY",
                 "vertical ROI extends outside the sensor",
             ),
-            (
-                settings.start_x * settings.binning % 2 == 0,
-                "StartX",
-                "SDK coordinate must be even",
-            ),
-            (
-                settings.start_y * settings.binning % 2 == 0,
-                "StartY",
-                "SDK coordinate must be even",
-            ),
-            (
-                settings.num_x * settings.binning >= 16
-                and settings.num_x * settings.binning % 2 == 0,
-                "NumX",
-                "SDK width must be even and at least 16",
-            ),
-            (
-                settings.num_y * settings.binning >= 16
-                and settings.num_y * settings.binning % 2 == 0,
-                "NumY",
-                "SDK height must be even and at least 16",
-            ),
         )
         for valid, field, reason in checks:
             if not valid:
@@ -455,17 +437,9 @@ class CameraApi:
 
     def _stop_exposure(self) -> None:
         self._require_connected()
-        state = self._coordinator.snapshot().camera_state
-        if state is CameraState.IDLE:
-            return
-        if state is CameraState.EXPOSING:
-            raise AlpacaError(
-                METHOD_NOT_IMPLEMENTED,
-                "StopExposure is not supported while exposing; use AbortExposure",
-            )
         raise AlpacaError(
-            INVALID_OPERATION,
-            f"StopExposure is invalid while camera state is {state.name}",
+            METHOD_NOT_IMPLEMENTED,
+            "StopExposure is not supported; use AbortExposure",
         )
 
     def _require_connected(self) -> None:

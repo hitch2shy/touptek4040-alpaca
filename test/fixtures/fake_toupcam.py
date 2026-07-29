@@ -96,6 +96,7 @@ class FakeToupCam:
         }
         self.roi = (0, 0, 0, 0)
         self.exposure_us = 10_000
+        self.auto_exposure = True
         self.gain = 100
         self.temperature_deci_c = -75
         self.trigger_started = Event()
@@ -191,6 +192,13 @@ class FakeToupCam:
 
     def get_ExpoTime(self) -> int:
         return self.exposure_us
+
+    def put_AutoExpoEnable(self, enabled: bool) -> None:
+        self.sdk.calls.append(("put_AutoExpoEnable", enabled))
+        self.auto_exposure = bool(enabled)
+
+    def get_AutoExpoEnable(self) -> bool:
+        return self.auto_exposure
 
     def put_ExpoAGain(self, gain: int) -> None:
         self.sdk.calls.append(("put_ExpoAGain", gain))
@@ -294,6 +302,7 @@ class FakeToupcamApi:
 
     def Open(self, device_id: str) -> FakeToupCam:
         assert device_id in {"usb:1-2", "sn:TP241025143218C92B01151AEC40CB7"}
+        self.sdk.calls.append(("Open", device_id))
         self.handle.closed = False
         return self.handle
 

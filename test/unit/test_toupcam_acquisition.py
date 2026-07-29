@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from threading import Barrier, Event
+from threading import Event
 from datetime import timezone
 
 import numpy as np
@@ -29,7 +29,11 @@ from touptek4040.errors import (
     CameraOperationCancelledError,
     CameraTimeoutError,
 )
-from touptek4040.toupcam_camera import ToupTekCamera
+from touptek4040.toupcam_camera import (
+    CaptureSettings,
+    ToupTekCamera,
+    _software_bin_saturating,
+)
 
 
 @pytest.fixture
@@ -67,6 +71,126 @@ def test_triggered_frame_has_final_shape_dtype_and_metadata(
     assert frame.readout_mode is mode
 
 
+@pytest.mark.parametrize(
+    ("roi", "binning", "expected_sdk_roi", "expected_pixel"),
+    [
+        (Roi(1, 1, 1, 1), 1, (0, 0, 16, 16), 17),
+        (Roi(1, 1, 1, 1), 3, (0, 0, 18, 18), 7),
+        (Roi(4095, 4095, 1, 1), 1, (4080, 4080, 16, 16), 255),
+    ],
+)
+def test_sdk_padding_and_software_crop_support_ascom_one_pixel_roi(
+    camera: ToupTekCamera,
+    roi: Roi,
+    binning: int,
+    expected_sdk_roi: tuple[int, int, int, int],
+    expected_pixel: int,
+) -> None:
+    frame = camera.acquire(0.01, roi, binning, ReadoutMode.RAW12)
+
+    assert frame.pixels.shape == (1, 1)
+    assert int(frame.pixels[0, 0]) == expected_pixel
+    assert ("put_Roi", *expected_sdk_roi) in camera._sdk.calls
+
+
+@pytest.mark.parametrize(
+    ("mode", "dtype", "maximum"),
+    [
+        (ReadoutMode.RAW12, np.dtype(np.uint16), 4095),
+        (ReadoutMode.RAW8, np.dtype(np.uint8), 255),
+    ],
+)
+def test_unrepresentable_native_bin_uses_crop_before_saturating_software_bin(
+    mode: ReadoutMode,
+    dtype: np.dtype,
+    maximum: int,
+) -> None:
+    sdk = FakeSdk()
+    sdk.Toupcam.handle.get_Resolution = lambda _index: (22, 22)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    sdk.calls.clear()
+
+    frame = camera.acquire(0.01, Roi(0, 0, 7, 7), 3, mode)
+
+    assert frame.pixels.shape == (7, 7)
+    assert frame.pixels.dtype == dtype
+    assert int(frame.pixels.max()) <= maximum
+    assert int(frame.pixels[0, 0]) == min(
+        sum((y * 22 + x) % (maximum + 1) for y in range(3) for x in range(3)),
+        maximum,
+    )
+    assert ("put_Option", sdk.TOUPCAM_OPTION_BINNING, 1) in sdk.calls
+    assert ("put_Roi", 0, 0, 22, 22) in sdk.calls
+
+
+def test_full_4096_bin3_fallback_has_exact_ascom_geometry_and_bounded_buffer(
+    camera: ToupTekCamera,
+) -> None:
+    applied = camera.apply_settings(
+        CaptureSettings(
+            0.01,
+            Roi(0, 0, 4096 // 3, 4096 // 3),
+            3,
+            ReadoutMode.RAW12,
+        )
+    )
+
+    assert (applied.width, applied.height) == (1365, 1365)
+    assert (applied.prebin_width, applied.prebin_height) == (4095, 4095)
+    assert (applied.capture_width, applied.capture_height) == (4096, 4096)
+    assert applied.hardware_binning == 1
+    assert applied.software_binning == 3
+    assert applied.capture_width * applied.capture_height * applied.dtype.itemsize == (
+        32 * 1024 * 1024
+    )
+
+
+def test_odd_origin_fallback_crops_physical_pixels_before_binning() -> None:
+    sdk = FakeSdk()
+    sdk.Toupcam.handle.get_Resolution = lambda _index: (28, 28)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    sdk.calls.clear()
+
+    frame = camera.acquire(
+        0.01,
+        Roi(1, 0, 8, 7),
+        3,
+        ReadoutMode.RAW12,
+    )
+
+    assert frame.pixels.shape == (7, 8)
+    assert ("put_Option", sdk.TOUPCAM_OPTION_BINNING, 1) in sdk.calls
+    assert ("put_Roi", 2, 0, 26, 22) in sdk.calls
+    assert int(frame.pixels[0, 0]) == sum(
+        y * 26 + x for y in range(3) for x in range(1, 4)
+    )
+
+
+def test_software_bin_saturates_and_allocates_only_output_sized_accumulator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pixels = np.full((6, 6), 250, dtype=np.uint8)
+    original_zeros = np.zeros
+    allocations: list[tuple[tuple[int, int], np.dtype]] = []
+
+    def tracked_zeros(
+        shape: tuple[int, int],
+        *,
+        dtype: np.dtype,
+    ) -> np.ndarray:
+        allocations.append((shape, np.dtype(dtype)))
+        return original_zeros(shape, dtype=dtype)
+
+    monkeypatch.setattr(np, "zeros", tracked_zeros)
+
+    result = _software_bin_saturating(pixels, 3, 255)
+
+    assert np.array_equal(result, np.full((2, 2), 255, dtype=np.uint8))
+    assert allocations == [((2, 2), np.dtype(np.uint64))]
+
+
 def test_trigger_timeout_includes_sdk_exposure_margin(camera: ToupTekCamera) -> None:
     """A truncated timeout can expire before the SDK's documented margin."""
     camera.acquire(0.25, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
@@ -77,13 +201,58 @@ def test_trigger_timeout_includes_sdk_exposure_margin(camera: ToupTekCamera) -> 
     assert trigger_call == ("TriggerSyncV4", 4255, 0, -1)
 
 
-def test_camera_runs_only_around_the_synchronous_trigger(camera: ToupTekCamera) -> None:
-    """Missing Stop would make the next settings change violate SDK state rules."""
+def test_identical_exposures_reuse_one_started_pull_stream(camera: ToupTekCamera) -> None:
+    """The SDK reference keeps one stream running across synchronous triggers."""
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
     camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
 
     names = [call[0] for call in camera._sdk.calls]
     assert names.index("StartPullModeWithCallback") < names.index("TriggerSyncV4")
-    assert names.index("TriggerSyncV4") < names.index("Stop")
+    assert names.count("StartPullModeWithCallback") == 1
+    assert names.count("TriggerSyncV4") == 2
+    assert names.count("Stop") == 0
+
+    camera.disconnect()
+
+    assert camera._sdk.calls[-2:] == [("Stop",), ("Close",)]
+
+
+def test_reused_pull_stream_waits_for_empirical_trigger_recovery_window() -> None:
+    sdk = FakeSdk()
+    clock_values = iter((10.0, 10.005, 10.020))
+    sleeps: list[float] = []
+    camera = ToupTekCamera(
+        "TP241025143218C92B01151AEC40CB7",
+        sdk=sdk,
+        monotonic=lambda: next(clock_values),
+        sleeper=sleeps.append,
+        trigger_recovery_s=0.015,
+    )
+    camera.connect()
+    sdk.calls.clear()
+
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+
+    assert sleeps == [pytest.approx(0.010)]
+
+
+def test_structural_change_stops_reconfigures_and_restarts(camera: ToupTekCamera) -> None:
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    names = [call[0] for call in camera._sdk.calls]
+    assert names.count("StartPullModeWithCallback") == 2
+    assert names.count("TriggerSyncV4") == 2
+    assert names.count("Stop") == 1
+    assert names.count("Close") == 1
+    assert names.count("Open") == 1
+    stop_index = names.index("Stop")
+    assert stop_index < max(
+        index
+        for index, call in enumerate(camera._sdk.calls)
+        if call == ("put_Option", camera._sdk.TOUPCAM_OPTION_BITDEPTH, 0)
+    )
 
 
 def test_camera_is_stopped_when_trigger_fails(camera: ToupTekCamera) -> None:
@@ -166,48 +335,38 @@ def test_abort_is_an_idle_noop(camera: ToupTekCamera) -> None:
     assert ("Trigger", 0) not in camera._sdk.calls
 
 
-def test_abort_does_not_enter_sdk_during_normal_stop(camera: ToupTekCamera) -> None:
-    """Normal completion and Abort must never call Stop concurrently."""
+def test_abort_does_not_enter_sdk_during_reconfiguration_stop(
+    camera: ToupTekCamera,
+) -> None:
+    """Abort during non-triggering reconfiguration is an idle no-op."""
     handle = camera._handle
+    camera.acquire(0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
     handle.block_stop = True
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(
-            camera.acquire, 0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+            camera.acquire, 0.01, Roi(2, 2, 32, 32), 1, ReadoutMode.RAW8
         )
         assert handle.stop_entered.wait(1)
         camera.abort()
         handle.stop_release.set()
-        with pytest.raises(CameraOperationCancelledError):
-            pending.result(1)
+        pending.result(1)
 
     assert sum(call == ("Stop",) for call in camera._sdk.calls) == 1
     assert ("Trigger", 0) not in camera._sdk.calls
 
 
-def test_stop_claim_is_atomic_when_abort_and_cleanup_arrive_together(
-    camera: ToupTekCamera, monkeypatch: pytest.MonkeyPatch
+def test_abort_is_the_only_stop_claimant_during_a_trigger(
+    camera: ToupTekCamera,
 ) -> None:
-    """Both contenders at the claim boundary still produce one native Stop."""
     handle = camera._handle
     handle.block_trigger = True
-    handle.deliver_after_abort = True
-    barrier = Barrier(2)
-    original_claim = camera._claim_stop
-
-    def simultaneous_claim():
-        barrier.wait(timeout=1)
-        return original_claim()
-
-    monkeypatch.setattr(camera, "_claim_stop", simultaneous_claim)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         exposure = pool.submit(
             camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
         )
         assert handle.trigger_started.wait(1)
-        handle.trigger_release.set()
-        cancellation = pool.submit(camera.abort)
-        cancellation.result(1)
+        camera.abort()
         with pytest.raises(CameraOperationCancelledError):
             exposure.result(1)
 
@@ -323,10 +482,11 @@ def test_abort_after_final_commit_cannot_cancel_the_returned_frame(
 
 def test_stop_failure_marks_handle_unusable(camera: ToupTekCamera) -> None:
     """A failed Stop cannot transition the handle back to reusable idle."""
+    camera.acquire(0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
     camera._handle.stop_error = FakeHResultError(E_FAIL)
 
     with pytest.raises(CameraError):
-        camera.acquire(0.01, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
+        camera.acquire(0.01, Roi(2, 2, 32, 32), 1, ReadoutMode.RAW8)
     call_count = len(camera._sdk.calls)
     with pytest.raises(CameraNotConnectedError, match="reconnect"):
         _ = camera.temperature_c

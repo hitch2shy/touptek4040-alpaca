@@ -30,7 +30,7 @@ from .management import (
     management_values,
 )
 from .manifest import CAMERA_V4_ENDPOINTS, EndpointSpec
-from .request import client_transaction_id
+from .request import client_id, client_transaction_id
 from .responses import (
     INVALID_OPERATION,
     INVALID_VALUE,
@@ -240,7 +240,9 @@ def _error_response(
 def _request_client_id(request: falcon.Request) -> int:
     if request.method == "PUT" and request.content_length in (None, 0):
         query_only = SimpleNamespace(method="GET", params=request.params)
+        client_id(query_only)
         return client_transaction_id(query_only)
+    client_id(request)
     return client_transaction_id(request)
 
 

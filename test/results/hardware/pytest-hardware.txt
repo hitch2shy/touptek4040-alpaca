@@ -1,0 +1,49 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0 -- G:\ToupTek_4040\.worktrees\touptek4040-alpaca\.venv64\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: G:\ToupTek_4040\.worktrees\touptek4040-alpaca\test
+configfile: pytest.ini
+collecting ... collected 40 items
+
+test\hardware\test_hardware_abort.py::test_abort_discards_the_pending_real_frame PASSED [  2%]
+test\hardware\test_hardware_acquisition.py::test_short_software_trigger_matrix[0-1-dtype0-4095] PASSED [  5%]
+test\hardware\test_hardware_acquisition.py::test_short_software_trigger_matrix[1-2-dtype1-255] PASSED [  7%]
+test\hardware\test_hardware_acquisition.py::test_real_trigger_can_be_aborted_without_publishing_a_frame PASSED [ 10%]
+test\hardware\test_hardware_cooling.py::test_temperature_and_cooler_are_readable_without_state_toggle PASSED [ 12%]
+test\hardware\test_hardware_identity.py::test_connected_camera_has_approved_identity PASSED [ 15%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[1] PASSED [ 17%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[2] PASSED [ 20%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[3] PASSED [ 22%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[4] PASSED [ 25%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[5] PASSED [ 27%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[6] PASSED [ 30%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[7] PASSED [ 32%]
+test\hardware\test_hardware_matrix.py::test_full_frame_roi_is_largest_even_sdk_valid_square[8] PASSED [ 35%]
+test\hardware\test_hardware_matrix.py::test_hardware_guard_rejects_an_extra_or_wrong_camera PASSED [ 37%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[1-0] PASSED [ 40%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[1-1] PASSED [ 42%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[2-0] PASSED [ 45%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[2-1] PASSED [ 47%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[3-0] PASSED [ 50%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[3-1] PASSED [ 52%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[4-0] PASSED [ 55%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[4-1] PASSED [ 57%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[5-0] PASSED [ 60%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[5-1] PASSED [ 62%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[6-0] PASSED [ 65%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[6-1] PASSED [ 67%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[7-0] PASSED [ 70%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[7-1] PASSED [ 72%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[8-0] PASSED [ 75%]
+test\hardware\test_hardware_matrix.py::test_real_camera_mode_and_binning[8-1] PASSED [ 77%]
+test\hardware\test_hardware_matrix.py::test_real_even_offset_roi_and_repeated_short_acquisitions PASSED [ 80%]
+test\hardware\test_hardware_matrix.py::test_real_ascom_one_pixel_roi_uses_sdk_padding_and_software_crop[roi0-1] PASSED [ 82%]
+test\hardware\test_hardware_matrix.py::test_real_ascom_one_pixel_roi_uses_sdk_padding_and_software_crop[roi1-3] PASSED [ 85%]
+test\hardware\test_hardware_matrix.py::test_real_ascom_one_pixel_roi_uses_sdk_padding_and_software_crop[roi2-1] PASSED [ 87%]
+test\hardware\test_hardware_matrix.py::test_real_ascom_full_frame_bin3_uses_exact_1365_geometry[0] PASSED [ 90%]
+test\hardware\test_hardware_matrix.py::test_real_ascom_full_frame_bin3_uses_exact_1365_geometry[1] PASSED [ 92%]
+test\hardware\test_hardware_matrix.py::test_real_camera_disconnect_and_serial_reconnect PASSED [ 95%]
+test\hardware\test_hardware_matrix.py::test_real_coordinator_preview_publishes_and_stops PASSED [ 97%]
+test\hardware\test_hardware_orientation.py::test_real_asymmetric_frame_preserves_yx_storage_and_ascom_x_first_order PASSED [100%]
+
+============================= 40 passed in 30.48s =============================
