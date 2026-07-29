@@ -18,6 +18,13 @@
 - The current `CameraContract`, `CameraCoordinator`, Alpaca Camera V4 routes, Web endpoints and GUI behavior remain externally compatible.
 - A timed-out or crashed exposure is never automatically retried and never publishes an image.
 - A replacement owner remains disconnected until an explicit Connect.
+- Dew-heater control is Web-only: do not add Alpaca Camera endpoints or
+  advertise an Alpaca `Action`.
+- Dew-heater levels use the device-reported integer range
+  `0..TOUPCAM_OPTION_HEAT_MAX`; `0` means off. Do not assume a fixed maximum.
+- Heater writes are rejected during exposure, while the confirmed heater level
+  remains readable. Normal Disconnect and shutdown restore the level captured
+  at Connect.
 - All owner timeout values are finite and configurable; defaults are startup 10 s, Connect 20 s, ordinary command 5 s, exposure `duration * 1.02 + 10 s`, Abort 2 s and Disconnect 10 s.
 - `touptek4040.json` is the primary distributed configuration; explicitly selected legacy INI remains readable.
 - All tests, fixtures, scripts and generated evidence belong under `test/`.
@@ -255,16 +262,23 @@ git commit -m "feat: define camera owner IPC and shared frames"
 **Files:**
 - Create: `touptek4040/camera_owner.py`
 - Create: `touptek4040/owner_backend.py`
+- Modify: `touptek4040/camera_contract.py`
+- Modify: `touptek4040/sim_camera.py`
 - Modify: `touptek4040/toupcam_camera.py`
 - Modify: `test/fixtures/fake_toupcam.py`
 - Create: `test/fixtures/fake_owner_backend.py`
 - Create: `test/unit/test_camera_owner.py`
 - Modify: `test/unit/test_toupcam_acquisition.py`
+- Modify: `test/unit/test_toupcam_settings.py`
+- Modify: `test/unit/test_sim_camera.py`
 
 **Interfaces:**
 - Produces: `OwnerStartupSpec`
 - Produces: `camera_owner_main(command_connection, control_connection, startup_spec, generation, registry_path) -> None`
 - Produces: `OwnerBackend` protocol
+- Produces: `CameraContract.heater_supported: bool`,
+  `CameraContract.heater_max_level: int` and the read/write
+  `CameraContract.heater_level: int` property.
 - Consumes: `ToupTekCamera` only inside the owner process.
 
 - [ ] **Step 1: Write real-spawn owner RED tests**
@@ -280,19 +294,48 @@ def test_owner_runs_backend_in_a_different_spawned_process(owner_harness):
 ```
 
 Add tests proving the main process does not import the SDK loader when the
-owner harness is constructed.
+owner harness is constructed. Add heater tests proving the backend PID differs
+from the parent PID.
 
-- [ ] **Step 2: Run owner RED tests**
+- [ ] **Step 2: Write heater backend RED tests**
+
+Require exact SDK alignment:
+
+```python
+assert camera.heater_supported is bool(
+    camera.model_flag & sdk.TOUPCAM_FLAG_HEAT
+)
+assert camera.heater_max_level == handle.get_Option(
+    sdk.TOUPCAM_OPTION_HEAT_MAX
+)
+camera.heater_level = 0
+assert handle.get_Option(sdk.TOUPCAM_OPTION_HEAT) == 0
+```
+
+Also cover levels `1..heater_max_level`, bool, float, string, negative and
+overflow rejection without an SDK write; unsupported devices; simulator
+behavior; and proof that heater writes do not change TEC, TEC target or fan.
+
+- [ ] **Step 3: Run owner and heater RED tests**
 
 Run:
 
 ```powershell
-.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/unit/test_camera_owner.py -v
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/unit/test_camera_owner.py test/unit/test_toupcam_settings.py test/unit/test_sim_camera.py -v
 ```
 
-Expected: collection failure because the owner entry point does not exist.
+Expected: failures because the owner entry point and internal heater contract
+do not exist.
 
-- [ ] **Step 3: Implement sequential owner dispatch**
+- [ ] **Step 4: Implement the internal heater contract**
+
+Add exact integer-valued internal properties to `CameraContract`,
+`ToupTekCamera` and `SimCamera`. `ToupTekCamera` checks
+`TOUPCAM_FLAG_HEAT`, reads `TOUPCAM_OPTION_HEAT_MAX`, validates the current
+level in `0..max`, and uses `TOUPCAM_OPTION_HEAT` for reads and writes.
+The simulator uses a configurable finite maximum and never starts an owner.
+
+- [ ] **Step 5: Implement sequential owner dispatch**
 
 The owner validates every request, dispatches an explicit operation allow-list
 and returns only schema-validated results. Supported operations are:
@@ -301,45 +344,55 @@ and returns only schema-validated results. Supported operations are:
 handshake, connect, disconnect, capabilities, acquire, abort,
 get_gain, set_gain, get_temperature, get_target_temperature,
 set_target_temperature, get_cooler_on, set_cooler_on,
-get_tec_voltage, get_cooler_power, diagnostics, release_frame, shutdown
+get_tec_voltage, get_cooler_power,
+get_heater_capabilities, get_heater_level, set_heater_level,
+diagnostics, release_frame, shutdown
 ```
 
 No `getattr`-based arbitrary method dispatch is permitted.
 
-- [ ] **Step 4: Add independent Abort control handling**
+- [ ] **Step 6: Add independent Abort control handling**
 
 Run a small control thread in the owner that reads only `abort` and `shutdown`
 control messages. It may call the backend Abort concurrently with an
 acquisition, matching the existing native ownership model. Any other control
 operation is rejected.
 
-- [ ] **Step 5: Publish frames through shared memory**
+- [ ] **Step 7: Publish frames through shared memory**
 
 On successful acquire, write pixels to `SharedFrameRegistry`, return a
 `FrameDescriptor` plus the non-pixel `Frame` metadata and retain ownership
 until the proxy acknowledges release. On any pre-response exception, unlink
 the segment in the owner `finally`.
 
-- [ ] **Step 6: Make owner cleanup unconditional**
+- [ ] **Step 8: Snapshot and restore the heater**
+
+After successful Connect, snapshot the exact current heater level together
+with the existing mutable hardware state. Normal Disconnect, shutdown and the
+outer cleanup `finally` restore it before closing the handle. Restoration
+errors are reported honestly. A forced owner termination makes no restoration
+claim.
+
+- [ ] **Step 9: Make owner cleanup unconditional**
 
 The outermost `finally` aborts/stops the backend, calls disconnect, cleans
 owner-created segments and closes both connections. It records cleanup errors
 in a bounded final diagnostic message when the command pipe remains usable.
 
-- [ ] **Step 7: Keep the in-process backend tests green**
+- [ ] **Step 10: Keep the in-process backend tests green**
 
 Run:
 
 ```powershell
-.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/unit/test_camera_owner.py test/unit/test_toupcam_acquisition.py test/unit/test_toupcam_settings.py -v
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/unit/test_camera_owner.py test/unit/test_toupcam_acquisition.py test/unit/test_toupcam_settings.py test/unit/test_sim_camera.py -v
 ```
 
 Expected: all pass.
 
-- [ ] **Step 8: Commit the owner process**
+- [ ] **Step 11: Commit the owner process**
 
 ```powershell
-git add touptek4040/camera_owner.py touptek4040/owner_backend.py touptek4040/toupcam_camera.py test/fixtures/fake_toupcam.py test/fixtures/fake_owner_backend.py test/unit/test_camera_owner.py test/unit/test_toupcam_acquisition.py
+git add touptek4040/camera_owner.py touptek4040/owner_backend.py touptek4040/camera_contract.py touptek4040/sim_camera.py touptek4040/toupcam_camera.py test/fixtures/fake_toupcam.py test/fixtures/fake_owner_backend.py test/unit/test_camera_owner.py test/unit/test_toupcam_acquisition.py test/unit/test_toupcam_settings.py test/unit/test_sim_camera.py
 git commit -m "feat: run ToupTek SDK in a camera owner process"
 ```
 
@@ -358,6 +411,7 @@ git commit -m "feat: run ToupTek SDK in a camera owner process"
 - Produces: `CameraOwnerProxy(CameraContract)`
 - Produces: `OwnerProcessFactory`
 - Produces: `OwnerSupervisor`
+- Produces: proxied heater capability, maximum, read and write operations.
 - Consumes: `OwnerConfig`, `OwnerStartupSpec`, owner protocol and shared-frame registry.
 
 - [ ] **Step 1: Write timeout and no-retry RED tests**
@@ -375,7 +429,9 @@ def test_timed_out_exposure_is_not_retried(proxy, backend_counter):
 ```
 
 Require a new owner generation after termination and an explicit Connect
-before another acquire.
+before another acquire. Add a heater-write timeout case: the fake backend
+invocation count is one, the write is never retried, the replacement owner is
+disconnected and no cached level is reported as confirmed.
 
 - [ ] **Step 2: Write protocol-corruption and shared-memory RED tests**
 
@@ -438,7 +494,13 @@ Validate the descriptor, copy the shared array, release/unlink it and create a
 frozen `Frame`. A failure after opening shared memory still closes the mapping
 and attempts exact-name cleanup.
 
-- [ ] **Step 8: Run proxy and coordinator tests**
+- [ ] **Step 8: Implement heater proxy operations**
+
+Use the ordinary command timeout for heater reads and writes. Reject writes
+while `exposing` before sending IPC. Preserve one confirmed level only after a
+successful owner response; invalidate it when the owner generation fails.
+
+- [ ] **Step 9: Run proxy and coordinator tests**
 
 Run:
 
@@ -446,9 +508,10 @@ Run:
 .\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/unit/test_camera_proxy.py test/unit/test_owner_failures.py test/unit/test_camera_coordinator.py test/unit/test_camera_concurrency.py -v
 ```
 
-Expected: all pass.
+Expected: all pass, including no heater retry and explicit reconnect after a
+heater IPC timeout.
 
-- [ ] **Step 9: Commit proxy supervision**
+- [ ] **Step 10: Commit proxy supervision**
 
 ```powershell
 git add touptek4040/camera_proxy.py touptek4040/errors.py touptek4040/camera_contract.py test/unit/test_camera_proxy.py test/unit/test_owner_failures.py
@@ -477,7 +540,9 @@ git commit -m "feat: supervise camera owner timeouts and recovery"
 
 Require that real-mode coordinator construction starts an owner without
 loading the SDK in the parent, simulator construction starts no child, and a
-shutdown timeout leaves no child or shared memory.
+shutdown timeout leaves no child or shared memory. Also require that heater
+reads and writes in real mode execute in the owner PID, while simulator heater
+operations remain in-process.
 
 - [ ] **Step 2: Verify RED**
 
@@ -543,6 +608,11 @@ git commit -m "feat: integrate isolated owner into runtime apps"
 - Preserve and modify: `touptek4040/alpaca/app.py`
 - Preserve and modify: `touptek4040/camera_coordinator.py`
 - Preserve and modify: `touptek4040/toupcam_camera.py`
+- Modify: `touptek4040/web_console.py`
+- Modify: `touptek4040/web/index.html`
+- Modify: `touptek4040/web/app.js`
+- Modify: `touptek4040/web/settings-sync.js`
+- Modify: `touptek4040/web/app.css`
 - Preserve and modify: `test/alpaca/test_request_parsing.py`
 - Preserve and modify: `test/alpaca/test_protocol_errors.py`
 - Preserve and modify: `test/alpaca/test_exposure_api.py`
@@ -551,6 +621,9 @@ git commit -m "feat: integrate isolated owner into runtime apps"
 - Preserve and modify: `test/alpaca/test_imagebytes.py`
 - Preserve and modify: `test/unit/test_camera_coordinator.py`
 - Preserve and modify: `test/unit/test_toupcam_acquisition.py`
+- Modify: `test/web/conftest.py`
+- Modify: `test/web/test_web_api.py`
+- Create: `test/web/test_heater_control.py`
 
 **Interfaces:**
 - GET query parameter names remain case-insensitive.
@@ -560,6 +633,11 @@ git commit -m "feat: integrate isolated owner into runtime apps"
 - Idle `StopExposure` succeeds; unsupported in-progress Stop returns
   MethodNotImplemented.
 - Dark/bias duration zero is clamped to the hardware minimum.
+- Web status exposes `heaterSupported`, `heaterLevel`, `heaterMaxLevel` and
+  `heaterWritable`; Web updates accept only exact integer `heaterLevel`.
+- Produces:
+  `CameraCoordinator.set_heater_level_if_idle(level: int) -> None`.
+- Alpaca Camera V4 manifest, `SupportedActions` and `Action` remain unchanged.
 
 - [ ] **Step 1: Audit the existing dirty patch without discarding it**
 
@@ -587,7 +665,59 @@ Add integration cases proving dark duration zero becomes 12 µs in the owner,
 `LastExposureDuration` reports 12 µs, light duration zero is invalid, idle Stop
 succeeds and in-progress unsupported Stop returns the ASCOM error.
 
-- [ ] **Step 5: Run the Alpaca manifest and full non-hardware suite**
+- [ ] **Step 5: Write Web heater RED tests**
+
+Require:
+
+```python
+assert state["heaterSupported"] is True
+assert state["heaterLevel"] == 0
+assert state["heaterMaxLevel"] == 5
+assert state["heaterWritable"] is True
+```
+
+Cover off and every valid integer level, bool/float/string/negative/overflow
+rejection, unsupported and disconnected state, read failure, write failure,
+main-controller-connected operation, exposure read visibility, exposure write
+rejection before SDK/IPC, and two concurrent Web writes serialized by the
+coordinator.
+
+- [ ] **Step 6: Verify Web heater tests fail**
+
+Run:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/web/test_heater_control.py test/alpaca/test_camera_manifest.py test/alpaca/test_common_api.py -v
+```
+
+Expected: heater Web tests fail because the state and update fields do not
+exist; Alpaca manifest and common action behavior remain green.
+
+- [ ] **Step 7: Implement Web-only heater control**
+
+Add the four state fields and accept a body containing only:
+
+```json
+{"heaterLevel": 0}
+```
+
+The coordinator validates connection, support, exact integer range and idle
+exposure state under its existing synchronization barrier. The Web GUI renders
+Off plus `1..heaterMaxLevel`, disables writes during exposure, displays the
+last device-confirmed level, and rolls back its selection on error.
+
+- [ ] **Step 8: Prove Alpaca Camera V4 remains unchanged**
+
+Run:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/web test/alpaca/test_camera_manifest.py test/alpaca/test_common_api.py -v
+```
+
+Expected: all pass; `supportedactions` retains its prior value and no heater
+endpoint appears in the Camera V4 manifest.
+
+- [ ] **Step 9: Run the Alpaca manifest and full non-hardware suite**
 
 ```powershell
 .\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/alpaca test/unit test/web test/smoke test/integration -v
@@ -595,13 +725,13 @@ succeeds and in-progress unsupported Stop returns the ASCOM error.
 
 Expected: all pass with hardware tests gated.
 
-- [ ] **Step 6: Commit the preserved review fixes**
+- [ ] **Step 10: Commit the preserved review fixes and Web heater**
 
 Stage only the reviewed product and test files belonging to the accepted
 Task 13 feedback:
 
 ```powershell
-git add touptek4040/alpaca/request.py touptek4040/alpaca/camera_api.py touptek4040/alpaca/app.py touptek4040/camera_coordinator.py touptek4040/toupcam_camera.py test/alpaca test/unit/test_camera_coordinator.py test/unit/test_toupcam_acquisition.py
+git add touptek4040/alpaca/request.py touptek4040/alpaca/camera_api.py touptek4040/alpaca/app.py touptek4040/camera_coordinator.py touptek4040/toupcam_camera.py touptek4040/web_console.py touptek4040/web test/alpaca test/web test/unit/test_camera_coordinator.py test/unit/test_toupcam_acquisition.py
 git commit -m "fix: align owner-backed camera with ASCOM V4"
 ```
 
@@ -631,7 +761,7 @@ Parameterize:
 
 ```text
 startup, connect/Open, get setting, set setting, Trigger,
-frame publication, Abort, Disconnect/Close
+heater read, heater write, frame publication, Abort, Disconnect/Close
 ```
 
 For each case assert elapsed time is bounded by configured timeout plus a
@@ -680,6 +810,8 @@ git commit -m "test: prove owner timeout and leak isolation"
 **Interfaces:**
 - Consumes: packaged-equivalent owner/proxy and approved physical camera.
 - Produces: final restoration, timeout recovery and conformance evidence.
+- Consumes and restores the exact `TOUPCAM_OPTION_HEAT` level captured at
+  Connect.
 
 - [ ] **Step 1: Validate the raw pre-open gate without hardware mutation**
 
@@ -690,14 +822,17 @@ close. Extra, wrong-model and empty-ID fakes must record zero Open calls.
 - [ ] **Step 2: Run the first bounded hardware stage**
 
 Run identity, Connect, one RAW12 16 x 16 exposure and Disconnect. Require all
-15 snapshot fields equal and no live owner process or shared-memory entry.
+snapshot fields, including heater level and heater maximum, equal and no live
+owner process or shared-memory entry.
 
 - [ ] **Step 3: Run the approved matrix**
 
 Exercise RAW8/RAW12, native bins 1-8, ASCOM bin3 1365 fallback, small/odd/right
 edge ROI, repeated acquisition, orientation, safe bias-zero clamping, gain,
 cooling reads, Abort and reconnect. Inspect TEC target/state, fan and gain
-before/after structural transitions.
+before/after structural transitions. Read `TOUPCAM_OPTION_HEAT_MAX`, change
+`TOUPCAM_OPTION_HEAT` to one valid level only in a bounded heater stage, then
+restore and re-read the exact original level in `finally`.
 
 - [ ] **Step 4: Inject a real owner termination without retrying exposure**
 
@@ -809,13 +944,16 @@ Include the owner entry module, SDK Python wrapper and required
 Document JSON configuration fields and defaults, driver installation,
 firewall/discovery, N.I.N.A., trusted-LAN security, real/simulator selection,
 RAW modes, binning and software fallback, cooling, FITS, logs, diagnostics,
-owner timeout behavior, explicit reconnect after failure and troubleshooting.
+owner timeout behavior, explicit reconnect after failure, Web-only anti-dew
+heater levels, exposure-time write lockout, disconnect restoration and
+troubleshooting.
 
 - [ ] **Step 5: Run packaged simulator and real-camera smoke**
 
 The script verifies management, discovery, Connect, one exposure, ImageBytes,
 JSON, PNG, FITS, Abort, Disconnect, owner process cleanup and JSON loading.
-Real failure must never select simulation.
+It also verifies the packaged Web heater UI and one restored real-camera heater
+round trip. Real failure must never select simulation.
 
 - [ ] **Step 6: Run complete final verification**
 
@@ -858,3 +996,8 @@ git commit -m "build: package isolated ToupTek Alpaca release"
 - [ ] Fresh ConformU Protocol and Camera V4 have zero unexplained findings.
 - [ ] Packaged simulator and real-camera smoke pass with Windows spawn.
 - [ ] The Chinese guide and `touptek4040.json` match delivered filenames, defaults and behavior.
+- [ ] Web heater control uses only owner IPC, exposes the device-reported
+  integer range, rejects writes during exposure and restores the
+  connection-time level on normal Disconnect.
+- [ ] Alpaca Camera V4 routes, `SupportedActions` and `Action` contain no
+  heater extension.
