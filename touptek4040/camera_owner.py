@@ -9,7 +9,7 @@ import math
 import os
 from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Any
+from typing import Any, cast
 
 from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
 from .errors import CameraNotConnectedError
@@ -123,25 +123,79 @@ def _validate_toupcam_backend(
         raise ValueError("real owner requires the approved camera model and serial")
 
 
+_MISSING_BACKEND = object()
+
+
+@dataclass(eq=False, slots=True)
+class _ConstructionReservation:
+    cancelled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupReservation:
+    candidate: object
+
+
 class _BackendLifecycle:
     """Serialize owner backend identity and usability without locking SDK calls."""
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._backend: OwnerBackend | None = None
+        self._backend: object = _MISSING_BACKEND
+        self._construction: _ConstructionReservation | None = None
         self._state = "disconnected"
         self._shutdown_requested = False
 
-    def register(self, candidate: OwnerBackend) -> None:
+    def begin_construction(
+        self,
+        stop_requested: bool = False,
+    ) -> _ConstructionReservation:
         with self._lock:
-            if self._backend is not None or self._state != "disconnected":
+            if self._shutdown_requested or stop_requested:
+                raise OwnerProtocolError("owner shutdown is already requested")
+            if (
+                self._backend is not _MISSING_BACKEND
+                or self._construction is not None
+                or self._state != "disconnected"
+            ):
                 raise OwnerProtocolError(
                     "another backend candidate still requires cleanup"
                 )
-            if self._shutdown_requested:
-                raise OwnerProtocolError("owner shutdown is already requested")
+            reservation = _ConstructionReservation()
+            self._construction = reservation
+            self._state = "constructing"
+            return reservation
+
+    def attach_construction(
+        self,
+        reservation: _ConstructionReservation,
+        candidate: object,
+    ) -> None:
+        with self._lock:
+            if (
+                self._construction is not reservation
+                or self._state != "constructing"
+            ):
+                raise OwnerProtocolError(
+                    "backend construction reservation is no longer valid"
+                )
             self._backend = candidate
+            self._construction = None
             self._state = "validating"
+
+    def construction_failed(
+        self,
+        reservation: _ConstructionReservation,
+    ) -> None:
+        with self._lock:
+            if self._construction is not reservation:
+                return
+            self._construction = None
+            self._state = (
+                "stopping"
+                if reservation.cancelled or self._shutdown_requested
+                else "disconnected"
+            )
 
     def mark_connected(self, candidate: OwnerBackend) -> None:
         with self._lock:
@@ -161,7 +215,7 @@ class _BackendLifecycle:
     def snapshot(self) -> tuple[OwnerBackend | None, bool]:
         with self._lock:
             if self._state == "connected":
-                return self._backend, True
+                return cast(OwnerBackend, self._backend), True
             return None, False
 
     def capture_connected(self) -> OwnerBackend | None:
@@ -170,31 +224,41 @@ class _BackendLifecycle:
     def capture_for_shutdown(self) -> OwnerBackend | None:
         with self._lock:
             self._shutdown_requested = True
+            if self._construction is not None:
+                self._construction.cancelled = True
             if self._state == "connected":
-                return self._backend
+                return cast(OwnerBackend, self._backend)
             return None
 
-    def begin_cleanup(self) -> OwnerBackend | None:
+    def begin_cleanup(self) -> _CleanupReservation | None:
         with self._lock:
-            if self._backend is None or self._state == "disconnected":
+            if self._backend is _MISSING_BACKEND:
                 return None
             if self._state == "cleanup":
                 return None
             candidate = self._backend
             self._state = "cleanup"
-            return candidate
+            return _CleanupReservation(candidate)
 
-    def cleanup_failed(self, candidate: OwnerBackend) -> None:
+    def cleanup_failed(self, reservation: _CleanupReservation) -> None:
         with self._lock:
-            if self._backend is candidate and self._state == "cleanup":
+            if (
+                self._backend is reservation.candidate
+                and self._state == "cleanup"
+            ):
                 self._state = "validating"
 
-    def clear_after_cleanup(self, candidate: OwnerBackend) -> None:
+    def clear_after_cleanup(self, reservation: _CleanupReservation) -> None:
         with self._lock:
-            if self._backend is not candidate or self._state != "cleanup":
+            if (
+                self._backend is not reservation.candidate
+                or self._state != "cleanup"
+            ):
                 return
-            self._backend = None
-            self._state = "disconnected"
+            self._backend = _MISSING_BACKEND
+            self._state = (
+                "stopping" if self._shutdown_requested else "disconnected"
+            )
 
 
 def camera_owner_main(
@@ -229,27 +293,57 @@ def camera_owner_main(
         saved_heater_level = None
 
     def disconnect_backend() -> None:
-        candidate = lifecycle.begin_cleanup()
-        if candidate is None:
+        cleanup = lifecycle.begin_cleanup()
+        if cleanup is None:
             return
+        candidate = cleanup.candidate
         restoration_error: BaseException | None = None
+        if isinstance(candidate, OwnerBackend):
+            try:
+                restore_heater(candidate)
+            except BaseException as error:
+                restoration_error = error
         try:
-            restore_heater(candidate)
-        except BaseException as error:
-            restoration_error = error
-        try:
-            candidate.disconnect()
+            disconnect = getattr(candidate, "disconnect", None)
         except BaseException:
-            lifecycle.cleanup_failed(candidate)
+            lifecycle.cleanup_failed(cleanup)
             raise
-        lifecycle.clear_after_cleanup(candidate)
+        if not callable(disconnect):
+            lifecycle.clear_after_cleanup(cleanup)
+            if restoration_error is not None:
+                raise restoration_error
+            return
+        try:
+            disconnect()
+        except BaseException:
+            lifecycle.cleanup_failed(cleanup)
+            raise
+        lifecycle.clear_after_cleanup(cleanup)
         if restoration_error is not None:
             raise restoration_error
 
     def connect_backend() -> OwnerBackend:
-        candidate = _instantiate_backend(startup_spec, lifecycle.register)
-        lifecycle.ensure_connect_allowed(candidate)
-        return candidate
+        reservation = lifecycle.begin_construction(stop_requested.is_set())
+        attached = False
+
+        def attach_candidate(candidate: object) -> None:
+            nonlocal attached
+            lifecycle.attach_construction(reservation, candidate)
+            attached = True
+            lifecycle.ensure_connect_allowed(candidate)
+
+        try:
+            candidate = _instantiate_backend(startup_spec, attach_candidate)
+            lifecycle.ensure_connect_allowed(candidate)
+            return candidate
+        except BaseException:
+            lifecycle.construction_failed(reservation)
+            if attached:
+                try:
+                    disconnect_backend()
+                except BaseException as rollback_error:
+                    report_cleanup_error(rollback_error)
+            raise
 
     def control_loop() -> None:
         while not stop_requested.is_set():
@@ -465,6 +559,7 @@ def _dispatch(
     if operation == "connect":
         _require_keys(arguments, set())
         if not connected:
+            active_backend: OwnerBackend | None = None
             try:
                 active_backend = connect_backend()
                 active_backend.connect()
@@ -475,10 +570,11 @@ def _dispatch(
                 )
                 mark_connected(active_backend)
             except BaseException:
-                try:
-                    disconnect_backend()
-                except BaseException as rollback_error:
-                    report_cleanup_error(rollback_error)
+                if active_backend is not None:
+                    try:
+                        disconnect_backend()
+                    except BaseException as rollback_error:
+                        report_cleanup_error(rollback_error)
                 raise
             connected = True
         return {"connected": True}, connected, saved_heater_level, False

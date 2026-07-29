@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from threading import Thread
+from threading import Barrier, Thread
 import subprocess
 from types import ModuleType
 
@@ -17,12 +17,14 @@ import pytest
 from test.fixtures.fake_owner_backend import ExplodingOwnerPayload, FakeOwnerBackend
 from touptek4040.camera_owner import (
     OwnerStartupSpec,
+    _BackendLifecycle,
     _create_toupcam_backend,
     _instantiate_backend,
     camera_owner_main,
 )
 from touptek4040.owner_protocol import (
     OwnerRequest,
+    OwnerProtocolError,
     decode_acquire_start_ack,
     decode_response,
     encode_request,
@@ -624,6 +626,356 @@ def test_control_shutdown_before_connect_responds_then_closes_without_factory_ev
         with pytest.raises(EOFError):
             harness._command_parent.recv()
         assert lifecycle_path.exists() is False
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("failed_disconnects", "expected_disconnects", "expects_diagnostic"),
+    [(0, 1, False), (1, 2, True)],
+)
+def test_shutdown_during_opening_factory_adopts_and_boundedly_cleans_returned_backend(
+    tmp_path: Path,
+    failed_disconnects: int,
+    expected_disconnects: int,
+    expects_diagnostic: bool,
+) -> None:
+    factory_entered = tmp_path / "factory-entered"
+    factory_release = tmp_path / "factory-release"
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "factory_barrier_entered_path": str(factory_entered),
+            "factory_barrier_release_path": str(factory_release),
+            "fail_disconnects": failed_disconnects,
+            "lifecycle_path": str(lifecycle_path),
+            "state_path": str(state_path),
+        },
+        backend_factory="create_open_identity_probe_backend",
+        backend_validator="validate_identity_probe_backend",
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.raw_request(1, "connect", {}))
+    )
+    try:
+        worker.start()
+        _wait_for_path(factory_entered)
+
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        assert not harness._control_parent.poll(0.1)
+
+        factory_release.touch()
+        worker.join(3)
+        harness.process.join(3)
+
+        assert not worker.is_alive()
+        assert len(responses) == 1
+        response = responses[0]
+        assert response.request_id == 1
+        assert response.operation == "connect"
+        assert response.error is not None
+        assert response.error.message == "owner shutdown is already requested"
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == expected_disconnects
+        assert state["counts"].get("abort", 0) == 0
+        assert state["connected"] is False
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == [
+            "construct",
+            "connect",
+            *(["disconnect"] * expected_disconnects),
+        ]
+        if expects_diagnostic:
+            assert harness._command_parent.poll(3)
+            diagnostic = harness._command_parent.recv()
+            _assert_bounded_cleanup_diagnostic(diagnostic)
+            assert diagnostic["error"]["diagnostics"]["errors"] == [
+                "fake disconnect failed"
+            ]
+        else:
+            with pytest.raises(EOFError):
+                harness._command_parent.recv()
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        factory_release.touch()
+        worker.join(3)
+        harness.close()
+
+
+def test_retryable_cleanup_candidate_rejects_connect_before_second_factory_call(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "fail_disconnects": 1,
+            "fail_snapshot": True,
+            "lifecycle_path": str(lifecycle_path),
+            "state_path": str(state_path),
+        },
+    )
+    try:
+        first = harness.raw_request(1, "connect", {})
+        assert first.error is not None
+        assert first.error.message == "snapshot failed"
+        assert _read_fake_backend_state(state_path)["counts"]["disconnect"] == 1
+
+        second = harness.raw_request(2, "connect", {})
+
+        assert second.request_id == 2
+        assert second.operation == "connect"
+        assert second.error is not None
+        assert (
+            second.error.message
+            == "another backend candidate still requires cleanup"
+        )
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 1
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == ["construct", "connect", "disconnect"]
+
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+        harness.process.join(3)
+
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 2
+        assert state["connected"] is False
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == ["construct", "connect", "disconnect", "disconnect"]
+    finally:
+        harness.close()
+
+
+def test_concurrent_construction_reservations_admit_exactly_one_connect_attempt() -> None:
+    lifecycle = _BackendLifecycle()
+    start = Barrier(2)
+    reservations: list[object] = []
+    errors: list[BaseException] = []
+
+    def reserve() -> None:
+        start.wait()
+        try:
+            reservations.append(lifecycle.begin_construction())
+        except BaseException as error:
+            errors.append(error)
+
+    workers = [Thread(target=reserve) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(reservations) == 1
+    assert len(errors) == 1
+    assert str(errors[0]) == "another backend candidate still requires cleanup"
+    other_lifecycle = _BackendLifecycle()
+    foreign_reservation = other_lifecycle.begin_construction()
+    with pytest.raises(
+        OwnerProtocolError,
+        match="backend construction reservation is no longer valid",
+    ):
+        lifecycle.attach_construction(foreign_reservation, object())
+    other_lifecycle.construction_failed(foreign_reservation)
+    lifecycle.construction_failed(reservations[0])
+    with pytest.raises(
+        OwnerProtocolError,
+        match="owner shutdown is already requested",
+    ):
+        lifecycle.begin_construction(stop_requested=True)
+    replacement = lifecycle.begin_construction()
+    assert replacement is not reservations[0]
+    lifecycle.construction_failed(replacement)
+
+
+def test_factory_exception_clears_exact_reservation_for_next_connect(
+    tmp_path: Path,
+) -> None:
+    failure_marker = tmp_path / "factory-failed"
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "factory_failure_marker_path": str(failure_marker),
+            "lifecycle_path": str(lifecycle_path),
+            "state_path": str(state_path),
+        },
+        backend_factory="create_factory_exception_once_backend",
+    )
+    try:
+        first = harness.raw_request(1, "connect", {})
+        assert first.error is not None
+        assert first.error.message == "factory failed before returning"
+
+        second = harness.raw_request(2, "connect", {})
+        assert second.error is None
+        assert second.result == {"connected": True}
+        third = harness.raw_request(3, "disconnect", {})
+        assert third.error is None
+        assert third.result == {"connected": False}
+
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == [
+            "factory_call",
+            "factory_error",
+            "factory_call",
+            "construct",
+            "connect",
+            "disconnect",
+        ]
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 1
+    finally:
+        harness.close()
+
+
+def test_shutdown_during_factory_exception_clears_reservation_and_exits(
+    tmp_path: Path,
+) -> None:
+    factory_entered = tmp_path / "factory-entered"
+    factory_release = tmp_path / "factory-release"
+    failure_marker = tmp_path / "factory-failed"
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "factory_barrier_entered_path": str(factory_entered),
+            "factory_barrier_release_path": str(factory_release),
+            "factory_failure_marker_path": str(failure_marker),
+            "lifecycle_path": str(lifecycle_path),
+        },
+        backend_factory="create_factory_exception_once_backend",
+    )
+    responses: list[object] = []
+    worker = Thread(
+        target=lambda: responses.append(harness.raw_request(1, "connect", {}))
+    )
+    try:
+        worker.start()
+        _wait_for_path(factory_entered)
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+
+        factory_release.touch()
+        worker.join(3)
+        harness.process.join(3)
+
+        assert not worker.is_alive()
+        assert len(responses) == 1
+        assert responses[0].request_id == 1
+        assert responses[0].operation == "connect"
+        assert responses[0].error is not None
+        assert (
+            responses[0].error.message
+            == "factory failed before returning"
+        )
+        assert harness.process.exitcode == 0
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == ["factory_call", "factory_error"]
+        with pytest.raises(EOFError):
+            harness._command_parent.recv()
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+    finally:
+        factory_release.touch()
+        worker.join(3)
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("result_kind", "expected_malformed_event"),
+    [
+        ("none", "malformed_none"),
+        ("object", "malformed_object"),
+        ("disconnectable", "malformed_disconnectable"),
+    ],
+)
+def test_malformed_factory_result_is_bounded_and_does_not_poison_next_connect(
+    tmp_path: Path,
+    result_kind: str,
+    expected_malformed_event: str,
+) -> None:
+    result_marker = tmp_path / "malformed-returned"
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "lifecycle_path": str(lifecycle_path),
+            "malformed_result_kind": result_kind,
+            "malformed_result_marker_path": str(result_marker),
+            "state_path": str(state_path),
+        },
+        backend_factory="create_malformed_once_backend",
+    )
+    try:
+        first = harness.raw_request(1, "connect", {})
+        assert first.error is not None
+        assert (
+            first.error.message
+            == "owner backend does not implement CameraContract"
+        )
+
+        second = harness.raw_request(2, "connect", {})
+        assert second.error is None
+        assert second.result == {"connected": True}
+        third = harness.raw_request(3, "disconnect", {})
+        assert third.error is None
+        assert third.result == {"connected": False}
+
+        operations = [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ]
+        expected = [
+            "factory_call",
+            expected_malformed_event,
+        ]
+        if result_kind == "disconnectable":
+            expected.append("malformed_disconnect")
+        expected.extend(
+            [
+                "factory_call",
+                "construct",
+                "connect",
+                "disconnect",
+            ]
+        )
+        assert operations == expected
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 1
     finally:
         harness.close()
 

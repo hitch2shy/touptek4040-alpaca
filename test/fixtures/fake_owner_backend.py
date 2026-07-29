@@ -53,6 +53,23 @@ class _FakeOwnerIdentity:
         return self._model
 
 
+class _NonconformingOwnerBackend:
+    """Factory result with no camera contract or cleanup surface."""
+
+
+class _DisconnectableNonconformingOwnerBackend:
+    """Malformed factory result that still exposes its handle cleanup."""
+
+    def __init__(self, lifecycle_path: str | None) -> None:
+        self._lifecycle_path = lifecycle_path
+
+    def disconnect(self) -> None:
+        _append_lifecycle_event(
+            self._lifecycle_path,
+            "malformed_disconnect",
+        )
+
+
 class FakeOwnerBackend:
     """Small deterministic backend whose process identity is observable."""
 
@@ -362,7 +379,66 @@ def create_open_identity_probe_backend(
         raises=bool(kwargs.get("identity_property_raises", False)),
     )
     backend.connect()
+    _wait_on_file_barrier(
+        _optional_path_argument(kwargs, "factory_barrier_entered_path"),
+        _optional_path_argument(kwargs, "factory_barrier_release_path"),
+    )
     return backend
+
+
+def create_factory_exception_once_backend(
+    serial: str | None = None,
+    **kwargs: object,
+) -> FakeOwnerBackend:
+    lifecycle_path = _optional_path_argument(kwargs, "lifecycle_path")
+    failure_marker_path = _optional_path_argument(
+        kwargs, "factory_failure_marker_path"
+    )
+    _append_lifecycle_event(lifecycle_path, "factory_call", serial=serial)
+    if failure_marker_path is None:
+        raise ValueError("factory_failure_marker_path is required")
+    failure_marker = Path(failure_marker_path)
+    if not failure_marker.exists():
+        failure_marker.parent.mkdir(parents=True, exist_ok=True)
+        failure_marker.touch()
+        _wait_on_file_barrier(
+            _optional_path_argument(kwargs, "factory_barrier_entered_path"),
+            _optional_path_argument(kwargs, "factory_barrier_release_path"),
+        )
+        _append_lifecycle_event(lifecycle_path, "factory_error", serial=serial)
+        raise RuntimeError("factory failed before returning")
+    return create_backend(serial, **kwargs)
+
+
+def create_malformed_once_backend(
+    serial: str | None = None,
+    **kwargs: object,
+) -> object:
+    lifecycle_path = _optional_path_argument(kwargs, "lifecycle_path")
+    result_marker_path = _optional_path_argument(
+        kwargs, "malformed_result_marker_path"
+    )
+    result_kind = kwargs.get("malformed_result_kind")
+    _append_lifecycle_event(lifecycle_path, "factory_call", serial=serial)
+    if result_marker_path is None:
+        raise ValueError("malformed_result_marker_path is required")
+    if result_kind not in {"none", "object", "disconnectable"}:
+        raise ValueError("malformed_result_kind is invalid")
+    result_marker = Path(result_marker_path)
+    if result_marker.exists():
+        return create_backend(serial, **kwargs)
+    result_marker.parent.mkdir(parents=True, exist_ok=True)
+    result_marker.touch()
+    _append_lifecycle_event(
+        lifecycle_path,
+        f"malformed_{result_kind}",
+        serial=serial,
+    )
+    if result_kind == "none":
+        return None
+    if result_kind == "disconnectable":
+        return _DisconnectableNonconformingOwnerBackend(lifecycle_path)
+    return _NonconformingOwnerBackend()
 
 
 def validate_identity_probe_backend(
@@ -417,3 +493,21 @@ def _wait_on_file_barrier(
         if time.monotonic() >= deadline:
             raise TimeoutError("fake owner file barrier timed out")
         time.sleep(0.005)
+
+
+def _append_lifecycle_event(
+    lifecycle_path: str | None,
+    operation: str,
+    **details: object,
+) -> None:
+    if lifecycle_path is None:
+        return
+    path = Path(lifecycle_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "operation": operation,
+        "pid": os.getpid(),
+        **details,
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
