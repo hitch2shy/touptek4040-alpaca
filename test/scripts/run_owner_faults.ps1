@@ -23,26 +23,31 @@ if ($ValidationOnly -and (-not $CasesInput -or -not $OutputDirectory)) {
 
 if ($ValidationOnly) {
     $resultDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+    if (
+        [StringComparer]::OrdinalIgnoreCase.Equals(
+            $resultDirectory.TrimEnd("\"),
+            $officialResultDirectory.TrimEnd("\")
+        )
+    ) {
+        Write-Error "ValidationOnly cannot target the official result directory"
+        exit 64
+    }
     $jsonLines = [System.IO.Path]::GetFullPath($CasesInput)
     $summaryJson = Join-Path $resultDirectory "validation-summary.json"
     $summaryMarkdown = Join-Path $resultDirectory "validation-summary.md"
 } else {
     $resultDirectory = $officialResultDirectory
-    if (Test-Path -LiteralPath $resultDirectory) {
-        $resolvedResultDirectory = (Resolve-Path -LiteralPath $resultDirectory).Path
-        if ($resolvedResultDirectory -ne $officialResultDirectory) {
-            Write-Error "Refusing to delete a non-official evidence directory"
-            exit 65
-        }
-        Remove-Item -LiteralPath $resultDirectory -Recurse -Force
-    }
     $jsonLines = Join-Path $resultDirectory "cases.jsonl"
     $summaryJson = Join-Path $resultDirectory "summary.json"
     $summaryMarkdown = Join-Path $resultDirectory "summary.md"
 }
 
 New-Item -ItemType Directory -Force -Path $resultDirectory | Out-Null
-foreach ($path in @($summaryJson, $summaryMarkdown)) {
+$generatedPathsToRemove = @($summaryJson, $summaryMarkdown)
+if (-not $ValidationOnly) {
+    $generatedPathsToRemove = @($jsonLines) + $generatedPathsToRemove
+}
+foreach ($path in $generatedPathsToRemove) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
@@ -51,6 +56,7 @@ foreach ($path in @($summaryJson, $summaryMarkdown)) {
 $pytestExitCode = 0
 if (-not $ValidationOnly) {
     $env:TOUPTEK_OWNER_FAULT_RESULTS = $jsonLines
+    $env:TOUPTEK_OWNER_FAULT_AUDIT_ACTIVE = "1"
     Push-Location $repoRoot
     try {
         & $python -m pytest -c test/pytest.ini `
@@ -61,6 +67,7 @@ if (-not $ValidationOnly) {
     finally {
         Pop-Location
         Remove-Item Env:TOUPTEK_OWNER_FAULT_RESULTS -ErrorAction SilentlyContinue
+        Remove-Item Env:TOUPTEK_OWNER_FAULT_AUDIT_ACTIVE -ErrorAction SilentlyContinue
     }
 }
 

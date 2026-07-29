@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 
@@ -479,6 +480,120 @@ def test_official_runner_rejects_stale_cases_override(
 
     assert completed.returncode != 0
     assert not (output_directory / "summary.json").exists()
+
+
+def test_official_runner_preserves_unknown_diagnostics_and_refreshes_known_files(
+    tmp_path: Path,
+) -> None:
+    if (
+        os.environ.get("TOUPTEK_OWNER_FAULT_CLEANUP_PROBE") == "1"
+        or os.environ.get("TOUPTEK_OWNER_FAULT_AUDIT_ACTIVE") == "1"
+    ):
+        pytest.skip("outer cleanup probe owns the official audit invocation")
+    result_directory = (
+        Path(__file__).resolve().parents[1] / "results" / "owner-faults"
+    )
+    result_directory.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    unknown_file = result_directory / f"manual-{token}.txt"
+    nested_directory = result_directory / f"diagnostic-{token}"
+    nested_file = nested_directory / "notes.txt"
+    nested_directory.mkdir()
+    unknown_file.write_text("preserve me", encoding="utf-8")
+    nested_file.write_text("nested diagnostic", encoding="utf-8")
+    for name in ("cases.jsonl", "summary.json", "summary.md"):
+        (result_directory / name).write_text("STALE", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["TOUPTEK_OWNER_FAULT_CLEANUP_PROBE"] = "1"
+
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(
+                    Path(__file__).resolve().parents[1]
+                    / "scripts"
+                    / "run_owner_faults.ps1"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert unknown_file.read_text(encoding="utf-8") == "preserve me"
+        assert nested_file.read_text(encoding="utf-8") == "nested diagnostic"
+        for name in ("cases.jsonl", "summary.json", "summary.md"):
+            assert (
+                (result_directory / name).read_text(
+                    encoding="utf-8-sig"
+                )
+                != "STALE"
+            )
+    finally:
+        if nested_file.exists():
+            nested_file.unlink()
+        if nested_directory.exists():
+            nested_directory.rmdir()
+        if unknown_file.exists():
+            unknown_file.unlink()
+
+
+def test_validation_only_cannot_target_official_result_directory(
+    tmp_path: Path,
+) -> None:
+    if (
+        os.environ.get("TOUPTEK_OWNER_FAULT_CLEANUP_PROBE") == "1"
+        or os.environ.get("TOUPTEK_OWNER_FAULT_AUDIT_ACTIVE") == "1"
+    ):
+        pytest.skip("outer cleanup probe owns the official audit invocation")
+    result_directory = (
+        Path(__file__).resolve().parents[1] / "results" / "owner-faults"
+    )
+    official_summary = result_directory / "summary.json"
+    before = official_summary.read_bytes()
+    validation_summary = result_directory / "validation-summary.json"
+    if validation_summary.exists():
+        validation_summary.unlink()
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in _valid_runner_records()
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_owner_faults.ps1"
+            ),
+            "-CasesInput",
+            str(cases_path),
+            "-OutputDirectory",
+            str(result_directory),
+            "-ValidationOnly",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    assert official_summary.read_bytes() == before
+    assert not validation_summary.exists()
 
 
 def _valid_runner_records() -> list[dict[str, object]]:

@@ -2,7 +2,7 @@
     "schemaVersion":  3,
     "mode":  "official-fresh-audit",
     "auditEligible":  true,
-    "generatedUtc":  "2026-07-29T20:17:51Z",
+    "generatedUtc":  "2026-07-29T20:25:40Z",
     "passed":  true,
     "pytestExitCode":  0,
     "expectedCases":  14,
@@ -29,10 +29,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  1.0367613999987952,
+                                       "elapsed_s":  0.9406868999940343,
                                        "hard_bound_s":  2.1,
                                        "hung_generation":  1,
-                                       "hung_pid":  20236,
+                                       "hung_pid":  9680,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -43,7 +43,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  0,
-                                       "terminated_pid":  20236
+                                       "terminated_pid":  9680
                                    }
                   },
                   {
@@ -54,10 +54,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.5073090999940177,
+                                       "elapsed_s":  0.4630087000114145,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  36756,
+                                       "hung_pid":  1384,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -68,7 +68,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  1,
-                                       "terminated_pid":  36756
+                                       "terminated_pid":  1384
                                    }
                   },
                   {
@@ -79,10 +79,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.5357557000097586,
+                                       "elapsed_s":  0.46667100000195205,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  14588,
+                                       "hung_pid":  3368,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -93,7 +93,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  14588
+                                       "terminated_pid":  3368
                                    }
                   },
                   {
@@ -104,10 +104,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.5191600999969523,
+                                       "elapsed_s":  0.49179759999969974,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  12056,
+                                       "hung_pid":  37728,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -118,7 +118,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  12056
+                                       "terminated_pid":  37728
                                    }
                   },
                   {
@@ -129,10 +129,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.47711659999913536,
+                                       "elapsed_s":  0.46852389999548905,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  28128,
+                                       "hung_pid":  34752,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -143,7 +143,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  28128
+                                       "terminated_pid":  34752
                                    }
                   },
                   {
@@ -154,10 +154,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.5184607999981381,
+                                       "elapsed_s":  0.48665219999384135,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  35944,
+                                       "hung_pid":  13836,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -168,7 +168,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  35944
+                                       "terminated_pid":  13836
                                    }
                   },
                   {
@@ -179,10 +179,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.48634809999202844,
+                                       "elapsed_s":  0.4645948999968823,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  36680,
+                                       "hung_pid":  8976,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -193,7 +193,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  36680
+                                       "terminated_pid":  8976
                                    }
                   },
                   {
@@ -204,10 +204,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.49683720000030007,
+                                       "elapsed_s":  0.4707549000013387,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  35724,
+                                       "hung_pid":  29968,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -218,7 +218,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  35724
+                                       "terminated_pid":  29968
                                    }
                   },
                   {
@@ -229,10 +229,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.46488999998837244,
+                                       "elapsed_s":  0.46218030000454746,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  15808,
+                                       "hung_pid":  3384,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -243,7 +243,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  0,
-                                       "terminated_pid":  15808
+                                       "terminated_pid":  3384
                                    }
                   },
                   {
@@ -254,10 +254,10 @@
 
                                      ],
                       "evidence":  {
-                                       "elapsed_s":  0.5379285999952117,
+                                       "elapsed_s":  0.505357300004107,
                                        "hard_bound_s":  0.9,
                                        "hung_generation":  1,
-                                       "hung_pid":  36792,
+                                       "hung_pid":  29648,
                                        "hung_pid_alive":  false,
                                        "invocations_by_generation":  {
                                                                          "1":  1,
@@ -268,7 +268,7 @@
                                        "replacement_connected":  false,
                                        "replacement_generation":  2,
                                        "request_id":  2,
-                                       "terminated_pid":  36792
+                                       "terminated_pid":  29648
                                    }
                   },
                   {
