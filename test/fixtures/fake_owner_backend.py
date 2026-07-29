@@ -41,6 +41,18 @@ class _MalformedTimestamp:
         return object()
 
 
+class _FakeOwnerIdentity:
+    def __init__(self, model: str, *, raises: bool = False) -> None:
+        self._model = model
+        self._raises = raises
+
+    @property
+    def model(self) -> str:
+        if self._raises:
+            raise RuntimeError("identity property failed")
+        return self._model
+
+
 class FakeOwnerBackend:
     """Small deterministic backend whose process identity is observable."""
 
@@ -291,3 +303,44 @@ def create_identity_checked_backend(
         reported_model=reported_model,
     )
     return backend
+
+
+def create_open_identity_probe_backend(
+    serial: str | None = None,
+    **kwargs: object,
+) -> FakeOwnerBackend:
+    backend = create_backend(serial, **kwargs)
+    reported_serial = kwargs.get("reported_serial", serial)
+    reported_model = kwargs.get("reported_model", "approved-model")
+    if not isinstance(reported_serial, str):
+        raise TypeError("reported_serial must be a string")
+    if not isinstance(reported_model, str):
+        raise TypeError("reported_model must be a string")
+    backend.serial = reported_serial
+    backend.identity = _FakeOwnerIdentity(
+        reported_model,
+        raises=bool(kwargs.get("identity_property_raises", False)),
+    )
+    backend.connect()
+    return backend
+
+
+def validate_identity_probe_backend(
+    backend: FakeOwnerBackend,
+    serial: str | None = None,
+    **_kwargs: object,
+) -> None:
+    backend._append_lifecycle("identity_read")
+    model = backend.identity.model
+    if backend.serial != serial or model != "approved-model":
+        backend._append_lifecycle(
+            "identity_rejected",
+            reported_serial=backend.serial,
+            reported_model=model,
+        )
+        raise ValueError("real owner requires the approved camera model and serial")
+    backend._append_lifecycle(
+        "identity_verified",
+        reported_serial=backend.serial,
+        reported_model=model,
+    )

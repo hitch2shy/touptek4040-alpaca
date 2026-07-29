@@ -77,6 +77,7 @@ class OwnerStartupSpec:
     backend_module: str = "touptek4040.camera_owner"
     backend_factory: str = "_create_toupcam_backend"
     backend_arguments: Mapping[str, object] = field(default_factory=dict)
+    backend_validator: str | None = None
 
     def __post_init__(self) -> None:
         if self.serial is not None and (not isinstance(self.serial, str) or not self.serial):
@@ -85,6 +86,10 @@ class OwnerStartupSpec:
             raise ValueError("backend_module must be a non-empty string")
         if not isinstance(self.backend_factory, str) or not self.backend_factory:
             raise ValueError("backend_factory must be a non-empty string")
+        if self.backend_validator is not None and (
+            not isinstance(self.backend_validator, str) or not self.backend_validator
+        ):
+            raise ValueError("backend_validator must be a non-empty string or None")
         if not isinstance(self.backend_arguments, Mapping):
             raise ValueError("backend_arguments must be a mapping")
         if not all(isinstance(key, str) for key in self.backend_arguments):
@@ -102,10 +107,20 @@ def _create_toupcam_backend(serial: str | None = None, **_kwargs: object) -> Own
 
     camera = ToupTekCamera(serial)
     camera.connect()
-    if camera.identity.model != APPROVED_CAMERA_MODEL or camera.serial != APPROVED_CAMERA_SERIAL:
-        camera.disconnect()
-        raise ValueError("real owner requires the approved camera model and serial")
     return camera
+
+
+def _validate_toupcam_backend(
+    camera: OwnerBackend,
+    serial: str | None = None,
+    **_kwargs: object,
+) -> None:
+    if (
+        serial != APPROVED_CAMERA_SERIAL
+        or camera.identity.model != APPROVED_CAMERA_MODEL
+        or camera.serial != APPROVED_CAMERA_SERIAL
+    ):
+        raise ValueError("real owner requires the approved camera model and serial")
 
 
 def camera_owner_main(
@@ -159,12 +174,21 @@ def camera_owner_main(
         if restoration_error is not None:
             raise restoration_error
 
-    def connect_backend() -> OwnerBackend:
+    def register_backend(candidate: OwnerBackend) -> None:
         nonlocal backend, backend_may_own_handle
-        if backend is None:
-            backend = _instantiate_backend(startup_spec)
-            backend_may_own_handle = True
-        return backend
+        if backend is not None and backend is not candidate:
+            raise OwnerProtocolError(
+                "another backend candidate still requires cleanup"
+            )
+        backend = candidate
+        backend_may_own_handle = True
+
+    def connect_backend() -> OwnerBackend:
+        if backend is not None:
+            raise OwnerProtocolError(
+                "the previous backend candidate still requires cleanup"
+            )
+        return _instantiate_backend(startup_spec, register_backend)
 
     def control_loop() -> None:
         while not stop_requested.is_set():
@@ -192,6 +216,8 @@ def camera_owner_main(
                         control_connection.send({"operation": "shutdown", "ok": True})
                     except BaseException as error:
                         control_connection.send({"operation": "shutdown", "ok": False, "error": str(error)[:256]})
+                else:
+                    control_connection.send({"operation": "shutdown", "ok": True})
                 stop_requested.set()
                 continue
             if operation == "abort" and backend is not None and connected:
@@ -287,13 +313,27 @@ def camera_owner_main(
             control_connection.close()
 
 
-def _instantiate_backend(spec: OwnerStartupSpec) -> OwnerBackend:
+def _instantiate_backend(
+    spec: OwnerStartupSpec,
+    register_candidate: Any,
+) -> OwnerBackend:
     module = importlib.import_module(spec.backend_module)
     factory = getattr(module, spec.backend_factory)
-    backend = factory(spec.serial, **dict(spec.backend_arguments))
-    if not isinstance(backend, OwnerBackend):
+    candidate = factory(spec.serial, **dict(spec.backend_arguments))
+    register_candidate(candidate)
+    if not isinstance(candidate, OwnerBackend):
         raise TypeError("owner backend does not implement CameraContract")
-    return backend
+    validator_name = spec.backend_validator
+    if (
+        validator_name is None
+        and spec.backend_module == "touptek4040.camera_owner"
+        and spec.backend_factory == "_create_toupcam_backend"
+    ):
+        validator_name = "_validate_toupcam_backend"
+    if validator_name is not None:
+        validator = getattr(module, validator_name)
+        validator(candidate, spec.serial, **dict(spec.backend_arguments))
+    return candidate
 
 
 def _handle_command(
@@ -353,8 +393,8 @@ def _dispatch(
     if operation == "connect":
         _require_keys(arguments, set())
         if not connected:
-            active_backend = connect_backend()
             try:
+                active_backend = connect_backend()
                 active_backend.connect()
                 saved_heater_level = (
                     active_backend.heater_level

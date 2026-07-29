@@ -14,8 +14,13 @@ from types import ModuleType
 
 import pytest
 
-from test.fixtures.fake_owner_backend import ExplodingOwnerPayload
-from touptek4040.camera_owner import OwnerStartupSpec, _create_toupcam_backend, camera_owner_main
+from test.fixtures.fake_owner_backend import ExplodingOwnerPayload, FakeOwnerBackend
+from touptek4040.camera_owner import (
+    OwnerStartupSpec,
+    _create_toupcam_backend,
+    _instantiate_backend,
+    camera_owner_main,
+)
 from touptek4040.owner_protocol import (
     OwnerRequest,
     decode_acquire_start_ack,
@@ -31,6 +36,7 @@ class OwnerHarness:
         backend_arguments: dict[str, object] | None = None,
         *,
         backend_factory: str = "create_backend",
+        backend_validator: str | None = None,
     ) -> None:
         context = multiprocessing.get_context("spawn")
         self._command_parent, command_child = context.Pipe()
@@ -38,17 +44,20 @@ class OwnerHarness:
         self._generation = 19
         self._request_id = 0
         self.registry_path = temporary_path / "frames.json"
+        startup_arguments: dict[str, object] = {
+            "serial": "FAKE-OWNER",
+            "backend_module": "test.fixtures.fake_owner_backend",
+            "backend_factory": backend_factory,
+            "backend_arguments": backend_arguments or {},
+        }
+        if backend_validator is not None:
+            startup_arguments["backend_validator"] = backend_validator
         self.process = context.Process(
             target=camera_owner_main,
             args=(
                 command_child,
                 control_child,
-                OwnerStartupSpec(
-                    serial="FAKE-OWNER",
-                    backend_module="test.fixtures.fake_owner_backend",
-                    backend_factory=backend_factory,
-                    backend_arguments=backend_arguments or {},
-                ),
+                OwnerStartupSpec(**startup_arguments),
                 self._generation,
                 str(self.registry_path),
             ),
@@ -220,6 +229,125 @@ def test_wrong_identity_connect_fails_and_cleans_deferred_candidate(
         harness.close()
 
 
+@pytest.mark.parametrize(
+    ("reported_serial", "reported_model"),
+    [
+        ("WRONG-SERIAL", "approved-model"),
+        ("FAKE-OWNER", "wrong-model"),
+    ],
+)
+def test_identity_rejection_retains_opened_candidate_for_outer_cleanup_retry(
+    tmp_path: Path,
+    reported_serial: str,
+    reported_model: str,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "fail_disconnects": 1,
+            "lifecycle_path": str(lifecycle_path),
+            "reported_model": reported_model,
+            "reported_serial": reported_serial,
+            "state_path": str(state_path),
+        },
+        backend_factory="create_open_identity_probe_backend",
+        backend_validator="validate_identity_probe_backend",
+    )
+    try:
+        response = harness.raw_request(1, "connect", {})
+        assert response.error is not None
+        assert response.error.message == (
+            "real owner requires the approved camera model and serial"
+        )
+        assert _read_fake_backend_state(state_path)["counts"]["disconnect"] == 1
+
+        harness._command_parent.send(ExplodingOwnerPayload())
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        errors = diagnostic["error"]["diagnostics"]["errors"]
+        assert errors.count("fake disconnect failed") == 1
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 2
+        assert state["counts"]["abort"] == 1
+        assert state["connected"] is False
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == [
+            "construct",
+            "connect",
+            "identity_read",
+            "identity_rejected",
+            "disconnect",
+            "disconnect",
+        ]
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("failed_disconnects", "cleanup_connected", "cleanup_error_count"),
+    [(1, False, 1), (2, True, 2)],
+)
+def test_identity_property_failure_preserves_original_error_and_bounds_cleanup(
+    tmp_path: Path,
+    failed_disconnects: int,
+    cleanup_connected: bool,
+    cleanup_error_count: int,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "fail_disconnects": failed_disconnects,
+            "identity_property_raises": True,
+            "lifecycle_path": str(lifecycle_path),
+            "state_path": str(state_path),
+        },
+        backend_factory="create_open_identity_probe_backend",
+        backend_validator="validate_identity_probe_backend",
+    )
+    try:
+        response = harness.raw_request(1, "connect", {})
+        assert response.error is not None
+        assert response.error.message == "identity property failed"
+        assert _read_fake_backend_state(state_path)["counts"]["disconnect"] == 1
+
+        harness._command_parent.send(ExplodingOwnerPayload())
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        errors = diagnostic["error"]["diagnostics"]["errors"]
+        assert errors.count("fake disconnect failed") == cleanup_error_count
+        assert "identity property failed" not in errors
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["connect"] == 1
+        assert state["counts"]["disconnect"] == 2
+        assert state["counts"]["abort"] == 1
+        assert state["connected"] is cleanup_connected
+        assert [
+            event["operation"] for event in _read_lifecycle(lifecycle_path)
+        ] == [
+            "construct",
+            "connect",
+            "identity_read",
+            "disconnect",
+            "disconnect",
+        ]
+    finally:
+        harness.close()
+
+
 def test_multiple_connect_disconnect_cycles_construct_fresh_backends(
     tmp_path: Path,
 ) -> None:
@@ -386,53 +514,59 @@ def test_real_owner_rejects_any_non_approved_identity_before_loading_sdk(serial)
 
 
 @pytest.mark.parametrize(
-    ("model", "expected_events", "raises"),
+    ("model", "raises"),
     [
-        (
-            "sMAX16AM-U3-CL-GPS",
-            ["construct", "connect"],
-            False,
-        ),
-        (
-            "wrong-model",
-            ["construct", "connect", "disconnect"],
-            True,
-        ),
+        ("sMAX16AM-U3-CL-GPS", False),
+        ("wrong-model", True),
     ],
 )
-def test_production_backend_opens_exact_serial_before_identity_acceptance(
+def test_production_backend_registers_opened_exact_serial_before_identity_acceptance(
     monkeypatch,
     model: str,
-    expected_events: list[str],
     raises: bool,
 ) -> None:
     events: list[str] = []
+    registered: list[FakeOwnerBackend] = []
     approved_serial = "TP241025143218C92B01151AEC40CB7"
 
-    class Candidate:
+    class Candidate(FakeOwnerBackend):
         def __init__(self, serial: str) -> None:
             events.append("construct")
             assert serial == approved_serial
-            self.serial = serial
+            super().__init__(serial)
             self.identity = type("Identity", (), {"model": model})()
 
         def connect(self) -> None:
             events.append("connect")
+            super().connect()
 
         def disconnect(self) -> None:
             events.append("disconnect")
+            super().disconnect()
 
     module = ModuleType("touptek4040.toupcam_camera")
     module.ToupTekCamera = Candidate
     monkeypatch.setitem(sys.modules, "touptek4040.toupcam_camera", module)
 
-    if raises:
-        with pytest.raises(ValueError, match="approved camera model and serial"):
-            _create_toupcam_backend(approved_serial)
-    else:
-        assert _create_toupcam_backend(approved_serial).serial == approved_serial
+    try:
+        if raises:
+            with pytest.raises(ValueError, match="approved camera model and serial"):
+                _instantiate_backend(
+                    OwnerStartupSpec(serial=approved_serial),
+                    registered.append,
+                )
+        else:
+            assert _instantiate_backend(
+                OwnerStartupSpec(serial=approved_serial),
+                registered.append,
+            ).serial == approved_serial
 
-    assert events == expected_events
+        assert len(registered) == 1
+        assert registered[0].serial == approved_serial
+        assert events == ["construct", "connect"]
+    finally:
+        for candidate in registered:
+            candidate.disconnect()
 
 
 def test_control_shutdown_aborts_a_truly_blocked_spawned_acquisition(tmp_path: Path):
@@ -455,6 +589,41 @@ def test_control_shutdown_aborts_a_truly_blocked_spawned_acquisition(tmp_path: P
         harness.process.join(3)
         assert not harness.process.is_alive()
         assert failure
+    finally:
+        harness.close()
+
+
+def test_control_shutdown_before_connect_responds_then_closes_without_factory_events(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {"lifecycle_path": str(lifecycle_path)},
+    )
+    try:
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "abort",
+            "ok": False,
+            "error": "camera is not connected",
+        }
+
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": True,
+        }
+
+        harness.process.join(3)
+        assert harness.process.exitcode == 0
+        with pytest.raises(EOFError):
+            harness._control_parent.recv()
+        with pytest.raises(EOFError):
+            harness._command_parent.recv()
+        assert lifecycle_path.exists() is False
     finally:
         harness.close()
 
