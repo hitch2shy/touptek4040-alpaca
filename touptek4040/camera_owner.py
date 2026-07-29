@@ -87,7 +87,11 @@ def camera_owner_main(
 
     def report_cleanup_error(error: BaseException) -> None:
         if len(cleanup_errors) < 4:
-            cleanup_errors.append(str(error)[:256] or type(error).__name__)
+            try:
+                message = str(error)
+            except BaseException:
+                message = type(error).__name__
+            cleanup_errors.append(message[:256] or type(error).__name__)
 
     def restore_heater() -> None:
         nonlocal saved_heater_level
@@ -122,15 +126,15 @@ def camera_owner_main(
             except (EOFError, OSError):
                 return
             if not isinstance(message, Mapping):
-                control_connection.send({"operation": "rejected", "ok": False, "error": "control message must be an object"})
+                control_connection.send({"operation": "invalid_control", "ok": False, "error": "control message must be an object"})
                 continue
             operation = message.get("operation")
             if set(message) != {"operation"}:
-                response_operation = operation if isinstance(operation, str) else "invalid_control"
+                response_operation = _control_response_operation(operation)
                 control_connection.send({"operation": response_operation, "ok": False, "error": "control message has an invalid schema"})
                 continue
-            if not isinstance(operation, str):
-                control_connection.send({"operation": "rejected", "ok": False, "error": "control operation is required"})
+            if not isinstance(operation, str) or not operation:
+                control_connection.send({"operation": "invalid_control", "ok": False, "error": "control operation is required"})
                 continue
             if operation == "shutdown":
                 if backend is not None:
@@ -150,7 +154,7 @@ def camera_owner_main(
             elif operation == "abort":
                 control_connection.send({"operation": "abort", "ok": False, "error": "camera is not connected"})
             else:
-                control_connection.send({"operation": "rejected", "ok": False, "error": "unsupported control operation"})
+                control_connection.send({"operation": operation, "ok": False, "error": "unsupported control operation"})
 
     control_thread: Thread | None = None
     try:
@@ -181,12 +185,18 @@ def camera_owner_main(
                 response = _handle_command(
                     payload, generation, backend, registry, owned_descriptors,
                     connected, saved_heater_level, disconnect_backend,
+                    report_cleanup_error,
                 )
             except BaseException as error:
                 if isinstance(request, OwnerRequest):
                     response = (_response_payload(request, error=_owner_error(error)), connected, saved_heater_level, False)
                 else:
-                    response = _invalid_payload_response(payload, generation, error)
+                    response = (
+                        _invalid_payload_response(payload, generation, error),
+                        connected,
+                        saved_heater_level,
+                        False,
+                    )
             connected = bool(response[1])
             saved_heater_level = response[2]
             should_stop = bool(response[3])
@@ -217,6 +227,13 @@ def camera_owner_main(
                     report_cleanup_error(error)
         if control_thread is not None:
             control_thread.join(0.2)
+        if cleanup_errors:
+            try:
+                command_connection.send(
+                    _cleanup_diagnostic_payload(generation, cleanup_errors)
+                )
+            except BaseException:
+                pass
         try:
             command_connection.close()
         finally:
@@ -241,6 +258,7 @@ def _handle_command(
     connected: bool,
     saved_heater_level: int | None,
     disconnect_backend: Any,
+    report_cleanup_error: Any,
 ) -> tuple[dict[str, object], bool, int | None, bool]:
     request: OwnerRequest | None = None
     try:
@@ -248,7 +266,14 @@ def _handle_command(
         if request.owner_generation != generation:
             raise OwnerProtocolError("request belongs to a different owner generation")
         result, connected, saved_heater_level, shutdown = _dispatch(
-            request, backend, registry, owned_descriptors, connected, saved_heater_level, disconnect_backend
+            request,
+            backend,
+            registry,
+            owned_descriptors,
+            connected,
+            saved_heater_level,
+            disconnect_backend,
+            report_cleanup_error,
         )
         return _response_payload(request, result=result), connected, saved_heater_level, shutdown
     except BaseException as error:
@@ -265,6 +290,7 @@ def _dispatch(
     connected: bool,
     saved_heater_level: int | None,
     disconnect_backend: Any,
+    report_cleanup_error: Any,
 ) -> tuple[dict[str, object], bool, int | None, bool]:
     operation = request.operation
     arguments = request.arguments
@@ -278,7 +304,10 @@ def _dispatch(
             try:
                 saved_heater_level = backend.heater_level if backend.heater_supported else None
             except BaseException:
-                disconnect_backend()
+                try:
+                    disconnect_backend()
+                except BaseException as rollback_error:
+                    report_cleanup_error(rollback_error)
                 raise
             connected = True
         return {"connected": True}, connected, saved_heater_level, False
@@ -372,10 +401,35 @@ def _response_payload(request: OwnerRequest, *, result: object | None = None, er
     return payload
 
 
-def _invalid_payload_response(payload: object, generation: int, error: BaseException) -> tuple[dict[str, object], bool, int | None, bool]:
+def _invalid_payload_response(
+    payload: object,
+    generation: int,
+    error: BaseException,
+) -> dict[str, object]:
     del payload
     request = OwnerRequest(PROTOCOL_VERSION, generation, 0, "invalid", {})
-    return _response_payload(request, error=_owner_error(error)), False, None, False
+    return _response_payload(request, error=_owner_error(error))
+
+
+def _control_response_operation(operation: object) -> str:
+    if isinstance(operation, str) and operation:
+        return operation
+    return "invalid_control"
+
+
+def _cleanup_diagnostic_payload(
+    generation: int,
+    cleanup_errors: list[str],
+) -> dict[str, object]:
+    request = OwnerRequest(PROTOCOL_VERSION, generation, 0, "cleanup", {})
+    return _response_payload(
+        request,
+        error=OwnerError(
+            "cleanup_failed",
+            "camera owner final cleanup failed",
+            {"errors": list(cleanup_errors)},
+        ),
+    )
 
 
 def _owner_error(error: BaseException) -> OwnerError:

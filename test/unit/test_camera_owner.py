@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 
 import pytest
 
+from test.fixtures.fake_owner_backend import ExplodingOwnerPayload
 from touptek4040.camera_owner import OwnerStartupSpec, _create_toupcam_backend, camera_owner_main
 from touptek4040.owner_protocol import OwnerRequest, decode_response, encode_request
 
@@ -23,6 +25,7 @@ class OwnerHarness:
         self._control_parent, control_child = context.Pipe()
         self._generation = 19
         self._request_id = 0
+        self.registry_path = temporary_path / "frames.json"
         self.process = context.Process(
             target=camera_owner_main,
             args=(
@@ -35,7 +38,7 @@ class OwnerHarness:
                     backend_arguments=backend_arguments or {},
                 ),
                 self._generation,
-                str(temporary_path / "frames.json"),
+                str(self.registry_path),
             ),
         )
         self.process.start()
@@ -59,7 +62,7 @@ class OwnerHarness:
         return decode_response(self._command_parent.recv(), request)
 
     def close(self) -> None:
-        if self.process.is_alive():
+        if self.process.is_alive() and not self._command_parent.closed:
             try:
                 self.request("shutdown", {})
             except (AssertionError, EOFError, OSError):
@@ -68,8 +71,10 @@ class OwnerHarness:
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(3)
-        self._command_parent.close()
-        self._control_parent.close()
+        if not self._command_parent.closed:
+            self._command_parent.close()
+        if not self._control_parent.closed:
+            self._control_parent.close()
 
 
 @pytest.fixture
@@ -126,12 +131,41 @@ def test_owner_publishes_and_releases_a_frame(owner_harness: OwnerHarness):
 
 def test_normal_owner_disconnect_restores_the_connect_time_heater_level(tmp_path: Path):
     restoration_log = tmp_path / "restored-heater.txt"
-    harness = OwnerHarness(tmp_path, {"restore_log_path": str(restoration_log)})
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "restore_log_path": str(restoration_log),
+            "state_path": str(state_path),
+        },
+    )
     try:
         harness.request("connect", {})
         harness.request("set_heater_level", {"value": 4})
         harness.request("disconnect", {})
         assert restoration_log.read_text(encoding="utf-8") == "2"
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["disconnect"] == 1
+        assert _heater_write_count(state, 2) == 1
+    finally:
+        harness.close()
+
+
+def test_normal_owner_shutdown_restores_the_connect_time_heater_level_once(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(tmp_path, {"state_path": str(state_path)})
+    try:
+        harness.request("connect", {})
+        harness.request("set_heater_level", {"value": 4})
+        assert harness.request("shutdown", {}) == {"shutdown": True}
+        harness.process.join(3)
+
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["disconnect"] == 1
+        assert _heater_write_count(state, 2) == 1
     finally:
         harness.close()
 
@@ -201,6 +235,41 @@ def test_control_messages_always_receive_a_bounded_response(owner_harness: Owner
         assert len(response["error"]) <= 256
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_operation"),
+    [
+        ({"operation": "unsupported"}, "unsupported"),
+        ({"operation": "abort", "extra": True}, "abort"),
+        ({"operation": "shutdown", "extra": True}, "shutdown"),
+        ({"operation": 1}, "invalid_control"),
+        ({"operation": ""}, "invalid_control"),
+        ({}, "invalid_control"),
+        ([], "invalid_control"),
+    ],
+)
+def test_rejected_control_preserves_correlation_without_backend_invocation(
+    tmp_path: Path,
+    message: object,
+    expected_operation: str,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(tmp_path, {"state_path": str(state_path)})
+    try:
+        before = _read_fake_backend_state(state_path)
+        harness._control_parent.send(message)
+        assert harness._control_parent.poll(3)
+        response = harness._control_parent.recv()
+
+        assert response["operation"] == expected_operation
+        assert response["ok"] is False
+        assert len(response["error"]) <= 256
+        assert not harness._control_parent.poll(0.1)
+        assert _read_fake_backend_state(state_path)["events"] == before["events"]
+        assert harness.process.is_alive()
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize("operation", ["abort", "shutdown"])
 def test_control_extra_key_never_executes_the_requested_operation(owner_harness: OwnerHarness, operation: str):
     owner_harness._control_parent.send({"operation": operation, "extra": True})
@@ -222,6 +291,40 @@ def test_control_abort_failure_is_returned_to_the_parent(tmp_path: Path):
         harness.close()
 
 
+def test_control_shutdown_abort_failure_is_correlated_and_reports_final_cleanup(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {"fail_abort": True, "state_path": str(state_path)},
+    )
+    try:
+        harness.request("connect", {})
+        harness.request("set_heater_level", {"value": 4})
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv() == {
+            "operation": "shutdown",
+            "ok": False,
+            "error": "fake abort failed",
+        }
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        with pytest.raises(EOFError):
+            harness._command_parent.recv()
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["abort"] == 2
+        assert state["counts"]["disconnect"] == 1
+        assert _heater_write_count(state, 2) == 1
+    finally:
+        harness.close()
+
+
 def test_fresh_interpreter_import_of_owner_does_not_import_sdk_loader(tmp_path: Path):
     result = subprocess.run(
         [sys.executable, "-c", "import sys; import touptek4040.camera_owner; assert 'touptek4040.toupcam_loader' not in sys.modules"],
@@ -233,16 +336,128 @@ def test_fresh_interpreter_import_of_owner_does_not_import_sdk_loader(tmp_path: 
     assert result.returncode == 0, result.stderr
 
 
-def test_outer_cleanup_retries_failed_snapshot_rollback_disconnect(tmp_path: Path):
-    restoration_log = tmp_path / "restored.txt"
-    harness = OwnerHarness(tmp_path, {"fail_snapshot": True, "fail_disconnects": 1, "restore_log_path": str(restoration_log)})
+@pytest.mark.parametrize(
+    ("failed_disconnects", "cleanup_connected"),
+    [(1, False), (2, True)],
+)
+def test_outer_cleanup_retries_snapshot_rollback_and_preserves_original_error(
+    tmp_path: Path,
+    failed_disconnects: int,
+    cleanup_connected: bool,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "fail_snapshot": True,
+            "fail_disconnects": failed_disconnects,
+            "state_path": str(state_path),
+        },
+    )
     try:
         response = harness.raw_request(1, "connect", {})
         assert response.error is not None
-        harness._request_id = 1
+        assert response.error.message == "snapshot failed"
+        assert _read_fake_backend_state(state_path)["counts"]["disconnect"] == 1
+        harness._command_parent.close()
+        harness.process.join(3)
+
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["abort"] == 1
+        assert state["counts"]["disconnect"] == 2
+        assert state["connected"] is cleanup_connected
     finally:
         harness.close()
-    assert restoration_log.read_text(encoding="utf-8") == "2"
+
+
+def test_snapshot_rollback_failure_is_reported_separately_on_outer_exit(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "fail_snapshot": True,
+            "fail_disconnects": 1,
+            "state_path": str(state_path),
+        },
+    )
+    try:
+        response = harness.raw_request(1, "connect", {})
+        assert response.error is not None
+        assert response.error.message == "snapshot failed"
+        harness._command_parent.send(ExplodingOwnerPayload())
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        errors = diagnostic["error"]["diagnostics"]["errors"]
+        assert "fake disconnect failed" in errors
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["abort"] == 1
+        assert state["counts"]["disconnect"] == 2
+    finally:
+        harness.close()
+
+
+def test_genuine_outer_finally_restores_heater_once_and_emits_one_diagnostic(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(tmp_path, {"state_path": str(state_path)})
+    try:
+        harness.request("connect", {})
+        harness.request("set_heater_level", {"value": 4})
+        harness._command_parent.send(ExplodingOwnerPayload())
+        assert harness._command_parent.poll(3)
+        diagnostic = harness._command_parent.recv()
+        harness.process.join(3)
+
+        _assert_bounded_cleanup_diagnostic(diagnostic)
+        with pytest.raises(EOFError):
+            harness._command_parent.recv()
+        assert harness.process.exitcode == 0
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["abort"] == 1
+        assert state["counts"]["disconnect"] == 1
+        assert _heater_write_count(state, 2) == 1
+    finally:
+        harness.close()
+
+
+def test_malformed_frame_response_releases_registry_and_publisher_ownership(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {"malformed_frame": True, "state_path": str(state_path)},
+    )
+    try:
+        harness.request("connect", {})
+        response = harness.raw_request(
+            2,
+            "acquire",
+            {
+                "duration_s": 0.001,
+                "roi": {"x": 0, "y": 0, "width": 2, "height": 2},
+                "binning": 1,
+                "readout_mode": 0,
+            },
+        )
+        assert response.error is not None
+        assert response.result is None
+        assert "JSON values" in response.error.message
+        harness._request_id = 2
+        assert harness.request("diagnostics", {})["owned_frame_count"] == 0
+        registry = json.loads(harness.registry_path.read_text(encoding="utf-8"))
+        assert registry == {"frames": []}
+        assert _read_fake_backend_state(state_path)["counts"]["acquire"] == 1
+    finally:
+        harness.close()
 
 
 def test_control_abort_unblocks_a_blocked_acquisition_without_stopping_owner(tmp_path: Path):
@@ -267,3 +482,42 @@ def _capture_acquire_failure(harness: OwnerHarness, failures: list[BaseException
         harness.request("acquire", {"duration_s": 1, "roi": {"x": 0, "y": 0, "width": 2, "height": 2}, "binning": 1, "readout_mode": 0})
     except BaseException as error:
         failures.append(error)
+
+
+def _read_fake_backend_state(path: Path) -> dict[str, object]:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.01)
+            continue
+        assert isinstance(state, dict)
+        return state
+    raise AssertionError("fake backend state was not published")
+
+
+def _heater_write_count(state: dict[str, object], value: int) -> int:
+    events = state["events"]
+    assert isinstance(events, list)
+    return sum(
+        event.get("operation") == "set_heater_level" and event.get("value") == value
+        for event in events
+        if isinstance(event, dict)
+    )
+
+
+def _assert_bounded_cleanup_diagnostic(payload: object) -> None:
+    assert isinstance(payload, dict)
+    assert payload["operation"] == "cleanup"
+    assert payload["request_id"] == 0
+    error = payload["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "cleanup_failed"
+    diagnostics = error["diagnostics"]
+    assert isinstance(diagnostics, dict)
+    errors = diagnostics["errors"]
+    assert isinstance(errors, list)
+    assert 1 <= len(errors) <= 4
+    assert all(isinstance(item, str) and len(item) <= 256 for item in errors)
+    assert len(json.dumps(payload)) <= 2048
