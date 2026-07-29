@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 import sys
 import time
+from threading import Thread
 
 import pytest
 
-from touptek4040.camera_owner import OwnerStartupSpec, camera_owner_main
+from touptek4040.camera_owner import OwnerStartupSpec, _create_toupcam_backend, camera_owner_main
 from touptek4040.owner_protocol import OwnerRequest, decode_response, encode_request
 
 
@@ -49,6 +50,12 @@ class OwnerHarness:
         assert response.error is None, response.error
         assert isinstance(response.result, dict)
         return dict(response.result)
+
+    def raw_request(self, request_id: int, operation: str, arguments: dict[str, object]):
+        request = OwnerRequest(1, self._generation, request_id, operation, arguments)
+        self._command_parent.send(encode_request(request))
+        assert self._command_parent.poll(3)
+        return decode_response(self._command_parent.recv(), request)
 
     def close(self) -> None:
         if self.process.is_alive():
@@ -124,5 +131,51 @@ def test_normal_owner_disconnect_restores_the_connect_time_heater_level(tmp_path
         harness.request("set_heater_level", {"value": 4})
         harness.request("disconnect", {})
         assert restoration_log.read_text(encoding="utf-8") == "2"
+    finally:
+        harness.close()
+
+
+def test_owner_rejects_duplicate_request_ids_before_repeating_a_setter(owner_harness: OwnerHarness):
+    owner_harness.request("connect", {})
+    first = owner_harness.raw_request(50, "set_heater_level", {"value": 3})
+    duplicate = owner_harness.raw_request(50, "set_heater_level", {"value": 4})
+
+    assert first.error is None
+    assert duplicate.error is not None
+    owner_harness._request_id = 50
+    assert owner_harness.request("get_heater_level", {}) == {"value": 3}
+
+
+def test_startup_spec_rejects_non_serializable_backend_arguments():
+    with pytest.raises(ValueError):
+        OwnerStartupSpec(backend_arguments={"nested": [lambda: None]})
+
+
+@pytest.mark.parametrize("serial", [None, "", "WRONG"])
+def test_real_owner_rejects_any_non_approved_identity_before_loading_sdk(serial):
+    with pytest.raises(ValueError):
+        _create_toupcam_backend(serial)
+
+
+def test_control_shutdown_aborts_a_truly_blocked_spawned_acquisition(tmp_path: Path):
+    harness = OwnerHarness(tmp_path, {"block_acquire": True})
+    try:
+        harness.request("connect", {})
+        failure: list[BaseException] = []
+        def acquire() -> None:
+            try:
+                harness.request("acquire", {"duration_s": 1, "roi": {"x": 0, "y": 0, "width": 2, "height": 2}, "binning": 1, "readout_mode": 0})
+            except BaseException as error:
+                failure.append(error)
+        worker = Thread(target=acquire)
+        worker.start()
+        time.sleep(0.1)
+        harness._control_parent.send({"operation": "shutdown"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv()["ok"] is True
+        worker.join(3)
+        harness.process.join(3)
+        assert not harness.process.is_alive()
+        assert failure
     finally:
         harness.close()

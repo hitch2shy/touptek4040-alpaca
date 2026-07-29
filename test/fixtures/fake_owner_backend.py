@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+from threading import Event
+import time
 
 import numpy as np
 
@@ -15,7 +17,7 @@ from touptek4040.errors import CameraInvalidValueError, CameraNotConnectedError
 class FakeOwnerBackend:
     """Small deterministic backend whose process identity is observable."""
 
-    def __init__(self, serial: str | None = None, restore_log_path: str | None = None) -> None:
+    def __init__(self, serial: str | None = None, restore_log_path: str | None = None, block_acquire: bool = False, fail_snapshot: bool = False) -> None:
         self.serial = serial or "FAKE-OWNER"
         self.backend_pid = os.getpid()
         self.connected = False
@@ -26,6 +28,9 @@ class FakeOwnerBackend:
         self.abort_calls = 0
         self.disconnect_calls = 0
         self._restore_log_path = restore_log_path
+        self._block_acquire = block_acquire
+        self._fail_snapshot = fail_snapshot
+        self._abort_requested = Event()
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -42,11 +47,18 @@ class FakeOwnerBackend:
 
     def acquire(self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode, control=None) -> Frame:
         self._require_connected()
+        if self._block_acquire:
+            deadline = time.monotonic() + 10
+            while not self._abort_requested.wait(0.01):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("test acquisition remained blocked")
+            raise RuntimeError("fake acquisition aborted")
         pixels = np.arange(roi.width * roi.height, dtype=np.uint16).reshape(roi.height, roi.width)
         return Frame(pixels, datetime.now(timezone.utc), duration_s, binning, roi, readout_mode, self._gain)
 
     def abort(self) -> None:
         self.abort_calls += 1
+        self._abort_requested.set()
 
     @property
     def gain(self) -> int:
@@ -102,6 +114,9 @@ class FakeOwnerBackend:
     @property
     def heater_level(self) -> int:
         self._require_connected()
+        if self._fail_snapshot:
+            self._fail_snapshot = False
+            raise RuntimeError("snapshot failed")
         return self._heater_level
 
     @heater_level.setter
@@ -120,4 +135,4 @@ def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBack
     restore_log_path = kwargs.get("restore_log_path")
     if restore_log_path is not None and not isinstance(restore_log_path, str):
         raise TypeError("restore_log_path must be a string")
-    return FakeOwnerBackend(serial, restore_log_path)
+    return FakeOwnerBackend(serial, restore_log_path, bool(kwargs.get("block_acquire", False)), bool(kwargs.get("fail_snapshot", False)))

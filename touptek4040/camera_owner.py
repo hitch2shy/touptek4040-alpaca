@@ -19,10 +19,14 @@ from .owner_protocol import (
     OwnerProtocolError,
     OwnerRequest,
     OwnerResponse,
-    PROTOCOL_VERSION,
+PROTOCOL_VERSION,
     decode_request,
 )
 from .shared_frames import SharedFrameRegistry
+
+
+APPROVED_CAMERA_SERIAL = "TP241025143218C92B01151AEC40CB7"
+APPROVED_CAMERA_MODEL = "sMAX16AM-U3-CL-GPS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,14 +49,22 @@ class OwnerStartupSpec:
             raise ValueError("backend_arguments must be a mapping")
         if not all(isinstance(key, str) for key in self.backend_arguments):
             raise ValueError("backend_arguments keys must be strings")
+        if not _is_safe_startup_value(dict(self.backend_arguments)):
+            raise ValueError("backend_arguments must contain only finite JSON values")
         object.__setattr__(self, "backend_arguments", dict(self.backend_arguments))
 
 
 def _create_toupcam_backend(serial: str | None = None, **_kwargs: object) -> OwnerBackend:
     """Import the SDK adapter only after this spawned process has started."""
+    if serial != APPROVED_CAMERA_SERIAL:
+        raise ValueError("real owner requires the approved camera serial")
     from .toupcam_camera import ToupTekCamera
 
-    return ToupTekCamera(serial)
+    camera = ToupTekCamera(serial)
+    if camera.identity.model != APPROVED_CAMERA_MODEL or camera.serial != APPROVED_CAMERA_SERIAL:
+        camera.disconnect()
+        raise ValueError("real owner requires the approved camera model and serial")
+    return camera
 
 
 def camera_owner_main(
@@ -70,6 +82,7 @@ def camera_owner_main(
     owned_descriptors: dict[str, FrameDescriptor] = {}
     stop_requested = Event()
     cleanup_errors: list[str] = []
+    last_request_id = 0
 
     def report_cleanup_error(error: BaseException) -> None:
         if len(cleanup_errors) < 4:
@@ -110,13 +123,22 @@ def camera_owner_main(
                 continue
             operation = message["operation"]
             if operation == "shutdown":
+                if backend is not None:
+                    try:
+                        backend.abort()
+                        control_connection.send({"operation": "shutdown", "ok": True})
+                    except BaseException as error:
+                        control_connection.send({"operation": "shutdown", "ok": False, "error": str(error)[:256]})
                 stop_requested.set()
                 continue
             if operation == "abort" and backend is not None:
                 try:
                     backend.abort()
-                except BaseException:
-                    pass
+                    control_connection.send({"operation": "abort", "ok": True})
+                except BaseException as error:
+                    control_connection.send({"operation": "abort", "ok": False, "error": str(error)[:256]})
+            elif operation != "abort":
+                control_connection.send({"operation": "rejected", "ok": False, "error": "unsupported control operation"})
 
     control_thread: Thread | None = None
     try:
@@ -135,16 +157,23 @@ def camera_owner_main(
                 payload = command_connection.recv()
             except (EOFError, OSError):
                 break
-            response = _handle_command(
-                payload,
-                generation,
-                backend,
-                registry,
-                owned_descriptors,
-                connected,
-                saved_heater_level,
-                disconnect_backend,
-            )
+            try:
+                request: OwnerRequest | None = None
+                request = decode_request(payload)
+                if request.owner_generation != generation:
+                    raise OwnerProtocolError("request belongs to a different owner generation")
+                if request.request_id <= last_request_id:
+                    raise OwnerProtocolError("request_id must increase monotonically")
+                last_request_id = request.request_id
+                response = _handle_command(
+                    payload, generation, backend, registry, owned_descriptors,
+                    connected, saved_heater_level, disconnect_backend,
+                )
+            except BaseException as error:
+                if isinstance(request, OwnerRequest):
+                    response = (_response_payload(request, error=_owner_error(error)), connected, saved_heater_level, False)
+                else:
+                    response = _invalid_payload_response(payload, generation, error)
             connected = bool(response[1])
             saved_heater_level = response[2]
             should_stop = bool(response[3])
@@ -158,7 +187,7 @@ def camera_owner_main(
         report_cleanup_error(error)
     finally:
         stop_requested.set()
-        if backend is not None:
+        if backend is not None and connected:
             try:
                 backend.abort()
             except BaseException as error:
@@ -173,16 +202,6 @@ def camera_owner_main(
                     registry.release(descriptor)
                 except BaseException as error:
                     report_cleanup_error(error)
-        if cleanup_errors:
-            try:
-                command_connection.send(
-                    _response_payload(
-                        OwnerRequest(PROTOCOL_VERSION, generation, 0, "shutdown", {}),
-                        error=OwnerError("cleanup_error", "owner cleanup encountered errors", {"errors": cleanup_errors}),
-                    )
-                )
-            except BaseException:
-                pass
         if control_thread is not None:
             control_thread.join(0.2)
         try:
@@ -222,9 +241,6 @@ def _handle_command(
     except BaseException as error:
         if request is None:
             return _invalid_payload_response(payload, generation, error), connected, saved_heater_level, False
-        if request.operation in {"disconnect", "shutdown"}:
-            connected = False
-            saved_heater_level = None
         return _response_payload(request, error=_owner_error(error)), connected, saved_heater_level, False
 
 
@@ -246,8 +262,12 @@ def _dispatch(
         _require_keys(arguments, set())
         if not connected:
             backend.connect()
+            try:
+                saved_heater_level = backend.heater_level if backend.heater_supported else None
+            except BaseException:
+                backend.disconnect()
+                raise
             connected = True
-            saved_heater_level = backend.heater_level if backend.heater_supported else None
         return {"connected": True}, connected, saved_heater_level, False
     if operation == "disconnect":
         _require_keys(arguments, set())
@@ -260,8 +280,14 @@ def _dispatch(
         duration_s, roi, binning, readout_mode = _acquire_arguments(arguments)
         frame = backend.acquire(duration_s, roi, binning, readout_mode)
         descriptor = registry.publish(frame.pixels, _frame_pixel_metadata(frame))
+        try:
+            result = {"descriptor": _descriptor_payload(descriptor), "frame": _frame_payload(frame)}
+            _response_payload(request, result=result)
+        except BaseException:
+            registry.release(descriptor)
+            raise
         owned_descriptors[descriptor.name] = descriptor
-        return {"descriptor": _descriptor_payload(descriptor), "frame": _frame_payload(frame)}, connected, saved_heater_level, False
+        return result, connected, saved_heater_level, False
     if operation == "abort":
         _require_keys(arguments, set())
         backend.abort()
@@ -413,3 +439,17 @@ def _descriptor_from_payload(payload: object) -> FrameDescriptor:
         raise
     except (TypeError, ValueError) as error:
         raise OwnerProtocolError("descriptor is invalid") from error
+
+
+def _is_safe_startup_value(value: object) -> bool:
+    if value is None or isinstance(value, (bool, str)):
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_safe_startup_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(isinstance(key, str) and _is_safe_startup_value(item) for key, item in value.items())
+    return False
