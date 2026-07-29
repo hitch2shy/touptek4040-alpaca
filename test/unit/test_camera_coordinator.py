@@ -27,7 +27,10 @@ from touptek4040.errors import (
     CameraInvalidValueError,
     CameraNotConnectedError,
     CameraNotSupportedError,
+    CameraOwnerProtocolError,
+    CameraOwnerTerminationError,
     CameraOperationCancelledError,
+    CameraTimeoutError,
 )
 
 
@@ -100,6 +103,11 @@ class ControlledCamera:
         self.max_active_acquisitions = 0
         self.abort_count = 0
         self.abort_error: Exception | None = None
+        self.abort_started = threading.Event()
+        self.abort_release = threading.Event()
+        self.abort_release.set()
+        self.block_abort = False
+        self.release_acquisition_on_abort = False
         self.disconnect_error: Exception | None = None
         self.failure: Exception | None = None
         self._gain = 100
@@ -273,10 +281,18 @@ class ControlledCamera:
 
     def abort(self) -> None:
         self.abort_count += 1
+        self.operation_order.append(("abort-enter",))
+        self.abort_started.set()
+        if self.block_abort:
+            self.abort_release.wait(2.0)
         if self.abort_error is not None:
             if isinstance(self.abort_error, CameraNotConnectedError):
                 self.connected = False
+            self.operation_order.append(("abort-exit", "error"))
             raise self.abort_error
+        if self.release_acquisition_on_abort and self.active_acquisitions:
+            self.release_frame()
+        self.operation_order.append(("abort-exit", "ok"))
 
     @property
     def temperature_c(self) -> float:
@@ -318,6 +334,17 @@ class ControlledCamera:
                 self._acquisition_condition.wait(remaining)
 
 
+class GenerationFailingProxy(ControlledCamera):
+    """Complete camera double for a proxy whose exact owner generation failed."""
+
+    def __init__(self, failure_field: str) -> None:
+        super().__init__()
+        failure = CameraNotConnectedError(
+            "heater response belongs to a failed owner generation"
+        )
+        setattr(self, failure_field, failure)
+
+
 @pytest.fixture
 def controlled_camera():
     camera = ControlledCamera()
@@ -328,6 +355,7 @@ def controlled_camera():
     camera.disconnect_release.set()
     camera.heater_set_release.set()
     camera.heater_level_read_release.set()
+    camera.abort_release.set()
 
 
 @pytest.fixture
@@ -367,6 +395,114 @@ def test_set_connected_sync_opens_and_closes_the_owned_camera(controlled_camera)
 
     assert coordinator.snapshot().connected is False
     assert controlled_camera.connected is False
+
+
+@pytest.mark.parametrize(
+    "failure_field",
+    [
+        "heater_supported_error",
+        "heater_max_level_error",
+        "heater_level_error",
+    ],
+)
+def test_fatal_owner_generation_failure_during_heater_init_rolls_back_connect(
+    failure_field,
+):
+    proxy = GenerationFailingProxy(failure_field)
+    coordinator = CameraCoordinator(lambda _source: proxy, "controlled")
+
+    with pytest.raises(CameraNotConnectedError, match="failed owner generation"):
+        coordinator.set_connected_sync(True)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.connecting is False
+    assert snapshot.camera_state is CameraState.ERROR
+    assert isinstance(snapshot.error, CameraNotConnectedError)
+    assert proxy.disconnect_count == 1
+    assert proxy.connected is False
+    assert coordinator._camera is None
+    with pytest.raises(CameraNotConnectedError):
+        coordinator.heater_snapshot()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CameraTimeoutError("owner heater initialization timed out"),
+        CameraOwnerProtocolError("owner heater response was invalid"),
+        CameraOwnerTerminationError("owner heater termination was unproven"),
+    ],
+    ids=("timeout", "protocol", "termination"),
+)
+def test_equivalent_fatal_heater_init_errors_never_publish_connected(failure):
+    camera = ControlledCamera()
+    camera.heater_supported_error = failure
+    coordinator = CameraCoordinator(lambda _source: camera, "controlled")
+
+    with pytest.raises(type(failure), match=str(failure)):
+        coordinator.set_connected_sync(True)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state is CameraState.ERROR
+    assert isinstance(snapshot.error, type(failure))
+    assert camera.disconnect_count == 1
+    assert coordinator._camera is None
+
+
+def test_fatal_heater_init_and_cleanup_failures_are_both_reported():
+    camera = ControlledCamera()
+    camera.heater_max_level_error = CameraOwnerProtocolError(
+        "owner heater generation failed"
+    )
+    camera.disconnect_error = CameraError("owner cleanup failed")
+    coordinator = CameraCoordinator(lambda _source: camera, "controlled")
+
+    with pytest.raises(CameraCleanupError) as caught:
+        coordinator.set_connected_sync(True)
+
+    assert tuple(type(error) for error in caught.value.errors) == (
+        CameraOwnerProtocolError,
+        CameraError,
+    )
+    assert tuple(str(error) for error in caught.value.errors) == (
+        "owner heater generation failed",
+        "owner cleanup failed",
+    )
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is False
+    assert snapshot.camera_state is CameraState.ERROR
+    assert camera.disconnect_count == 1
+    assert coordinator._camera is camera
+
+
+def test_unsupported_heater_initialization_remains_a_connected_session():
+    camera = ControlledCamera()
+    camera._heater_supported = False
+    coordinator = CameraCoordinator(lambda _source: camera, "controlled")
+
+    coordinator.set_connected_sync(True)
+    snapshot = coordinator.heater_snapshot()
+
+    assert coordinator.snapshot().connected is True
+    assert snapshot.supported is False
+    assert snapshot.maximum is None
+    assert snapshot.level is None
+    coordinator.set_connected_sync(False)
+
+
+def test_nonfatal_heater_capability_read_failure_keeps_camera_connected():
+    camera = ControlledCamera()
+    camera.heater_supported_error = CameraError("optional heater read failed")
+    coordinator = CameraCoordinator(lambda _source: camera, "controlled")
+
+    coordinator.set_connected_sync(True)
+
+    assert coordinator.snapshot().connected is True
+    with pytest.raises(CameraError, match="optional heater read failed"):
+        coordinator.heater_snapshot()
+    coordinator.set_connected_sync(False)
 
 
 def test_start_exposure_is_non_blocking(coordinator, controlled_camera):
@@ -490,6 +626,149 @@ def test_abort_linearizes_before_backend_acquisition_claim(
     assert controlled_camera.acquire_count == 0
     assert coordinator.snapshot().camera_state is CameraState.IDLE
     assert coordinator.frame is None
+
+
+def test_blocking_abort_keeps_heater_and_new_exposure_behind_busy_barrier(
+    coordinator,
+    controlled_camera,
+):
+    controlled_camera.release_acquisition_on_abort = True
+    coordinator.start_exposure(1.0, True)
+    controlled_camera.wait_for_acquisitions(1)
+    controlled_camera.operation_order.clear()
+    controlled_camera.block_abort = True
+    controlled_camera.abort_started.clear()
+    controlled_camera.abort_release.clear()
+    results: dict[str, list[object]] = {
+        "abort": [],
+        "read": [],
+        "write": [],
+        "start": [],
+    }
+    errors: dict[str, list[BaseException]] = {
+        key: [] for key in results
+    }
+
+    def captured(name, operation) -> None:
+        try:
+            results[name].append(operation())
+        except BaseException as error:
+            errors[name].append(error)
+
+    aborter = threading.Thread(
+        target=captured,
+        args=("abort", coordinator.abort_exposure),
+    )
+    aborter.start()
+    assert controlled_camera.abort_started.wait(1)
+
+    workers = [
+        threading.Thread(
+            target=captured,
+            args=("read", coordinator.heater_snapshot),
+        ),
+        threading.Thread(
+            target=captured,
+            args=(
+                "write",
+                lambda: coordinator.set_heater_level_confirmed_if_idle(2),
+            ),
+        ),
+        threading.Thread(
+            target=captured,
+            args=("start", lambda: coordinator.start_exposure(0.1, True)),
+        ),
+    ]
+    for worker in workers:
+        worker.start()
+        worker.join(1)
+
+    during_abort = coordinator.snapshot()
+    camera_order_during_abort = list(controlled_camera.operation_order)
+    controlled_camera.abort_release.set()
+    aborter.join(1)
+    for worker in workers:
+        worker.join(1)
+    controlled_camera.release_frame()
+    controlled_camera.release_frame()
+    wait_until(lambda: controlled_camera.active_acquisitions == 0)
+
+    assert not aborter.is_alive()
+    assert all(not worker.is_alive() for worker in workers)
+    assert during_abort.camera_state is CameraState.EXPOSING
+    assert during_abort.image_ready is False
+    assert camera_order_during_abort == [("abort-enter",)]
+    assert controlled_camera.operation_order == [
+        ("abort-enter",),
+        ("abort-exit", "ok"),
+    ]
+    assert results["abort"] == [None]
+    assert errors["abort"] == []
+    assert len(results["read"]) == 1
+    assert isinstance(results["read"][0], HeaterSnapshot)
+    assert errors["read"] == []
+    assert results["write"] == []
+    assert len(errors["write"]) == 1
+    assert isinstance(errors["write"][0], CameraBusyError)
+    assert results["start"] == []
+    assert len(errors["start"]) == 1
+    assert isinstance(errors["start"][0], CameraBusyError)
+    assert coordinator.snapshot().camera_state is CameraState.IDLE
+
+
+@pytest.mark.parametrize(
+    ("abort_error", "expected_connected", "expected_state"),
+    [
+        (CameraError("abort failed"), True, CameraState.EXPOSING),
+        (
+            CameraNotConnectedError("camera disconnected"),
+            False,
+            CameraState.ERROR,
+        ),
+        (
+            CameraTimeoutError("owner abort timed out"),
+            False,
+            CameraState.ERROR,
+        ),
+        (
+            CameraOwnerProtocolError("owner generation failed"),
+            False,
+            CameraState.ERROR,
+        ),
+        (
+            CameraOwnerTerminationError("owner termination unproven"),
+            False,
+            CameraState.ERROR,
+        ),
+    ],
+    ids=(
+        "device-error",
+        "not-connected",
+        "owner-timeout",
+        "owner-protocol",
+        "owner-termination",
+    ),
+)
+def test_abort_failure_publishes_error_and_session_connectivity(
+    coordinator,
+    controlled_camera,
+    abort_error,
+    expected_connected,
+    expected_state,
+):
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    controlled_camera.abort_error = abort_error
+
+    with pytest.raises(type(abort_error), match=str(abort_error)):
+        coordinator.abort_exposure()
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.connected is expected_connected
+    assert snapshot.camera_state is expected_state
+    assert isinstance(snapshot.error, type(abort_error))
+    assert snapshot.image_ready is False
+    controlled_camera.release_frame()
 
 
 def test_percent_completed_is_available_only_during_exposure(

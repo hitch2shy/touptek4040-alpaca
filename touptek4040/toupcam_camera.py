@@ -904,6 +904,13 @@ class ToupTekCamera:
         state: _PersistentNativeState,
     ) -> None:
         current = self._snapshot_persistent_native_state(handle)
+        if state.heater_level is not None and (
+            current.heater_max_level is None
+            or state.heater_level > current.heater_max_level
+        ):
+            raise CameraError(
+                "saved heater level exceeds the fresh handle maximum"
+            )
         if current.gain != state.gain:
             handle.put_ExpoAGain(state.gain)
         if current.exposure_us != state.exposure_us:
@@ -928,13 +935,6 @@ class ToupTekCamera:
         if current.vflip != state.vflip:
             handle.put_VFlip(state.vflip)
         if state.heater_level is not None:
-            if (
-                current.heater_max_level is None
-                or state.heater_level > current.heater_max_level
-            ):
-                raise CameraError(
-                    "saved heater level exceeds the fresh handle maximum"
-                )
             if current.heater_level != state.heater_level:
                 handle.put_Option(
                     self._sdk.TOUPCAM_OPTION_HEAT,

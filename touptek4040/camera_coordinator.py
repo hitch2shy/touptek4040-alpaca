@@ -27,6 +27,8 @@ from .errors import (
     CameraInvalidValueError,
     CameraNotConnectedError,
     CameraNotSupportedError,
+    CameraOwnerProtocolError,
+    CameraOwnerTerminationError,
     CameraOperationCancelledError,
     CameraTimeoutError,
     safe_camera_error,
@@ -405,10 +407,6 @@ class CameraCoordinator:
                 return
             self._session_id += 1
             abort_session = self._session_id
-            self._state = CameraState.IDLE
-            self._error = None
-            self._clear_formal_image_locked()
-            self._publish_changed_locked()
         try:
             camera.abort()
         except BaseException as error:
@@ -419,14 +417,29 @@ class CameraCoordinator:
                     and self._connected
                     and self._camera is camera
                 ):
-                    self._state = CameraState.ERROR
                     self._error = translated
-                    if _contains_not_connected(translated):
+                    if _is_session_ending_error(translated):
+                        self._state = CameraState.ERROR
                         self._connected = False
                         self._connection_target = False
                         self._invalidate_heater_cache_locked()
+                        self._clear_formal_image_locked()
+                        self._exposure_started_monotonic = None
+                        self._exposure_duration_s = None
                     self._publish_changed_locked()
             raise translated from error
+        with self._condition:
+            if (
+                self._session_id == abort_session
+                and self._connected
+                and self._camera is camera
+            ):
+                self._state = CameraState.IDLE
+                self._error = None
+                self._clear_formal_image_locked()
+                self._exposure_started_monotonic = None
+                self._exposure_duration_s = None
+                self._publish_changed_locked()
 
     def start_preview(self, callback: Callable[[Frame], None]) -> None:
         if not callable(callback):
@@ -592,6 +605,7 @@ class CameraCoordinator:
     def _connect_worker(self, generation: int) -> None:
         camera: CameraContract | None = None
         error: CameraError | None = None
+        fatal_heater_error: CameraError | None = None
         with self._lifecycle_lock:
             with self._condition:
                 current = (
@@ -680,17 +694,24 @@ class CameraCoordinator:
                     and self._connection_target is True
                 )
                 if current and error is None and camera is not None:
-                    self._camera = camera
                     try:
                         self._read_heater_snapshot_locked(camera)
-                    except BaseException:
+                    except BaseException as caught:
                         self._invalidate_heater_cache_locked()
-                    self._connected = True
-                    self._connecting = False
-                    self._state = CameraState.IDLE
-                    self._error = None
-                    self._lifecycle_errors.clear()
-                    self._publish_changed_locked()
+                        heater_error = _camera_error(
+                            caught,
+                            "initialize heater state",
+                        )
+                        if _is_session_ending_error(heater_error):
+                            fatal_heater_error = heater_error
+                    if fatal_heater_error is None:
+                        self._camera = camera
+                        self._connected = True
+                        self._connecting = False
+                        self._state = CameraState.IDLE
+                        self._error = None
+                        self._lifecycle_errors.clear()
+                        self._publish_changed_locked()
                 elif current:
                     self._camera = None
                     self._connected = False
@@ -700,6 +721,46 @@ class CameraCoordinator:
                     self._error = error or CameraError("connect camera failed")
                     self._lifecycle_errors.clear()
                     self._publish_changed_locked()
+            if fatal_heater_error is not None and camera is not None:
+                cleanup_errors: list[CameraError] = []
+                try:
+                    camera.disconnect()
+                except BaseException as cleanup_error:
+                    _append_error(
+                        cleanup_errors,
+                        _camera_error(
+                            cleanup_error,
+                            "disconnect failed camera initialization",
+                        ),
+                    )
+                with self._condition:
+                    current = (
+                        generation == self._connection_generation
+                        and self._connection_target is True
+                    )
+                    all_errors = _unique_errors(
+                        [fatal_heater_error, *cleanup_errors]
+                    )
+                    if current:
+                        self._camera = camera if cleanup_errors else None
+                        self._connected = False
+                        self._invalidate_heater_cache_locked()
+                        self._connecting = False
+                        self._state = CameraState.ERROR
+                        self._error = _combined_error(
+                            "camera initialization failed",
+                            all_errors,
+                        )
+                        self._lifecycle_errors.clear()
+                        self._publish_changed_locked()
+                    elif cleanup_errors:
+                        self._camera = camera
+                        self._connected = False
+                        self._invalidate_heater_cache_locked()
+                        self._lifecycle_errors[:] = _unique_errors(
+                            [*self._lifecycle_errors, *all_errors]
+                        )
+                return
             if not current and camera is not None:
                 cleanup_errors: list[CameraError] = []
                 try:
@@ -1367,6 +1428,28 @@ def _contains_not_connected(error: CameraError) -> bool:
             return True
         if isinstance(error, CameraCleanupError):
             return any(_contains_not_connected(nested) for nested in error.errors)
+    except BaseException:
+        return False
+    return False
+
+
+def _is_session_ending_error(error: CameraError) -> bool:
+    try:
+        if isinstance(
+            error,
+            (
+                CameraNotConnectedError,
+                CameraTimeoutError,
+                CameraOwnerProtocolError,
+                CameraOwnerTerminationError,
+            ),
+        ):
+            return True
+        if isinstance(error, CameraCleanupError):
+            return any(
+                _is_session_ending_error(nested)
+                for nested in error.errors
+            )
     except BaseException:
         return False
     return False

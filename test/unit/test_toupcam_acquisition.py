@@ -425,6 +425,49 @@ def test_structural_reopen_heater_snapshot_failure_keeps_old_handle_owned() -> N
     assert len(sdk.Toupcam.handles) == opens_before
 
 
+def test_structural_reopen_fresh_heater_max_read_failure_has_zero_writes() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    device = sdk.Toupcam.EnumV2()[0]
+    device.model.flag |= FLAG_HEAT
+    sdk.Toupcam.EnumV2 = lambda: [device]
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    old_handle = camera._handle
+    old_handle.gain = 321
+    old_handle.exposure_us = 54_321
+    old_handle.auto_exposure = False
+    old_handle.options[OPTION_TECTARGET] = -123
+    old_handle.options[OPTION_TEC] = 0
+    old_handle.options[OPTION_FAN] = 3
+    old_handle.options[OPTION_ROTATE] = 180
+    old_handle.options[OPTION_TEC_VOLTAGE_MAX] = 88
+    old_handle.options[OPTION_HEAT] = 4
+    old_handle.hflip = True
+    old_handle.vflip = True
+
+    def fail_fresh_heater_maximum_read(handle) -> None:
+        handle.get_option_errors[OPTION_HEAT_MAX] = FakeHResultError(E_FAIL)
+
+    sdk.next_open_setup = fail_fresh_heater_maximum_read
+    sdk.calls.clear()
+
+    with pytest.raises(CameraError, match="replay camera state"):
+        camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    fresh_handle = sdk.Toupcam.handle
+    open_index = sdk.calls.index(("Open", f"sn:{camera.serial}"))
+    fresh_calls = sdk.calls[open_index + 1 :]
+    assert fresh_handle.closed is True
+    assert camera._handle is None
+    assert not any(call[0].startswith("put_") for call in fresh_calls)
+    assert old_handle.gain == 321
+    assert old_handle.options[OPTION_TECTARGET] == -123
+    assert old_handle.options[OPTION_TEC] == 0
+    assert old_handle.options[OPTION_FAN] == 3
+    assert old_handle.options[OPTION_HEAT] == 4
+
+
 def test_structural_reopen_rejects_heater_level_above_fresh_maximum() -> None:
     sdk = FakeSdk(fresh_handles=True)
     device = sdk.Toupcam.EnumV2()[0]
@@ -433,22 +476,39 @@ def test_structural_reopen_rejects_heater_level_above_fresh_maximum() -> None:
     camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
     camera.connect()
     camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
-    camera._handle.options[OPTION_HEAT] = 4
+    old_handle = camera._handle
+    old_handle.gain = 321
+    old_handle.exposure_us = 54_321
+    old_handle.auto_exposure = False
+    old_handle.options[OPTION_TECTARGET] = -123
+    old_handle.options[OPTION_TEC] = 0
+    old_handle.options[OPTION_FAN] = 3
+    old_handle.options[OPTION_ROTATE] = 180
+    old_handle.options[OPTION_TEC_VOLTAGE_MAX] = 88
+    old_handle.options[OPTION_HEAT] = 4
+    old_handle.hflip = True
+    old_handle.vflip = True
 
     def lower_fresh_heater_maximum(handle) -> None:
         handle.options[OPTION_HEAT_MAX] = 3
 
     sdk.next_open_setup = lower_fresh_heater_maximum
+    sdk.calls.clear()
 
     with pytest.raises(CameraError, match="heater"):
         camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
 
     fresh_handle = sdk.Toupcam.handle
+    open_index = sdk.calls.index(("Open", f"sn:{camera.serial}"))
+    fresh_calls = sdk.calls[open_index + 1 :]
     assert fresh_handle.closed is True
     assert camera._handle is None
-    assert not any(
-        call[:2] == ("put_Option", OPTION_HEAT) for call in sdk.calls
-    )
+    assert not any(call[0].startswith("put_") for call in fresh_calls)
+    assert old_handle.gain == 321
+    assert old_handle.options[OPTION_TECTARGET] == -123
+    assert old_handle.options[OPTION_TEC] == 0
+    assert old_handle.options[OPTION_FAN] == 3
+    assert old_handle.options[OPTION_HEAT] == 4
 
 
 def test_structural_reopen_replay_failure_closes_and_quarantines_fresh_handle() -> None:
