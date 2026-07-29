@@ -1,0 +1,242 @@
+ToupTek 4040 ASCOM Alpaca 相机软件
+临时测试版使用说明
+================================
+
+一、版本性质
+------------
+
+这是便携式临时测试版，用于验证 sMAX16AM-U3-CL-GPS 相机与 ASCOM Alpaca、
+网页控制台和本地诊断界面的基本功能。
+
+本临时版仍在主程序进程内调用 ToupTek SDK，尚未启用正式版计划中的相机
+owner 子进程硬隔离。原生 SDK 调用在异常情况下可能使程序无响应。本版本
+不能作为无人值守正式发布版使用。
+
+
+二、支持的相机与环境
+--------------------
+
+操作系统：64 位 Windows 10 或 Windows 11
+相机型号：sMAX16AM-U3-CL-GPS
+传感器分辨率：4096 × 4096
+像元尺寸：9.0 µm × 9.0 µm
+批准的相机序列号：TP241025143218C92B01151AEC40CB7
+
+请先安装 ToupTek 官方相机驱动，再连接相机 USB 3.0 数据线和供电。
+程序只接受配置文件中指定的真实相机。真实相机连接失败时，程序不会自动
+切换到模拟器。
+
+
+三、解压与文件
+--------------
+
+将 ToupTek4040-Test.zip 完整解压到一个可写目录，不要直接在 ZIP 压缩包
+内运行。
+
+主要文件：
+
+ToupTek4040GUI.exe       本地相机诊断工具
+ToupTek4040Alpaca.exe    ASCOM Alpaca 服务和网页图像控制台
+toupcam.dll              ToupTek 64 位相机运行库
+touptek4040.json         程序配置
+使用说明.txt             本说明
+BUILD-INFO.txt           构建提交、时间和测试版标识
+_runtime                 Python 与程序运行依赖，请勿改名或删除
+
+同一台真实相机同一时间只能由一个程序占用。运行 GUI 前必须关闭 Alpaca
+服务；运行 Alpaca 服务前必须关闭 GUI、N.I.N.A. 中已有的相机连接以及其他
+ToupTek 相机软件。
+
+
+四、touptek4040.json 配置
+-------------------------
+
+程序默认读取与 EXE 同目录的 touptek4040.json。
+
+server.host
+  Alpaca HTTP 监听地址。0.0.0.0 表示允许本机所有网卡，测试时可改为
+  127.0.0.1，仅允许本机访问。
+
+server.port
+  Alpaca HTTP 端口，默认 11111。
+
+server.discovery_port
+  ASCOM Alpaca UDP 发现端口，默认 32227。
+
+camera.source
+  toupcam 表示真实相机，sim 表示模拟器。正式观测应使用 toupcam。
+
+camera.serial
+  目标真实相机序列号：
+  TP241025143218C92B01151AEC40CB7
+
+camera.readout_mode
+  RAW 12-bit 或 RAW 8-bit。
+
+camera.gain
+  null 表示连接后读取/保留设备增益；也可填写允许范围内的整数。
+
+owner.*
+  这是正式 owner 隔离版使用的超时配置。本临时版尚未提供完整的进程级
+  卡死隔离，请不要把这些值理解为当前版本能够终止所有 SDK 卡死。
+
+web.enabled
+  true 启用网页控制台。
+
+logging.level
+  INFO、DEBUG、WARNING 或 ERROR。
+
+logging.directory
+  日志目录。默认 logs，位于解压目录下。
+
+security.trusted_lan_only
+  true 表示只接受可信本机/局域网使用方式。不要把测试服务直接暴露到互联网。
+
+修改 JSON 后请保存为 UTF-8，并重新启动程序。JSON 键名、大小写和数据类型
+必须正确，未知字段或重复字段会被拒绝。
+
+
+五、本地 GUI 使用
+----------------
+
+1. 确认 Alpaca 服务、N.I.N.A. 和其他相机程序均已关闭。
+2. 双击 ToupTek4040GUI.exe。
+3. 检查窗口上方显示的 Source 和 Serial。
+4. 点击 Connect。
+5. 初次测试建议：
+   RAW mode       RAW 12-bit
+   Gain           100
+   Binning        1
+   Exposure (s)   0.1
+   ROI X / Y      0 / 0
+   ROI width      512
+   ROI height     512
+6. 点击 One exposure 进行一次曝光。
+7. 点击 Start preview 开始连续预览采集，点击 Stop preview 停止。
+8. 使用 Apply cooling 设置目标温度与 Cooler 状态。
+9. 必要时点击 Abort 中止曝光。
+10. 完成后点击 Disconnect，再关闭窗口。
+
+注意：当前 GUI 的 Preview 区只显示帧尺寸和灰度范围统计，不显示实际像素
+画面。要查看实时图像，请使用下一节的网页控制台。
+
+
+六、Alpaca 服务与网页图像
+------------------------
+
+1. 确认 GUI 和其他相机程序已关闭。
+2. 双击 ToupTek4040Alpaca.exe。
+3. 保持服务窗口运行。
+4. 在本机浏览器打开：
+
+   http://127.0.0.1:11111/ui/
+
+5. 点击 Connect。
+6. 初次测试建议先设置 512 × 512 ROI、Bin 1、RAW 12-bit 和 0.1 秒曝光。
+7. 点击 Start preview 查看实际相机图像；再次点击可停止预览。
+8. 可调整黑场/白场显示范围、查看统计和指定像素值。
+9. One exposure 用于正式单次曝光。
+10. FITS 下载用于保存当前图像。
+11. 使用完毕后点击 Disconnect，再关闭 Alpaca 服务窗口。
+
+如果浏览器打不开：
+
+- 确认 ToupTek4040Alpaca.exe 仍在运行；
+- 确认端口 11111 未被其他程序占用；
+- 检查 Windows 防火墙；
+- 检查 touptek4040.json 中 web.enabled 为 true；
+- 只在本机测试时，将 server.host 设置为 127.0.0.1。
+
+
+七、N.I.N.A. 连接
+----------------
+
+先启动 ToupTek4040Alpaca.exe，然后在 N.I.N.A. 中添加 ASCOM Alpaca Camera：
+
+协议/主机：HTTP / 127.0.0.1
+端口：11111
+设备类型：Camera
+设备编号：0
+
+连接顺序：
+
+1. 启动 Alpaca 服务；
+2. 在网页控制台确认 Connect 和短曝光正常；
+3. 网页中 Disconnect；
+4. 再由 N.I.N.A. 连接 Camera 0。
+
+不要让网页、N.I.N.A. 和 GUI 同时争用真实相机。
+
+
+八、图像参数
+------------
+
+RAW 12-bit
+  推荐科学成像模式，像素值范围通常为 0–4095，传输使用 uint16 容器。
+
+RAW 8-bit
+  数据量较小，像素值范围 0–255，适合快速测试。
+
+ROI
+  StartX、StartY、宽度和高度必须位于 4096 × 4096 传感器范围内。首次测试
+  使用 512 × 512 或更小 ROI，确认稳定后再逐步扩大。
+
+Binning
+  支持原生 Bin 1–8；部分尺寸可能使用软件回退。改变 RAW 模式、Bin 或
+  全幅结构时，临时版可能需要重配相机。
+
+曝光
+  普通亮场曝光必须大于零。暗场/偏置由 ASCOM Camera 规则处理并可能钳制
+  到相机最短曝光时间。
+
+制冷
+  设置目标温度后启用 Cooler。观察 Sensor temperature 和 Cooler power，
+  不要在有结露风险的环境中快速降温。
+
+
+九、日志与故障报告
+------------------
+
+日志默认位于解压目录的 logs 文件夹。提交问题时请附上：
+
+- BUILD-INFO.txt；
+- logs 中与故障时间对应的日志；
+- 使用的 touptek4040.json（确认其中没有自行加入的敏感信息）；
+- 操作步骤、RAW 模式、Bin、ROI、曝光和增益；
+- 是否使用 GUI、网页或 N.I.N.A.；
+- 相机和 USB 是否重新插拔过。
+
+
+十、程序无响应时的恢复
+----------------------
+
+由于这是未完成 owner 进程隔离的临时测试版，SDK 的 Open、Trigger、Close
+等原生调用仍可能使整个应用无响应。
+
+恢复步骤：
+
+1. 等待当前短曝光的合理完成时间；
+2. 尝试正常关闭该应用；
+3. 如果无法关闭，只结束无响应的 ToupTek4040GUI.exe 或
+   ToupTek4040Alpaca.exe 进程，不要结束无关 Python 或相机程序；
+4. 必要时断开并重新连接相机 USB；
+5. 重新启动一个应用；
+6. 明确点击 Connect，不要假定原连接仍然有效；
+7. 先用 RAW12、Bin 1、16 × 16 或 512 × 512 小 ROI 做短曝光检查。
+
+不要在临时版中反复执行已知高风险的 RAW12/Bin8 全幅结构切换。
+
+
+十一、正式版后续
+--------------
+
+临时测试包交付后会继续完成相机 owner 子进程隔离。正式版的目标是：
+
+- 所有真实 ToupTek SDK 调用只在受监督的 owner 子进程中运行；
+- Open、Trigger、Close 卡死时只终止准确的 owner 进程；
+- 超时曝光不自动重试、不发布图像；
+- 新 owner 保持断开，用户必须重新 Connect；
+- 使用共享内存传输 4096 × 4096 图像；
+- 重新运行真实硬件矩阵和 ASCOM ConformU。
+
+正式版将单独标识，不会把本临时包冒充为最终发布版。
