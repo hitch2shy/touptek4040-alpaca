@@ -15,7 +15,11 @@ from touptek4040.camera_contract import (
     ReadoutMode,
     Roi,
 )
-from touptek4040.camera_coordinator import CameraCoordinator, CameraState
+from touptek4040.camera_coordinator import (
+    CameraCoordinator,
+    CameraState,
+    HeaterSnapshot,
+)
 from touptek4040.errors import (
     CameraBusyError,
     CameraCleanupError,
@@ -53,6 +57,17 @@ def wait_until(predicate, timeout: float = 1.0) -> None:
         if time.monotonic() >= deadline:
             raise AssertionError("condition was not reached before timeout")
         time.sleep(0.005)
+
+
+def run_captured(
+    operation,
+    results: list[object],
+    errors: list[BaseException],
+) -> None:
+    try:
+        results.append(operation())
+    except BaseException as error:
+        errors.append(error)
 
 
 class ControlledCamera:
@@ -97,9 +112,17 @@ class ControlledCamera:
         self.heater_set_started = threading.Event()
         self.heater_set_release = threading.Event()
         self.heater_set_release.set()
+        self.heater_level_read_started = threading.Event()
+        self.heater_level_read_release = threading.Event()
+        self.heater_level_read_release.set()
         self.block_heater_set = False
+        self.block_heater_level_read = False
         self.active_heater_sets = 0
         self.max_active_heater_sets = 0
+        self.heater_supported_error: Exception | None = None
+        self.heater_max_level_error: Exception | None = None
+        self.heater_level_error: Exception | None = None
+        self.heater_set_error: Exception | None = None
         self.gain_error: Exception | None = None
         self.block_gain = False
         self.gain_started = threading.Event()
@@ -205,20 +228,33 @@ class ControlledCamera:
     @property
     def heater_supported(self) -> bool:
         self.heater_capability_reads += 1
+        self.operation_order.append(("heater-supported",))
+        if self.heater_supported_error is not None:
+            raise self.heater_supported_error
         return self._heater_supported
 
     @property
     def heater_max_level(self) -> int:
         self.heater_capability_reads += 1
+        self.operation_order.append(("heater-max",))
+        if self.heater_max_level_error is not None:
+            raise self.heater_max_level_error
         return self._heater_max_level
 
     @property
     def heater_level(self) -> int:
         self.heater_level_reads += 1
+        self.operation_order.append(("heater-level", self._heater_level))
+        self.heater_level_read_started.set()
+        if self.block_heater_level_read:
+            self.heater_level_read_release.wait(2.0)
+        if self.heater_level_error is not None:
+            raise self.heater_level_error
         return self._heater_level
 
     @heater_level.setter
     def heater_level(self, value: int) -> None:
+        self.operation_order.append(("heater-set", value))
         self.heater_set_started.set()
         self.active_heater_sets += 1
         self.max_active_heater_sets = max(
@@ -228,6 +264,8 @@ class ControlledCamera:
         try:
             if self.block_heater_set:
                 self.heater_set_release.wait(2.0)
+            if self.heater_set_error is not None:
+                raise self.heater_set_error
             self._heater_level = value
             self.heater_writes.append(value)
         finally:
@@ -289,6 +327,7 @@ def controlled_camera():
     camera.connect_release.set()
     camera.disconnect_release.set()
     camera.heater_set_release.set()
+    camera.heater_level_read_release.set()
 
 
 @pytest.fixture
@@ -365,6 +404,7 @@ def test_exposure_worker_applies_gain_then_acquires_with_frozen_settings(
         readout_mode=ReadoutMode.RAW8,
         gain=1650,
     )
+    controlled_camera.operation_order.clear()
 
     coordinator.start_exposure(
         0.25,
@@ -823,33 +863,349 @@ def test_concurrent_heater_writes_share_the_coordinator_linearization_point(
     coordinator,
     controlled_camera,
 ):
-    controlled_camera.block_heater_set = True
-    controlled_camera.heater_set_release.clear()
+    controlled_camera.operation_order.clear()
+    controlled_camera.block_heater_level_read = True
+    controlled_camera.heater_level_read_started.clear()
+    controlled_camera.heater_level_read_release.clear()
+    first_results: list[object] = []
+    second_results: list[object] = []
+    thread_errors: list[BaseException] = []
     first = threading.Thread(
-        target=coordinator.set_heater_level_if_idle,
-        args=(1,),
+        target=run_captured,
+        args=(
+            lambda: coordinator.set_heater_level_confirmed_if_idle(1),
+            first_results,
+            thread_errors,
+        ),
     )
     second = threading.Thread(
-        target=coordinator.set_heater_level_if_idle,
-        args=(2,),
+        target=run_captured,
+        args=(
+            lambda: coordinator.set_heater_level_confirmed_if_idle(2),
+            second_results,
+            thread_errors,
+        ),
     )
 
     first.start()
-    assert controlled_camera.heater_set_started.wait(1)
+    assert controlled_camera.heater_level_read_started.wait(1)
     second.start()
     time.sleep(0.05)
 
-    assert controlled_camera.max_active_heater_sets == 1
-    assert controlled_camera.heater_writes == []
+    assert controlled_camera.heater_writes == [1]
+    assert second_results == []
 
-    controlled_camera.heater_set_release.set()
+    controlled_camera.heater_level_read_release.set()
     first.join(1)
     second.join(1)
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert controlled_camera.max_active_heater_sets == 1
+    assert thread_errors == []
     assert controlled_camera.heater_writes == [1, 2]
+    assert controlled_camera.operation_order == [
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-set", 1),
+        ("heater-level", 1),
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-set", 2),
+        ("heater-level", 2),
+    ]
+    assert len(first_results) == len(second_results) == 1
+    first_snapshot = first_results[0]
+    second_snapshot = second_results[0]
+    assert isinstance(first_snapshot, HeaterSnapshot)
+    assert isinstance(second_snapshot, HeaterSnapshot)
+    assert first_snapshot.level == 1
+    assert second_snapshot.level == 2
+    assert first_snapshot.sequence < second_snapshot.sequence
+
+
+def test_heater_read_holds_idle_barrier_until_complete_before_exposure(
+    coordinator,
+    controlled_camera,
+):
+    controlled_camera.operation_order.clear()
+    controlled_camera._heater_level = 3
+    controlled_camera.block_heater_level_read = True
+    controlled_camera.heater_level_read_started.clear()
+    controlled_camera.heater_level_read_release.clear()
+    read_results: list[object] = []
+    start_results: list[object] = []
+    thread_errors: list[BaseException] = []
+    reader = threading.Thread(
+        target=run_captured,
+        args=(coordinator.heater_snapshot, read_results, thread_errors),
+    )
+    starter = threading.Thread(
+        target=run_captured,
+        args=(
+            lambda: coordinator.start_exposure(0.1, True),
+            start_results,
+            thread_errors,
+        ),
+    )
+
+    reader.start()
+    assert controlled_camera.heater_level_read_started.wait(1)
+    starter.start()
+    time.sleep(0.05)
+
+    assert controlled_camera.acquire_count == 0
+    assert start_results == []
+
+    controlled_camera.heater_level_read_release.set()
+    reader.join(1)
+    starter.join(1)
+    controlled_camera.wait_for_acquisitions(1)
+
+    assert thread_errors == []
+    assert read_results == [
+        HeaterSnapshot(
+            connection_generation=1,
+            sequence=2,
+            supported=True,
+            maximum=5,
+            level=3,
+        )
+    ]
+    assert start_results == [None]
+    assert controlled_camera.operation_order[:5] == [
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-level", 3),
+        ("gain", 100),
+        (
+            "acquire",
+            0.1,
+            Roi(0, 0, 8, 6),
+            1,
+            ReadoutMode.RAW12,
+            100,
+        ),
+    ]
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+def test_heater_write_and_readback_hold_idle_barrier_before_exposure(
+    coordinator,
+    controlled_camera,
+):
+    controlled_camera.operation_order.clear()
+    controlled_camera.block_heater_level_read = True
+    controlled_camera.heater_level_read_started.clear()
+    controlled_camera.heater_level_read_release.clear()
+    write_results: list[object] = []
+    start_results: list[object] = []
+    thread_errors: list[BaseException] = []
+    writer = threading.Thread(
+        target=run_captured,
+        args=(
+            lambda: coordinator.set_heater_level_confirmed_if_idle(4),
+            write_results,
+            thread_errors,
+        ),
+    )
+    starter = threading.Thread(
+        target=run_captured,
+        args=(
+            lambda: coordinator.start_exposure(0.1, True),
+            start_results,
+            thread_errors,
+        ),
+    )
+
+    writer.start()
+    assert controlled_camera.heater_level_read_started.wait(1)
+    starter.start()
+    time.sleep(0.05)
+
+    assert controlled_camera.acquire_count == 0
+    assert start_results == []
+
+    controlled_camera.heater_level_read_release.set()
+    writer.join(1)
+    starter.join(1)
+    controlled_camera.wait_for_acquisitions(1)
+
+    assert thread_errors == []
+    assert len(write_results) == 1
+    confirmed = write_results[0]
+    assert isinstance(confirmed, HeaterSnapshot)
+    assert confirmed.level == 4
+    assert start_results == [None]
+    assert controlled_camera.operation_order[:6] == [
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-set", 4),
+        ("heater-level", 4),
+        ("gain", 100),
+        (
+            "acquire",
+            0.1,
+            Roi(0, 0, 8, 6),
+            1,
+            ReadoutMode.RAW12,
+            100,
+        ),
+    ]
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+def test_first_heater_read_during_exposure_uses_connect_session_cache(
+):
+    controlled_camera = ControlledCamera()
+    controlled_camera._heater_level = 3
+    coordinator = CameraCoordinator(
+        lambda _source: controlled_camera,
+        "controlled",
+    )
+    coordinator.set_connected_sync(True)
+    connect_reads = (
+        controlled_camera.heater_capability_reads,
+        controlled_camera.heater_level_reads,
+    )
+    controlled_camera.operation_order.clear()
+
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    snapshot = coordinator.heater_snapshot()
+
+    assert snapshot.supported is True
+    assert snapshot.maximum == 5
+    assert snapshot.level == 3
+    assert snapshot.connection_generation == 1
+    assert (
+        controlled_camera.heater_capability_reads,
+        controlled_camera.heater_level_reads,
+    ) == connect_reads
+    assert not any(
+        entry[0].startswith("heater-")
+        for entry in controlled_camera.operation_order
+    )
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+    coordinator.set_connected_sync(False)
+
+
+@pytest.mark.parametrize(
+    ("failure_field", "operation"),
+    [
+        ("heater_supported_error", "read"),
+        ("heater_max_level_error", "read"),
+        ("heater_level_error", "read"),
+        ("heater_set_error", "write"),
+    ],
+)
+def test_heater_failure_invalidates_cache_before_exposure(
+    coordinator,
+    controlled_camera,
+    failure_field,
+    operation,
+):
+    setattr(controlled_camera, failure_field, CameraError("heater failure"))
+
+    with pytest.raises(CameraError, match="heater failure"):
+        if operation == "write":
+            coordinator.set_heater_level_confirmed_if_idle(2)
+        else:
+            coordinator.heater_snapshot()
+
+    reads_after_failure = (
+        controlled_camera.heater_capability_reads,
+        controlled_camera.heater_level_reads,
+        len(controlled_camera.heater_writes),
+    )
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+
+    with pytest.raises(CameraBusyError, match="heater state is unavailable"):
+        coordinator.heater_snapshot()
+
+    assert (
+        controlled_camera.heater_capability_reads,
+        controlled_camera.heater_level_reads,
+        len(controlled_camera.heater_writes),
+    ) == reads_after_failure
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+def test_abort_disconnect_invalidates_the_exact_session_heater_cache(
+    coordinator,
+    controlled_camera,
+):
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    controlled_camera.abort_error = CameraNotConnectedError(
+        "camera disconnected during abort"
+    )
+
+    with pytest.raises(CameraNotConnectedError):
+        coordinator.abort_exposure()
+
+    assert coordinator.snapshot().connected is False
+    with pytest.raises(CameraNotConnectedError):
+        coordinator.heater_snapshot()
+    controlled_camera.release_frame()
+
+
+@pytest.mark.parametrize(
+    ("second_supported", "second_maximum", "second_level"),
+    [
+        (True, 2, 1),
+        (False, None, None),
+    ],
+)
+def test_reconnect_replaces_heater_cache_with_exact_camera_session(
+    second_supported,
+    second_maximum,
+    second_level,
+):
+    first = ControlledCamera()
+    first._heater_max_level = 5
+    first._heater_level = 4
+    second = ControlledCamera()
+    second._heater_supported = second_supported
+    if second_maximum is not None:
+        second._heater_max_level = second_maximum
+    if second_level is not None:
+        second._heater_level = second_level
+    cameras = iter((first, second))
+    coordinator = CameraCoordinator(lambda source: next(cameras), "controlled")
+
+    coordinator.set_connected_sync(True)
+    first_snapshot = coordinator.heater_snapshot()
+    coordinator.set_connected_sync(False)
+    coordinator.set_connected_sync(True)
+    second_reads = (
+        second.heater_capability_reads,
+        second.heater_level_reads,
+    )
+    coordinator.start_exposure(0.1, True)
+    second.wait_for_acquisitions(1)
+    second_snapshot = coordinator.heater_snapshot()
+
+    assert first_snapshot.connection_generation == 1
+    assert first_snapshot.maximum == 5
+    assert first_snapshot.level == 4
+    assert second_snapshot.connection_generation == 3
+    assert second_snapshot.supported is second_supported
+    assert second_snapshot.maximum == second_maximum
+    assert second_snapshot.level == second_level
+    assert second_snapshot.sequence > first_snapshot.sequence
+    assert (
+        second.heater_capability_reads,
+        second.heater_level_reads,
+    ) == second_reads
+
+    coordinator.abort_exposure()
+    second.release_frame()
+    coordinator.set_connected_sync(False)
 
 
 def test_disconnected_coordinator_rejects_cooling_access():

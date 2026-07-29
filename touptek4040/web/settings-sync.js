@@ -1,9 +1,11 @@
-import { mutate } from "./api.js";
+import { getJson, mutate } from "./api.js";
 
 const byId = (id) => document.getElementById(id);
 let confirmedHeaterLevel = null;
 let renderedHeaterMaximum = null;
 let heaterWritable = false;
+let heaterPendingCount = 0;
+let heaterRequestGeneration = 0;
 
 export function readSettings() {
   return {
@@ -60,12 +62,12 @@ export function writeHeaterState(state) {
     && (maximum == null || state.heaterLevel <= maximum)
     ? state.heaterLevel
     : null;
+  confirmedHeaterLevel = confirmed;
   if (confirmed != null) {
-    confirmedHeaterLevel = confirmed;
     heater.value = String(confirmed);
   }
   heaterWritable = state.heaterWritable === true;
-  heater.disabled = !heaterWritable;
+  heater.disabled = heaterPendingCount > 0 || !heaterWritable;
 
   if (!state.connected) {
     status.textContent = "Not connected";
@@ -141,13 +143,17 @@ export function bindSettings(onApplied, onError) {
     const heater = byId("heater-level");
     const status = byId("heater-status");
     const previous = confirmedHeaterLevel;
+    const requested = Number(heater.value);
+    const requestGeneration = ++heaterRequestGeneration;
+    heaterPendingCount += 1;
     heater.disabled = true;
     status.textContent = "Applying…";
     try {
       const result = await mutate(
         "/web/v1/heater",
-        { heaterLevel: Number(heater.value) },
+        { heaterLevel: requested },
       );
+      if (requestGeneration !== heaterRequestGeneration) return;
       if (
         !Number.isInteger(result.heaterLevel)
         || result.heaterLevel < 0
@@ -161,13 +167,23 @@ export function bindSettings(onApplied, onError) {
         : `Level ${result.heaterLevel}`;
       onApplied();
     } catch (error) {
-      if (previous != null) heater.value = String(previous);
-      status.textContent = previous == null
-        ? "Write failed"
-        : `Write failed · Level ${previous}`;
+      if (requestGeneration !== heaterRequestGeneration) return;
+      try {
+        const authoritative = await getJson("/web/v1/state");
+        if (requestGeneration !== heaterRequestGeneration) return;
+        writeHeaterState(authoritative);
+      } catch {
+        if (requestGeneration !== heaterRequestGeneration) return;
+        confirmedHeaterLevel = previous;
+        if (previous != null) heater.value = String(previous);
+        status.textContent = previous == null
+          ? "Write failed"
+          : `Write failed · Level ${previous}`;
+      }
       onError(error);
     } finally {
-      heater.disabled = !heaterWritable;
+      heaterPendingCount -= 1;
+      heater.disabled = heaterPendingCount > 0 || !heaterWritable;
     }
   });
 }

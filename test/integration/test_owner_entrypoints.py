@@ -107,7 +107,7 @@ def test_real_runtime_owner_and_heater_execute_only_in_spawned_pid(
         state = _read_state(state_path)
         assert state["backend_pid"] == owner_pid
         assert state["heater_level"] == 3
-        assert state["counts"]["get_heater_level"] == 3
+        assert state["counts"]["get_heater_level"] == 4
         assert state["counts"]["set_heater_level"] == 1
         assert PARENT_SDK_MODULES.intersection(sys.modules) == loaded_sdk_modules
     finally:

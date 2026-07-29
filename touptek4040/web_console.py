@@ -120,10 +120,6 @@ class WebConsole:
         self._settings_lock = threading.RLock()
         self._target_temperature_c = -10.0
         self._cooler_on = False
-        self._heater_supported = False
-        self._heater_max_level: int | None = None
-        self._heater_level: int | None = None
-        self._heater_update_lock = threading.Lock()
         self.logs = LogBuffer()
         self.logs.append(
             "warning",
@@ -233,18 +229,14 @@ class WebConsole:
         level = body["heaterLevel"]
         if isinstance(level, bool) or not isinstance(level, int):
             raise ValueError("Invalid request body")
-        with self._heater_update_lock:
-            self.coordinator.set_heater_level_if_idle(level)
-            confirmed = self.coordinator.heater_level
-            if (
-                isinstance(confirmed, bool)
-                or not isinstance(confirmed, int)
-                or confirmed < 0
-            ):
-                raise CameraError("camera returned an invalid heater level")
-            with self._settings_lock:
-                self._heater_supported = True
-                self._heater_level = confirmed
+        snapshot = self.coordinator.set_heater_level_confirmed_if_idle(level)
+        confirmed = snapshot.level
+        if (
+            isinstance(confirmed, bool)
+            or not isinstance(confirmed, int)
+            or confirmed < 0
+        ):
+            raise CameraError("camera returned an invalid heater level")
         self.logs.append("info", f"Dew heater set to level {confirmed}")
         return {"heaterLevel": confirmed}
 
@@ -323,43 +315,22 @@ class WebConsole:
         state_number: int,
     ) -> dict[str, object]:
         if not connected or connecting:
-            with self._settings_lock:
-                self._heater_supported = False
-                self._heater_max_level = None
-                self._heater_level = None
             return _heater_media(False, None, None, False)
 
-        if state_number != 0:
-            with self._settings_lock:
-                return _heater_media(
-                    self._heater_supported,
-                    self._heater_max_level,
-                    self._heater_level,
-                    False,
-                )
-
         try:
-            supported = self.coordinator.heater_supported
-            if not isinstance(supported, bool):
+            snapshot = self.coordinator.heater_snapshot()
+            if not isinstance(snapshot.supported, bool):
                 raise CameraError("camera returned invalid heater support")
-            if not supported:
-                with self._settings_lock:
-                    self._heater_supported = False
-                    self._heater_max_level = 0
-                    self._heater_level = None
+            if not snapshot.supported:
                 return _heater_media(False, 0, None, False)
-            maximum = self.coordinator.heater_max_level
+            maximum = snapshot.maximum
             if (
                 isinstance(maximum, bool)
                 or not isinstance(maximum, int)
                 or maximum < 0
             ):
                 raise CameraError("camera returned an invalid heater maximum")
-        except Exception:
-            return _heater_media(False, None, None, False)
-
-        try:
-            level = self.coordinator.heater_level
+            level = snapshot.level
             if (
                 isinstance(level, bool)
                 or not isinstance(level, int)
@@ -367,16 +338,14 @@ class WebConsole:
             ):
                 raise CameraError("camera returned an invalid heater level")
         except Exception:
-            with self._settings_lock:
-                self._heater_supported = True
-                self._heater_max_level = maximum
-            return _heater_media(True, maximum, None, False)
+            return _heater_media(False, None, None, False)
 
-        with self._settings_lock:
-            self._heater_supported = True
-            self._heater_max_level = maximum
-            self._heater_level = level
-        return _heater_media(True, maximum, level, True)
+        return _heater_media(
+            True,
+            maximum,
+            level,
+            state_number == 0,
+        )
 
     def display_generation(self) -> ImageGeneration | None:
         preview = getattr(self.coordinator, "preview_generation", None)
@@ -858,9 +827,21 @@ def _mutation_body(request: falcon.Request) -> object:
             description="JSON body exceeds 4096 bytes",
         )
     try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("Invalid request body") from error
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
 
 
 def _object_with_keys(

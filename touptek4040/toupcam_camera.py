@@ -100,6 +100,8 @@ class _PersistentNativeState:
     tec_voltage_max: int
     hflip: bool
     vflip: bool
+    heater_max_level: int | None
+    heater_level: int | None
 
 
 def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentity]:
@@ -854,6 +856,29 @@ class ToupTekCamera:
         self,
         handle: Any,
     ) -> _PersistentNativeState:
+        heater_max_level: int | None = None
+        heater_level: int | None = None
+        if self.heater_supported:
+            heater_max_level = handle.get_Option(
+                self._sdk.TOUPCAM_OPTION_HEAT_MAX
+            )
+            if (
+                isinstance(heater_max_level, bool)
+                or not isinstance(heater_max_level, int)
+                or heater_max_level < 0
+            ):
+                raise CameraError(
+                    "camera returned an invalid heater maximum during reopen"
+                )
+            heater_level = handle.get_Option(self._sdk.TOUPCAM_OPTION_HEAT)
+            if (
+                isinstance(heater_level, bool)
+                or not isinstance(heater_level, int)
+                or not 0 <= heater_level <= heater_max_level
+            ):
+                raise CameraError(
+                    "camera returned an invalid heater level during reopen"
+                )
         return _PersistentNativeState(
             gain=handle.get_ExpoAGain(),
             exposure_us=handle.get_ExpoTime(),
@@ -869,6 +894,8 @@ class ToupTekCamera:
             ),
             hflip=bool(handle.get_HFlip()),
             vflip=bool(handle.get_VFlip()),
+            heater_max_level=heater_max_level,
+            heater_level=heater_level,
         )
 
     def _replay_persistent_native_state(
@@ -900,6 +927,19 @@ class ToupTekCamera:
             handle.put_HFlip(state.hflip)
         if current.vflip != state.vflip:
             handle.put_VFlip(state.vflip)
+        if state.heater_level is not None:
+            if (
+                current.heater_max_level is None
+                or state.heater_level > current.heater_max_level
+            ):
+                raise CameraError(
+                    "saved heater level exceeds the fresh handle maximum"
+                )
+            if current.heater_level != state.heater_level:
+                handle.put_Option(
+                    self._sdk.TOUPCAM_OPTION_HEAT,
+                    state.heater_level,
+                )
 
     def _pace_reused_trigger(self) -> None:
         """Allow the device's completed-frame pipeline to accept the next trigger."""

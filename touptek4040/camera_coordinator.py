@@ -69,6 +69,17 @@ class CameraSnapshot:
 
 
 @dataclass(frozen=True)
+class HeaterSnapshot:
+    """One confirmed heater state from an exact connected camera session."""
+
+    connection_generation: int
+    sequence: int
+    supported: bool
+    maximum: int | None
+    level: int | None
+
+
+@dataclass(frozen=True)
 class FormalImageRead:
     """One condition-linearized decision for a formal image download."""
 
@@ -126,6 +137,9 @@ class CameraCoordinator:
         self._connecting = False
         self._connection_target: bool | None = None
         self._connection_generation = 0
+        self._heater_sequence = 0
+        self._heater_snapshot: HeaterSnapshot | None = None
+        self._heater_cache_camera: CameraContract | None = None
         self._state = CameraState.IDLE
         self._error: CameraError | None = None
         self._session_id = 0
@@ -152,6 +166,7 @@ class CameraCoordinator:
                 self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
+            self._invalidate_heater_cache_locked()
             self._connection_target = True
             self._connecting = True
             if not quarantined:
@@ -180,6 +195,7 @@ class CameraCoordinator:
                 self._lifecycle_errors.clear()
             self._connection_generation += 1
             generation = self._connection_generation
+            self._invalidate_heater_cache_locked()
             self._connection_target = False
             self._connecting = True
             self._session_id += 1
@@ -315,6 +331,11 @@ class CameraCoordinator:
             camera.cooler_on = enabled
 
     def set_heater_level_if_idle(self, level: int) -> None:
+        self.set_heater_level_confirmed_if_idle(level)
+
+    def set_heater_level_confirmed_if_idle(self, level: int) -> HeaterSnapshot:
+        """Set and confirm a heater level without releasing the idle barrier."""
+
         with self._condition:
             camera = self._require_available_camera_locked()
             self._require_idle_locked()
@@ -322,16 +343,60 @@ class CameraCoordinator:
                 raise CameraInvalidValueError(
                     "heater level must be an integer"
                 )
-            if not camera.heater_supported:
-                raise CameraNotSupportedError(
-                    "camera does not support a heater"
+            try:
+                if not camera.heater_supported:
+                    raise CameraNotSupportedError(
+                        "camera does not support a heater"
+                    )
+                maximum = self._validated_heater_maximum(
+                    camera.heater_max_level
                 )
-            maximum = camera.heater_max_level
-            if level < 0 or level > maximum:
-                raise CameraInvalidValueError(
-                    f"heater level must be an integer from 0 to {maximum}"
+                if level < 0 or level > maximum:
+                    raise CameraInvalidValueError(
+                        f"heater level must be an integer from 0 to {maximum}"
+                    )
+                camera.heater_level = level
+                confirmed = self._validated_heater_level(
+                    camera.heater_level,
+                    maximum,
                 )
-            camera.heater_level = level
+                return self._cache_heater_snapshot_locked(
+                    camera,
+                    supported=True,
+                    maximum=maximum,
+                    level=confirmed,
+                )
+            except BaseException as error:
+                self._invalidate_heater_cache_locked()
+                if isinstance(error, CameraError):
+                    raise
+                raise _camera_error(error, "set heater level") from error
+
+    def heater_snapshot(self) -> HeaterSnapshot:
+        """Read heater state while idle or return this session's busy cache."""
+
+        with self._condition:
+            camera = self._require_available_camera_locked()
+            if self._state is CameraState.IDLE:
+                try:
+                    return self._read_heater_snapshot_locked(camera)
+                except BaseException as error:
+                    self._invalidate_heater_cache_locked()
+                    if isinstance(error, CameraError):
+                        raise
+                    raise _camera_error(error, "read heater state") from error
+            snapshot = self._heater_snapshot
+            if (
+                snapshot is not None
+                and self._heater_cache_camera is camera
+                and snapshot.connection_generation
+                == self._connection_generation
+            ):
+                return snapshot
+            raise CameraBusyError(
+                "heater state is unavailable while camera is "
+                f"{self._state.name.lower()}"
+            )
 
     def abort_exposure(self) -> None:
         with self._condition:
@@ -356,6 +421,10 @@ class CameraCoordinator:
                 ):
                     self._state = CameraState.ERROR
                     self._error = translated
+                    if _contains_not_connected(translated):
+                        self._connected = False
+                        self._connection_target = False
+                        self._invalidate_heater_cache_locked()
                     self._publish_changed_locked()
             raise translated from error
 
@@ -397,6 +466,7 @@ class CameraCoordinator:
             if _contains_not_connected(error):
                 self._connected = False
                 self._connection_target = False
+                self._invalidate_heater_cache_locked()
             self._publish_changed_locked()
         raise error
 
@@ -503,15 +573,21 @@ class CameraCoordinator:
 
     @property
     def heater_supported(self) -> bool:
-        return self._available_camera().heater_supported
+        return self.heater_snapshot().supported
 
     @property
     def heater_max_level(self) -> int:
-        return self._available_camera().heater_max_level
+        maximum = self.heater_snapshot().maximum
+        if maximum is None:
+            raise CameraNotSupportedError("camera does not support a heater")
+        return maximum
 
     @property
     def heater_level(self) -> int:
-        return self._available_camera().heater_level
+        level = self.heater_snapshot().level
+        if level is None:
+            raise CameraNotSupportedError("camera does not support a heater")
+        return level
 
     def _connect_worker(self, generation: int) -> None:
         camera: CameraContract | None = None
@@ -564,6 +640,7 @@ class CameraCoordinator:
                             self._lifecycle_errors[:] = all_cleanup_errors
                             return
                         self._connected = False
+                        self._invalidate_heater_cache_locked()
                         self._connecting = False
                         self._state = CameraState.ERROR
                         self._error = _combined_error(
@@ -574,6 +651,7 @@ class CameraCoordinator:
                         return
                     if self._camera is stale_camera:
                         self._camera = None
+                        self._invalidate_heater_cache_locked()
                     self._lifecycle_errors.clear()
                     if not current:
                         return
@@ -582,6 +660,7 @@ class CameraCoordinator:
             if prior_cleanup_errors:
                 with self._condition:
                     self._connected = False
+                    self._invalidate_heater_cache_locked()
                     self._connecting = False
                     self._state = CameraState.ERROR
                     self._error = _combined_error(
@@ -602,6 +681,10 @@ class CameraCoordinator:
                 )
                 if current and error is None and camera is not None:
                     self._camera = camera
+                    try:
+                        self._read_heater_snapshot_locked(camera)
+                    except BaseException:
+                        self._invalidate_heater_cache_locked()
                     self._connected = True
                     self._connecting = False
                     self._state = CameraState.IDLE
@@ -611,6 +694,7 @@ class CameraCoordinator:
                 elif current:
                     self._camera = None
                     self._connected = False
+                    self._invalidate_heater_cache_locked()
                     self._connecting = False
                     self._state = CameraState.ERROR
                     self._error = error or CameraError("connect camera failed")
@@ -632,6 +716,7 @@ class CameraCoordinator:
                     with self._condition:
                         self._camera = camera
                         self._connected = False
+                        self._invalidate_heater_cache_locked()
                         self._lifecycle_errors[:] = _unique_errors(
                             [*self._lifecycle_errors, *cleanup_errors]
                         )
@@ -661,6 +746,7 @@ class CameraCoordinator:
             with self._condition:
                 if not errors and self._camera is camera:
                     self._camera = None
+                    self._invalidate_heater_cache_locked()
                 current = (
                     generation == self._connection_generation
                     and self._connection_target is False
@@ -669,6 +755,7 @@ class CameraCoordinator:
                     all_errors = _unique_errors([*self._lifecycle_errors, *errors])
                     self._lifecycle_errors.clear()
                     self._connected = False
+                    self._invalidate_heater_cache_locked()
                     self._connecting = False
                     self._clear_formal_image_locked()
                     if all_errors:
@@ -808,6 +895,7 @@ class CameraCoordinator:
             if disconnected:
                 self._connected = False
                 self._connection_target = False
+                self._invalidate_heater_cache_locked()
             self._publish_changed_locked()
 
     def _preview_worker(
@@ -847,6 +935,7 @@ class CameraCoordinator:
                 if _contains_not_connected(self._error):
                     self._connected = False
                     self._connection_target = False
+                    self._invalidate_heater_cache_locked()
                 self._publish_changed_locked()
         finally:
             with self._condition:
@@ -865,6 +954,70 @@ class CameraCoordinator:
         if self._connecting:
             raise CameraBusyError("camera connection is changing")
         return self._camera
+
+    def _read_heater_snapshot_locked(
+        self,
+        camera: CameraContract,
+    ) -> HeaterSnapshot:
+        supported = camera.heater_supported
+        if not isinstance(supported, bool):
+            raise CameraError("camera returned an invalid heater capability")
+        if not supported:
+            return self._cache_heater_snapshot_locked(
+                camera,
+                supported=False,
+                maximum=None,
+                level=None,
+            )
+        maximum = self._validated_heater_maximum(camera.heater_max_level)
+        level = self._validated_heater_level(camera.heater_level, maximum)
+        return self._cache_heater_snapshot_locked(
+            camera,
+            supported=True,
+            maximum=maximum,
+            level=level,
+        )
+
+    def _cache_heater_snapshot_locked(
+        self,
+        camera: CameraContract,
+        *,
+        supported: bool,
+        maximum: int | None,
+        level: int | None,
+    ) -> HeaterSnapshot:
+        self._heater_sequence += 1
+        snapshot = HeaterSnapshot(
+            connection_generation=self._connection_generation,
+            sequence=self._heater_sequence,
+            supported=supported,
+            maximum=maximum,
+            level=level,
+        )
+        self._heater_snapshot = snapshot
+        self._heater_cache_camera = camera
+        return snapshot
+
+    def _invalidate_heater_cache_locked(self) -> None:
+        self._heater_snapshot = None
+        self._heater_cache_camera = None
+
+    @staticmethod
+    def _validated_heater_maximum(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CameraError("camera returned an invalid heater maximum")
+        return value
+
+    @staticmethod
+    def _validated_heater_level(value: object, maximum: int) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > maximum
+        ):
+            raise CameraError("camera returned an invalid heater level")
+        return value
 
     def _available_camera(self) -> CameraContract:
         with self._condition:

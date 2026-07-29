@@ -9,12 +9,54 @@ from types import SimpleNamespace
 
 import pytest
 
-from touptek4040.camera_coordinator import CameraState
+from touptek4040.camera_coordinator import CameraCoordinator, CameraState
 from touptek4040.camera_owner import OwnerStartupSpec
 from touptek4040.camera_proxy import CameraOwnerProxy
 from touptek4040.config import OwnerConfig
 from touptek4040.errors import CameraError
 from touptek4040.web_console import WebConsole
+
+
+class BlockingHeaterCamera:
+    def __init__(self) -> None:
+        self._heater_level = 0
+        self.block_readback = False
+        self.readback_entered = threading.Event()
+        self.readback_release = threading.Event()
+        self.readback_release.set()
+        self.operations: list[tuple[object, ...]] = []
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def abort(self) -> None:
+        pass
+
+    @property
+    def heater_supported(self) -> bool:
+        self.operations.append(("heater-supported",))
+        return True
+
+    @property
+    def heater_max_level(self) -> int:
+        self.operations.append(("heater-max",))
+        return 5
+
+    @property
+    def heater_level(self) -> int:
+        self.operations.append(("heater-level", self._heater_level))
+        self.readback_entered.set()
+        if self.block_readback:
+            assert self.readback_release.wait(1)
+        return self._heater_level
+
+    @heater_level.setter
+    def heater_level(self, value: int) -> None:
+        self.operations.append(("heater-set", value))
+        self._heater_level = value
 
 
 def test_supported_idle_state_reports_device_heater_contract(
@@ -91,6 +133,35 @@ def test_web_heater_accepts_only_the_exact_single_json_member(
     assert web_coordinator.heater_writes == []
 
 
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b'{"heaterLevel":1,"heaterLevel":2}',
+        b'{"heaterLevel":{"x":1,"x":2}}',
+        b"[]",
+        b"null",
+        b"1",
+        b'{"heaterLevel":1} true',
+        b'{"heaterLevel":{"x":1}}',
+    ],
+)
+def test_web_heater_rejects_ambiguous_or_nonobject_raw_json(
+    web_client,
+    web_coordinator,
+    mutation_headers,
+    raw_body,
+):
+    response = web_client.simulate_post(
+        "/web/v1/heater",
+        headers=mutation_headers,
+        body=raw_body,
+    )
+
+    assert response.status_code == 400
+    assert response.json == {"error": "Invalid request body"}
+    assert web_coordinator.heater_writes == []
+
+
 def test_unsupported_and_disconnected_heater_states_are_not_writable(
     web_client,
     web_coordinator,
@@ -127,7 +198,7 @@ def test_unsupported_and_disconnected_heater_states_are_not_writable(
     assert web_coordinator.heater_writes == []
 
 
-def test_heater_read_failure_keeps_state_available_but_disables_writes(
+def test_heater_read_failure_invalidates_web_state_and_disables_writes(
     web_client,
     web_coordinator,
 ):
@@ -136,9 +207,9 @@ def test_heater_read_failure_keeps_state_available_but_disables_writes(
     response = web_client.simulate_get("/web/v1/state")
 
     assert response.status_code == 200
-    assert response.json["heaterSupported"] is True
+    assert response.json["heaterSupported"] is False
     assert response.json["heaterLevel"] is None
-    assert response.json["heaterMaxLevel"] == 5
+    assert response.json["heaterMaxLevel"] is None
     assert response.json["heaterWritable"] is False
 
 
@@ -198,45 +269,63 @@ def test_exposure_keeps_last_confirmed_level_visible_and_rejects_write(
 
 
 def test_two_web_heater_writes_flow_through_one_coordinator_serialization_point(
-    web_coordinator,
     web_config,
 ):
-    console = WebConsole(web_coordinator, web_config)
-    coordinator_gate = threading.Lock()
-    first_entered = threading.Event()
-    release_first = threading.Event()
-    second_entered = threading.Event()
-    writes: list[int] = []
+    camera = BlockingHeaterCamera()
+    coordinator = CameraCoordinator(lambda _source: camera, "blocking-heater")
+    coordinator.set_connected_sync(True)
+    console = WebConsole(coordinator, web_config)
+    camera.operations.clear()
+    camera.block_readback = True
+    camera.readback_entered.clear()
+    camera.readback_release.clear()
+    first_results: list[dict[str, object]] = []
+    second_results: list[dict[str, object]] = []
+    thread_errors: list[BaseException] = []
 
-    def serialized_write(level: int) -> None:
-        with coordinator_gate:
-            if level == 1:
-                first_entered.set()
-                assert release_first.wait(1)
-            else:
-                second_entered.set()
-            web_coordinator._heater_level = level
-            writes.append(level)
+    def update(level: int, results: list[dict[str, object]]) -> None:
+        try:
+            results.append(console.update_heater({"heaterLevel": level}))
+        except BaseException as error:
+            thread_errors.append(error)
 
-    web_coordinator.set_heater_level_if_idle = serialized_write
     first = threading.Thread(
-        target=lambda: console.update_heater({"heaterLevel": 1}),
+        target=update,
+        args=(1, first_results),
     )
     second = threading.Thread(
-        target=lambda: console.update_heater({"heaterLevel": 2}),
+        target=update,
+        args=(2, second_results),
     )
 
     first.start()
-    assert first_entered.wait(1)
+    assert camera.readback_entered.wait(1)
     second.start()
-    assert not second_entered.wait(0.05)
-    release_first.set()
+    threading.Event().wait(0.05)
+
+    assert second_results == []
+
+    camera.readback_release.set()
     first.join(1)
     second.join(1)
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert writes == [1, 2]
+    assert thread_errors == []
+    assert first_results == [{"heaterLevel": 1}]
+    assert second_results == [{"heaterLevel": 2}]
+    assert camera.operations == [
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-set", 1),
+        ("heater-level", 1),
+        ("heater-supported",),
+        ("heater-max",),
+        ("heater-set", 2),
+        ("heater-level", 2),
+    ]
+
+    coordinator.set_connected_sync(False)
 
 
 def test_owner_backed_web_heater_operates_while_main_controller_stays_connected(
@@ -356,6 +445,186 @@ def test_heater_ui_generates_device_levels_disables_and_rolls_back(
         },
         "exposing": {"value": "2", "disabled": True},
         "rolledBack": "2",
+    }
+
+
+def test_heater_ui_keeps_overlapping_requests_ordered_and_refreshes_failures(
+    web_client,
+):
+    web_client.simulate_get("/ui/")
+    module = (
+        Path(__file__).parents[2]
+        / "touptek4040"
+        / "web"
+        / "settings-sync.js"
+    ).as_uri()
+    script = f"""
+      class Element {{
+        constructor(id = "") {{
+          this.id = id;
+          this.value = "";
+          this.textContent = "";
+          this.checked = false;
+          this.disabled = false;
+          this.listeners = {{}};
+          this.options = [];
+          this.classList = {{add() {{}}, remove() {{}}}};
+        }}
+        addEventListener(type, callback) {{ this.listeners[type] = callback; }}
+        replaceChildren(...children) {{ this.options = children; }}
+      }}
+      const ids = [
+        "gain", "gain-value", "binning", "readout-mode", "roi-x", "roi-y",
+        "roi-width", "roi-height", "apply-settings", "settings-message",
+        "target-temperature", "cooler-on", "heater-level", "heater-status",
+      ];
+      const elements = Object.fromEntries(ids.map((id) => [id, new Element(id)]));
+      globalThis.document = {{
+        getElementById: (id) => elements[id],
+        createElement: () => new Element(),
+      }};
+      const response = (ok, status, body) => ({{
+        ok,
+        status,
+        statusText: ok ? "OK" : "Error",
+        json: async () => body,
+      }});
+      const posts = [];
+      let gets = 0;
+      let authoritative = null;
+      globalThis.fetch = async (path, options = {{}}) => {{
+        if ((options.method ?? "GET") === "POST") {{
+          return new Promise((resolve) => posts.push({{
+            body: JSON.parse(options.body),
+            resolve,
+          }}));
+        }}
+        gets += 1;
+        return response(true, 200, authoritative);
+      }};
+      const errors = [];
+      const sync = await import({json.dumps(module)});
+      sync.writeHeaterState({{
+        connected: true,
+        cameraState: "idle",
+        heaterSupported: true,
+        heaterLevel: 1,
+        heaterMaxLevel: 3,
+        heaterWritable: true,
+      }});
+      sync.bindSettings(() => {{}}, (error) => errors.push(error.message));
+      const heater = elements["heater-level"];
+
+      heater.value = "2";
+      const first = heater.listeners.change();
+      heater.value = "3";
+      const second = heater.listeners.change();
+      sync.writeHeaterState({{
+        connected: true,
+        cameraState: "idle",
+        heaterSupported: true,
+        heaterLevel: 1,
+        heaterMaxLevel: 3,
+        heaterWritable: true,
+      }});
+      const disabledDuringSse = heater.disabled;
+
+      posts[1].resolve(response(true, 200, {{heaterLevel: 3}}));
+      await second;
+      const latestCompleted = {{
+        value: heater.value,
+        disabled: heater.disabled,
+      }};
+      posts[0].resolve(response(true, 200, {{heaterLevel: 2}}));
+      await first;
+      const olderCompleted = {{
+        value: heater.value,
+        disabled: heater.disabled,
+      }};
+
+      heater.value = "2";
+      const conflict = heater.listeners.change();
+      authoritative = {{
+        connected: true,
+        cameraState: "exposing",
+        heaterSupported: true,
+        heaterLevel: 3,
+        heaterMaxLevel: 3,
+        heaterWritable: false,
+      }};
+      posts[2].resolve(response(
+        false,
+        409,
+        {{error: "camera is exposing"}},
+      ));
+      await conflict;
+      const conflictRefreshed = {{
+        value: heater.value,
+        disabled: heater.disabled,
+        statusMatches: elements["heater-status"].textContent
+          === "Level 3 \u00b7 Exposing",
+      }};
+
+      heater.value = "0";
+      const unsupported = heater.listeners.change();
+      authoritative = {{
+        connected: true,
+        cameraState: "idle",
+        heaterSupported: false,
+        heaterLevel: null,
+        heaterMaxLevel: 0,
+        heaterWritable: false,
+      }};
+      posts[3].resolve(response(
+        false,
+        500,
+        {{error: "camera does not support a heater"}},
+      ));
+      await unsupported;
+      const unsupportedRefreshed = {{
+        disabled: heater.disabled,
+        status: elements["heater-status"].textContent,
+      }};
+
+      process.stdout.write(JSON.stringify({{
+        disabledDuringSse,
+        latestCompleted,
+        olderCompleted,
+        conflictRefreshed,
+        unsupportedRefreshed,
+        posts: posts.map((item) => item.body.heaterLevel),
+        gets,
+        errors,
+      }}));
+    """
+
+    completed = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "disabledDuringSse": True,
+        "latestCompleted": {"value": "3", "disabled": True},
+        "olderCompleted": {"value": "3", "disabled": False},
+        "conflictRefreshed": {
+            "value": "3",
+            "disabled": True,
+            "statusMatches": True,
+        },
+        "unsupportedRefreshed": {
+            "disabled": True,
+            "status": "Not supported",
+        },
+        "posts": [2, 3, 2, 0],
+        "gets": 2,
+        "errors": [
+            "camera is exposing",
+            "camera does not support a heater",
+        ],
     }
 
 

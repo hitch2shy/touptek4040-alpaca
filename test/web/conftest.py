@@ -13,7 +13,7 @@ from touptek4040.camera_contract import (
     ReadoutMode,
     Roi,
 )
-from touptek4040.camera_coordinator import CameraState
+from touptek4040.camera_coordinator import CameraState, HeaterSnapshot
 from touptek4040.errors import (
     CameraBusyError,
     CameraError,
@@ -44,6 +44,7 @@ class WebCoordinator:
         self.heater_writes: list[int] = []
         self.heater_read_error: Exception | None = None
         self.heater_write_error: Exception | None = None
+        self.heater_sequence = 0
         self.events = SimpleNamespace(subscribe=lambda: None)
         pixels = np.arange(256, dtype=np.uint16).reshape(16, 16)
         pixels[8, 8] = 4095
@@ -137,7 +138,39 @@ class WebCoordinator:
             raise self.heater_read_error
         return self._heater_level
 
+    def heater_snapshot(self) -> HeaterSnapshot:
+        if not self.connected:
+            raise CameraNotConnectedError("camera is not connected")
+        if self.camera_state is not CameraState.IDLE:
+            return HeaterSnapshot(
+                connection_generation=1,
+                sequence=self.heater_sequence,
+                supported=self._heater_supported,
+                maximum=self._heater_max_level if self._heater_supported else None,
+                level=self._heater_level if self._heater_supported else None,
+            )
+        supported = self.heater_supported
+        if not supported:
+            self.heater_sequence += 1
+            return HeaterSnapshot(1, self.heater_sequence, False, None, None)
+        maximum = self.heater_max_level
+        level = self.heater_level
+        self.heater_sequence += 1
+        return HeaterSnapshot(
+            1,
+            self.heater_sequence,
+            True,
+            maximum,
+            level,
+        )
+
     def set_heater_level_if_idle(self, value: int) -> None:
+        self.set_heater_level_confirmed_if_idle(value)
+
+    def set_heater_level_confirmed_if_idle(
+        self,
+        value: int,
+    ) -> HeaterSnapshot:
         if not self.connected:
             raise CameraNotConnectedError("camera is not connected")
         if self.camera_state is not CameraState.IDLE:
@@ -157,6 +190,15 @@ class WebCoordinator:
             raise CameraError(str(error))
         self._heater_level = value
         self.heater_writes.append(value)
+        confirmed = self.heater_level
+        self.heater_sequence += 1
+        return HeaterSnapshot(
+            1,
+            self.heater_sequence,
+            True,
+            self._heater_max_level,
+            confirmed,
+        )
 
     @property
     def temperature_c(self) -> float:
