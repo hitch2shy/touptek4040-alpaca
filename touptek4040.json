@@ -1,0 +1,32 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 11111,
+    "discovery_port": 32227
+  },
+  "camera": {
+    "source": "toupcam",
+    "serial": "TP241025143218C92B01151AEC40CB7",
+    "readout_mode": "RAW 12-bit",
+    "gain": null
+  },
+  "owner": {
+    "startup_timeout_s": 10.0,
+    "connect_timeout_s": 20.0,
+    "command_timeout_s": 5.0,
+    "exposure_overhead_s": 10.0,
+    "exposure_multiplier": 1.02,
+    "abort_timeout_s": 2.0,
+    "disconnect_timeout_s": 10.0
+  },
+  "web": {
+    "enabled": true
+  },
+  "logging": {
+    "level": "INFO",
+    "directory": "logs"
+  },
+  "security": {
+    "trusted_lan_only": true
+  }
+}

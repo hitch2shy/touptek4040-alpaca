@@ -20,7 +20,7 @@ from touptek4040.alpaca.app import create_app
 from touptek4040.alpaca.discovery import DiscoveryResponder
 from touptek4040.alpaca.management import SIMULATOR_SERIAL
 from touptek4040.camera_coordinator import CameraCoordinator
-from touptek4040.config import AppConfig, load_config
+from touptek4040.config import AppConfig, load_config, runtime_base_dir
 from touptek4040.errors import CameraError, CameraInvalidValueError, CameraNotConnectedError
 from touptek4040.sim_camera import SimCamera
 from touptek4040.toupcam_camera import ToupTekCamera, enumerate_cameras
@@ -55,7 +55,11 @@ def config_from_args(argv: Sequence[str] | None = None) -> AppConfig:
         "logging.directory": args.log_directory,
         "web.enabled": False if args.no_web else None,
     }
-    return load_config(args.config, overrides)
+    config_path = args.config or runtime_base_dir() / "touptek4040.json"
+    config = load_config(config_path, overrides)
+    if args.source == "sim" and args.serial is None:
+        return replace(config, camera=replace(config.camera, serial=None))
+    return config
 
 
 def build_coordinator(config: AppConfig) -> tuple[CameraCoordinator, AppConfig]:

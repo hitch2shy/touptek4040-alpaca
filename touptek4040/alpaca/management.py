@@ -7,6 +7,7 @@ import configparser
 from dataclasses import dataclass
 from html import escape
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ import uuid
 import falcon
 
 from .. import __version__
+from ..config import load_json_object_strict
 from .common_api import (
     DEVICE_DESCRIPTION,
     DEVICE_NAME,
@@ -405,19 +407,38 @@ def _write_server_config(
     values: Mapping[str, str],
 ) -> _ConfigurationIdentity:
     _require_config_identity(config_path, expected)
-    parser = configparser.ConfigParser(interpolation=None)
     try:
         with expected.target.open("r", encoding="utf-8") as stream:
             _require_open_file_identity(stream, expected)
-            parser.read_file(stream)
+            if expected.target.suffix == ".json":
+                document = load_json_object_strict(expected.target)
+                server = document.get("server")
+                if not isinstance(server, dict):
+                    raise ValueError("JSON configuration server must be an object")
+                server.update(
+                    host=values["host"],
+                    port=int(values["port"]),
+                    discovery_port=int(values["discovery_port"]),
+                )
+                rendered = json.dumps(document, indent=2) + "\n"
+            elif expected.target.suffix == ".ini":
+                parser = configparser.ConfigParser(interpolation=None)
+                parser.read_file(stream)
+                if not parser.has_section("server"):
+                    parser.add_section("server")
+                for name in ("host", "port", "discovery_port"):
+                    parser.set("server", name, values[name])
+                from io import StringIO
+
+                output = StringIO()
+                parser.write(output)
+                rendered = output.getvalue()
+            else:
+                raise ValueError("unsupported configuration suffix")
     except OSError as error:
         raise _ConfigurationTargetUnavailable from error
-    except configparser.Error as error:
+    except (ValueError, configparser.Error) as error:
         raise OSError("configuration could not be read") from error
-    if not parser.has_section("server"):
-        parser.add_section("server")
-    for name in ("host", "port", "discovery_port"):
-        parser.set("server", name, values[name])
 
     descriptor = -1
     temporary_path: Path | None = None
@@ -430,7 +451,7 @@ def _write_server_config(
         temporary_path = Path(raw_path)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             descriptor = -1
-            parser.write(stream)
+            stream.write(rendered)
             stream.flush()
             os.fsync(stream.fileno())
         replacement_stat = temporary_path.stat()

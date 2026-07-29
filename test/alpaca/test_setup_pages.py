@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import json
 import os
 from pathlib import Path
 import threading
@@ -226,6 +227,48 @@ def test_root_setup_post_atomically_updates_only_server_fields(
     }
     assert parser["camera"]["custom_camera_field"] == "keep-camera"
     assert parser["unrelated"]["custom_value"] == "keep-unrelated"
+    assert api_camera.connected is before_camera is False
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_root_setup_post_atomically_updates_only_server_fields_in_json(
+    coordinator,
+    api_camera,
+    tmp_path,
+):
+    config_path = tmp_path / "camera.json"
+    original = {
+        "server": {"host": "0.0.0.0", "port": 11111, "discovery_port": 32227},
+        "camera": {"source": "toupcam", "custom_camera_field": "keep-camera"},
+        "unrelated": {"custom_value": "keep-unrelated"},
+    }
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    client = _configurable_client(coordinator, config_path)
+    before_camera = api_camera.connected
+
+    response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 200
+    assert config_path.read_text(encoding="utf-8") == (
+        '{\n'
+        '  "server": {\n'
+        '    "host": "127.0.0.1",\n'
+        '    "port": 12345,\n'
+        '    "discovery_port": 32228\n'
+        '  },\n'
+        '  "camera": {\n'
+        '    "source": "toupcam",\n'
+        '    "custom_camera_field": "keep-camera"\n'
+        '  },\n'
+        '  "unrelated": {\n'
+        '    "custom_value": "keep-unrelated"\n'
+        '  }\n'
+        '}\n'
+    )
     assert api_camera.connected is before_camera is False
     assert list(tmp_path.glob("*.tmp")) == []
 
