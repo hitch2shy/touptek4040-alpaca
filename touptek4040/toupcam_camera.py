@@ -625,6 +625,43 @@ class ToupTekCamera:
             return 0.0
         return min(100.0, max(0.0, current * 100.0 / maximum))
 
+    @property
+    def model_flag(self) -> int:
+        """The SDK model flags used for feature-specific internal controls."""
+        return self.identity.model_flags
+
+    @property
+    def heater_supported(self) -> bool:
+        return bool(self.model_flag & self._sdk.TOUPCAM_FLAG_HEAT)
+
+    @property
+    def heater_max_level(self) -> int:
+        if not self.heater_supported:
+            return 0
+        maximum = self._get_option("TOUPCAM_OPTION_HEAT_MAX")
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+            raise CameraInvalidValueError("heater maximum is invalid")
+        return maximum
+
+    @property
+    def heater_level(self) -> int:
+        if not self.heater_supported:
+            raise CameraNotSupportedError("camera does not support a heater")
+        level = self._get_option("TOUPCAM_OPTION_HEAT")
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= self.heater_max_level:
+            raise CameraInvalidValueError("heater level is outside the supported range")
+        return level
+
+    @heater_level.setter
+    def heater_level(self, value: int) -> None:
+        if not self.heater_supported:
+            raise CameraNotSupportedError("camera does not support a heater")
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= self.heater_max_level:
+            raise CameraInvalidValueError(
+                f"heater level must be an integer from 0 to {self.heater_max_level}"
+            )
+        self._put_option("TOUPCAM_OPTION_HEAT", value, "set heater level")
+
     def _apply_settings_locked(
         self, handle: Any, settings: CaptureSettings
     ) -> AppliedSettings:

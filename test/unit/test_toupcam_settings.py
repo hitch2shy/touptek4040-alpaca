@@ -13,6 +13,10 @@ from test.fixtures.fake_toupcam import (
     OPTION_TEC_VOLTAGE,
     OPTION_TEC_VOLTAGE_MAX,
     OPTION_TECTARGET,
+    OPTION_FAN,
+    OPTION_HEAT,
+    OPTION_HEAT_MAX,
+    FLAG_HEAT,
     OPTION_TRIGGER,
     FakeSdk,
 )
@@ -313,6 +317,61 @@ def test_temperature_and_tec_values_are_converted_to_public_units(
     assert camera._handle.options[OPTION_TECTARGET] == -85
     assert camera._handle.options[OPTION_TEC_VOLTAGE] == 50
     assert camera._handle.options[OPTION_TEC_VOLTAGE_MAX] == 60
+
+
+def test_heater_uses_the_sdk_heat_options_without_changing_tec_settings(
+    camera: ToupTekCamera,
+) -> None:
+    camera.identity = camera.identity.__class__(
+        **{**camera.identity.__dict__, "model_flags": FLAG_HEAT}
+    )
+    handle = camera._handle
+    tec = handle.options[OPTION_TEC]
+    target = handle.options[OPTION_TECTARGET]
+    fan = handle.options[OPTION_FAN]
+
+    assert camera.heater_supported is bool(camera.model_flag & camera._sdk.TOUPCAM_FLAG_HEAT)
+    assert camera.heater_max_level == handle.get_Option(camera._sdk.TOUPCAM_OPTION_HEAT_MAX)
+    camera.heater_level = 0
+
+    assert handle.get_Option(camera._sdk.TOUPCAM_OPTION_HEAT) == 0
+    assert (handle.options[OPTION_TEC], handle.options[OPTION_TECTARGET], handle.options[OPTION_FAN]) == (tec, target, fan)
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4])
+def test_heater_accepts_every_integer_level_through_the_sdk_maximum(
+    camera: ToupTekCamera, level: int
+) -> None:
+    camera.identity = camera.identity.__class__(
+        **{**camera.identity.__dict__, "model_flags": FLAG_HEAT}
+    )
+
+    camera.heater_level = level
+
+    assert camera.heater_level == level
+
+
+def test_unsupported_camera_reports_no_heater_and_rejects_writes(
+    camera: ToupTekCamera,
+) -> None:
+    assert camera.heater_supported is False
+    assert camera.heater_max_level == 0
+
+    with pytest.raises(Exception, match="does not support a heater"):
+        camera.heater_level = 0
+    assert not any(call[:2] == ("put_Option", OPTION_HEAT) for call in camera._sdk.calls)
+
+
+@pytest.mark.parametrize("level", [True, 1.0, "1", -1, 5])
+def test_heater_rejects_invalid_levels_before_the_sdk_write(
+    camera: ToupTekCamera, level: object
+) -> None:
+    camera.identity = camera.identity.__class__(
+        **{**camera.identity.__dict__, "model_flags": FLAG_HEAT}
+    )
+    with pytest.raises(CameraInvalidValueError):
+        camera.heater_level = level  # type: ignore[assignment]
+    assert not any(call[:2] == ("put_Option", OPTION_HEAT) for call in camera._sdk.calls)
 
 
 def test_zero_maximum_tec_voltage_has_zero_cooler_power(camera: ToupTekCamera) -> None:

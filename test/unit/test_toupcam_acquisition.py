@@ -17,6 +17,8 @@ from test.fixtures.fake_toupcam import (
     E_UNEXPECTED,
     FakeHResultError,
     FakeSdk,
+    OPTION_HEAT,
+    FLAG_HEAT,
 )
 from touptek4040.camera_contract import ReadoutMode, Roi
 from touptek4040.errors import (
@@ -747,3 +749,31 @@ def test_cancelled_start_control_never_reaches_native_acquisition(
         call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
         for call in camera._sdk.calls
     )
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_heater_operations_are_serialized_behind_an_active_exposure(
+    camera: ToupTekCamera, operation: str
+) -> None:
+    camera.identity = camera.identity.__class__(
+        **{**camera.identity.__dict__, "model_flags": FLAG_HEAT}
+    )
+    handle = camera._handle
+    handle.block_trigger = True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exposure = pool.submit(
+            camera.acquire, 30.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12
+        )
+        assert handle.trigger_started.wait(1)
+        with pytest.raises(CameraBusyError):
+            if operation == "read":
+                _ = camera.heater_level
+            else:
+                camera.heater_level = 1
+        assert not any(
+            call[:2] == ("put_Option", OPTION_HEAT)
+            for call in camera._sdk.calls
+        )
+        camera.abort()
+        with pytest.raises(CameraOperationCancelledError):
+            exposure.result(1)

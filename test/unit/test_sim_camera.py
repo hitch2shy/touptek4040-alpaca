@@ -107,6 +107,25 @@ def test_simulator_has_deterministic_cooling_contract():
     assert camera.cooler_power_percent == 100.0
 
 
+def test_simulator_has_a_bounded_integer_heater_contract():
+    camera = SimCamera("SIM-4040", heater_max_level=3)
+
+    assert camera.heater_supported is True
+    assert camera.heater_max_level == 3
+    camera.heater_level = 3
+    assert camera.heater_level == 3
+    with pytest.raises(CameraInvalidValueError):
+        camera.heater_level = True
+
+
+@pytest.mark.parametrize("value", [1.0, "1", -1, 5])
+def test_simulator_rejects_non_integer_and_out_of_range_heater_levels(value: object):
+    camera = SimCamera("SIM-4040", heater_max_level=4)
+
+    with pytest.raises(CameraInvalidValueError):
+        camera.heater_level = value  # type: ignore[assignment]
+
+
 def test_simulator_gain_round_trips_and_is_recorded_in_the_frame():
     camera = SimCamera("SIM-4040")
 

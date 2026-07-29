@@ -35,12 +35,20 @@ class SimCamera(CameraContract):
         can_stop=False,
     )
 
-    def __init__(self, serial: str) -> None:
+    def __init__(self, serial: str, *, heater_max_level: int = 4) -> None:
+        if (
+            isinstance(heater_max_level, bool)
+            or not isinstance(heater_max_level, int)
+            or heater_max_level < 0
+        ):
+            raise CameraInvalidValueError("heater_max_level must be a non-negative integer")
         self.serial = serial
         self._connected = True
         self._target_temperature_c = 0.0
         self._cooler_on = False
         self._gain = 100
+        self._heater_max_level = heater_max_level
+        self._heater_level = 0
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -132,6 +140,32 @@ class SimCamera(CameraContract):
     def cooler_power_percent(self) -> float:
         current, maximum = self.tec_voltage()
         return current * 100.0 / maximum
+
+    @property
+    def heater_supported(self) -> bool:
+        return True
+
+    @property
+    def heater_max_level(self) -> int:
+        return self._heater_max_level
+
+    @property
+    def heater_level(self) -> int:
+        self._require_connected()
+        return self._heater_level
+
+    @heater_level.setter
+    def heater_level(self, value: int) -> None:
+        self._require_connected()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= self._heater_max_level
+        ):
+            raise CameraInvalidValueError(
+                f"heater level must be an integer from 0 to {self._heater_max_level}"
+            )
+        self._heater_level = value
 
     def _require_connected(self) -> None:
         if not self._connected:
