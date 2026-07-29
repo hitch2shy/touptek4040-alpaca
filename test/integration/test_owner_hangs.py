@@ -597,6 +597,132 @@ def test_validation_only_cannot_target_official_result_directory(
     assert not validation_summary.exists()
 
 
+def _directory_snapshot(directory: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(directory).as_posix(): (
+            None if path.is_dir() else path.read_bytes()
+        )
+        for path in sorted(directory.rglob("*"))
+    }
+
+
+def _create_directory_junction(link: Path, target: Path) -> None:
+    junction = subprocess.run(
+        [
+            "cmd",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if junction.returncode != 0:
+        pytest.skip(
+            "directory junction creation unavailable: "
+            + (junction.stderr or junction.stdout).strip()
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
+def test_validation_only_rejects_existing_junction_alias_to_official_results(
+    tmp_path: Path,
+) -> None:
+    result_directory = (
+        Path(__file__).resolve().parents[1] / "results" / "owner-faults"
+    )
+    before = _directory_snapshot(result_directory)
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in _valid_runner_records()
+        ),
+        encoding="utf-8",
+    )
+    alias = tmp_path / "official-alias"
+    _create_directory_junction(alias, result_directory)
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_owner_faults.ps1"
+            ),
+            "-CasesInput",
+            str(cases_path),
+            "-OutputDirectory",
+            str(alias),
+            "-ValidationOnly",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    assert _directory_snapshot(result_directory) == before
+    assert not (result_directory / "validation-summary.json").exists()
+    assert not (result_directory / "validation-summary.md").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
+def test_validation_only_rejects_nonexistent_child_beneath_official_alias(
+    tmp_path: Path,
+) -> None:
+    result_directory = (
+        Path(__file__).resolve().parents[1] / "results" / "owner-faults"
+    )
+    before = _directory_snapshot(result_directory)
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in _valid_runner_records()
+        ),
+        encoding="utf-8",
+    )
+    alias = tmp_path / "official-alias"
+    _create_directory_junction(alias, result_directory)
+    output_directory = alias / "not-created"
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_owner_faults.ps1"
+            ),
+            "-CasesInput",
+            str(cases_path),
+            "-OutputDirectory",
+            str(output_directory),
+            "-ValidationOnly",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    assert _directory_snapshot(result_directory) == before
+    assert not (result_directory / "not-created").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
 def test_official_runner_rejects_redirected_result_directory(
     tmp_path: Path,
@@ -627,24 +753,7 @@ def test_official_runner_rejects_redirected_result_directory(
         )
 
     redirected_directory = results_parent / "owner-faults"
-    junction = subprocess.run(
-        [
-            "cmd",
-            "/d",
-            "/c",
-            "mklink",
-            "/J",
-            str(redirected_directory),
-            str(external_directory),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if junction.returncode != 0:
-        pytest.skip(
-            "directory junction creation unavailable: "
-            + (junction.stderr or junction.stdout).strip()
-        )
+    _create_directory_junction(redirected_directory, external_directory)
 
     completed = subprocess.run(
         [

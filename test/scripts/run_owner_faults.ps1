@@ -86,6 +86,108 @@ function Get-PhysicalDirectoryPath {
     return [System.IO.Path]::GetFullPath($finalPath).TrimEnd("\")
 }
 
+function Test-PathWithinDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$DirectoryPath
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath(
+        $CandidatePath
+    ).TrimEnd("\")
+    $directory = [System.IO.Path]::GetFullPath(
+        $DirectoryPath
+    ).TrimEnd("\")
+    return (
+        [StringComparer]::OrdinalIgnoreCase.Equals($candidate, $directory) -or
+        $candidate.StartsWith(
+            $directory + [System.IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    )
+}
+
+function Assert-ValidationResultDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$OfficialResultDirectory,
+        [Parameter(Mandatory = $true)][string]$ResultDirectory
+    )
+
+    $textualOfficial = [System.IO.Path]::GetFullPath(
+        $OfficialResultDirectory
+    )
+    $textualResult = [System.IO.Path]::GetFullPath($ResultDirectory)
+    if (Test-PathWithinDirectory $textualResult $textualOfficial) {
+        throw "Validation output textually targets official evidence"
+    }
+
+    $officialInfo = Get-Item -LiteralPath $textualOfficial -Force
+    if (-not $officialInfo.PSIsContainer) {
+        throw "Official evidence path is not a directory"
+    }
+    $physicalOfficial = Get-PhysicalDirectoryPath $textualOfficial
+
+    if (Test-Path -LiteralPath $textualResult) {
+        $resultInfo = Get-Item -LiteralPath $textualResult -Force
+        if (-not $resultInfo.PSIsContainer) {
+            throw "Validation output path is not a directory"
+        }
+        $physicalResult = Get-PhysicalDirectoryPath $textualResult
+        if (Test-PathWithinDirectory $physicalResult $physicalOfficial) {
+            throw "Validation output physically targets official evidence"
+        }
+        return
+    }
+
+    $missingComponents = [System.Collections.Generic.List[string]]::new()
+    $nearestExistingParent = $textualResult
+    while (-not (Test-Path -LiteralPath $nearestExistingParent)) {
+        $leaf = Split-Path -Leaf $nearestExistingParent
+        $parent = Split-Path -Parent $nearestExistingParent
+        if (
+            [String]::IsNullOrWhiteSpace($leaf) -or
+            [String]::IsNullOrWhiteSpace($parent) -or
+            [StringComparer]::OrdinalIgnoreCase.Equals(
+                $parent,
+                $nearestExistingParent
+            )
+        ) {
+            throw "Cannot resolve validation output parent chain"
+        }
+        $missingComponents.Insert(0, $leaf)
+        $nearestExistingParent = $parent
+    }
+
+    $parentInfo = Get-Item -LiteralPath $nearestExistingParent -Force
+    if (-not $parentInfo.PSIsContainer) {
+        throw "Validation output parent is not a directory"
+    }
+    $physicalParent = Get-PhysicalDirectoryPath $nearestExistingParent
+    $predictedPhysicalResult = $physicalParent
+    foreach ($component in $missingComponents) {
+        $predictedPhysicalResult = Join-Path (
+            $predictedPhysicalResult
+        ) $component
+    }
+    if (
+        Test-PathWithinDirectory $predictedPhysicalResult $physicalOfficial
+    ) {
+        throw "Validation output parent aliases official evidence"
+    }
+
+    New-Item -ItemType Directory -Path $textualResult | Out-Null
+    $createdInfo = Get-Item -LiteralPath $textualResult -Force
+    if (-not $createdInfo.PSIsContainer) {
+        throw "Created validation output path is not a directory"
+    }
+    $physicalCreatedResult = Get-PhysicalDirectoryPath $textualResult
+    if (
+        Test-PathWithinDirectory $physicalCreatedResult $physicalOfficial
+    ) {
+        throw "Created validation output resolves into official evidence"
+    }
+}
+
 function Assert-OfficialResultDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -152,14 +254,17 @@ if ($ValidationOnly -and (-not $CasesInput -or -not $OutputDirectory)) {
 
 if ($ValidationOnly) {
     $resultDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
-    if (
-        [StringComparer]::OrdinalIgnoreCase.Equals(
-            $resultDirectory.TrimEnd("\"),
-            $officialResultDirectory.TrimEnd("\")
+    try {
+        Assert-ValidationResultDirectory `
+            $officialResultDirectory `
+            $resultDirectory
+    }
+    catch {
+        Write-Error (
+            "Refusing unsafe validation evidence directory before writing: " +
+            $_.Exception.Message
         )
-    ) {
-        Write-Error "ValidationOnly cannot target the official result directory"
-        exit 64
+        exit 65
     }
     $jsonLines = [System.IO.Path]::GetFullPath($CasesInput)
     $summaryJson = Join-Path $resultDirectory "validation-summary.json"
