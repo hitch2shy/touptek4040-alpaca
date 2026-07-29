@@ -86,6 +86,22 @@ class CameraIdentity:
     tec_target_range_deci_c: tuple[int, int] | None
 
 
+@dataclass(frozen=True)
+class _PersistentNativeState:
+    """Live settings that a fresh SDK handle does not inherit."""
+
+    gain: int
+    exposure_us: int
+    auto_exposure: bool
+    tec_target_deci_c: int
+    tec_enabled: int
+    fan: int
+    rotate: int
+    tec_voltage_max: int
+    hflip: bool
+    vflip: bool
+
+
 def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentity]:
     """Open every enumerated camera briefly to read its serial and capabilities."""
     active_sdk = sdk if sdk is not None else load_default_toupcam_module()
@@ -263,6 +279,8 @@ class ToupTekCamera:
             with self._native_lease(during_acquisition=True) as handle:
                 applied = self._apply_settings_locked(handle, settings)
                 with self._condition:
+                    if self._disconnecting:
+                        raise CameraNotConnectedError("camera is disconnecting")
                     handle = self._require_connected_locked()
                 buffer = _allocate_buffer(applied)
                 frame_info = self._sdk.ToupcamFrameInfoV4()
@@ -272,6 +290,10 @@ class ToupTekCamera:
 
                 def claim() -> None:
                     with self._condition:
+                        if self._disconnecting:
+                            raise CameraNotConnectedError(
+                                "camera is disconnecting"
+                            )
                         self._require_connected_locked()
                         claim_state["generation"] = self._abort_generation
                         self._acquisition_configuring = False
@@ -290,16 +312,39 @@ class ToupTekCamera:
                 operation_errors: list[CameraError] = []
                 try:
                     with self._condition:
+                        cancelled = (
+                            generation != self._abort_generation
+                            or self._disconnecting
+                        )
                         stream_started = self._camera_started
-                    if not stream_started:
+                    started_stream = not cancelled and not stream_started
+                    if started_stream:
                         handle.StartPullModeWithCallback(None, None)
                     with self._condition:
-                        self._camera_started = True
-                        cancelled = generation != self._abort_generation
+                        if started_stream:
+                            self._camera_started = True
+                        cancelled = (
+                            generation != self._abort_generation
+                            or self._disconnecting
+                        )
                     if not cancelled:
-                        started_utc = datetime.now(timezone.utc)
-                        handle.TriggerSyncV4(timeout_ms, buffer, 0, -1, frame_info)
-                        self._last_trigger_completed_monotonic = self._monotonic()
+                        with self._condition:
+                            cancelled = (
+                                generation != self._abort_generation
+                                or self._disconnecting
+                            )
+                        if not cancelled:
+                            started_utc = datetime.now(timezone.utc)
+                            handle.TriggerSyncV4(
+                                timeout_ms,
+                                buffer,
+                                0,
+                                -1,
+                                frame_info,
+                            )
+                            self._last_trigger_completed_monotonic = (
+                                self._monotonic()
+                            )
                 except BaseException as error:
                     operation_errors.append(_translate_sdk_error(error, "acquire frame"))
                 with self._condition:
@@ -684,6 +729,13 @@ class ToupTekCamera:
             stream_started = self._camera_started
         if structure_changed and stream_started:
             try:
+                persistent_state = self._snapshot_persistent_native_state(handle)
+            except BaseException as error:
+                raise _translate_sdk_error(
+                    error,
+                    "snapshot camera state for reconfiguration",
+                ) from error
+            try:
                 handle.Stop()
             except BaseException as error:
                 with self._condition:
@@ -722,6 +774,35 @@ class ToupTekCamera:
             with self._condition:
                 self._handle = handle
                 self._unusable = False
+            try:
+                self._replay_persistent_native_state(handle, persistent_state)
+            except BaseException as error:
+                replay_error = _translate_sdk_error(
+                    error,
+                    "replay camera state after reconfiguration",
+                )
+                close_error: CameraError | None = None
+                try:
+                    handle.Close()
+                except BaseException as close_failure:
+                    close_error = _translate_sdk_error(
+                        close_failure,
+                        "close camera after replay failure",
+                    )
+                with self._condition:
+                    if close_error is None and self._handle is handle:
+                        self._handle = None
+                    elif close_error is not None:
+                        self._handle = handle
+                    self._camera_started = False
+                    self._configured_structure = None
+                    self._unusable = True
+                if close_error is not None:
+                    raise CameraCleanupError(
+                        "state replay and fresh handle close both failed",
+                        (replay_error, close_error),
+                    ) from error
+                raise replay_error from error
         try:
             if structure_changed:
                 handle.put_AutoExpoEnable(False)
@@ -768,6 +849,57 @@ class ToupTekCamera:
             hardware_binning,
             software_binning,
         )
+
+    def _snapshot_persistent_native_state(
+        self,
+        handle: Any,
+    ) -> _PersistentNativeState:
+        return _PersistentNativeState(
+            gain=handle.get_ExpoAGain(),
+            exposure_us=handle.get_ExpoTime(),
+            auto_exposure=bool(handle.get_AutoExpoEnable()),
+            tec_target_deci_c=handle.get_Option(
+                self._sdk.TOUPCAM_OPTION_TECTARGET
+            ),
+            tec_enabled=handle.get_Option(self._sdk.TOUPCAM_OPTION_TEC),
+            fan=handle.get_Option(self._sdk.TOUPCAM_OPTION_FAN),
+            rotate=handle.get_Option(self._sdk.TOUPCAM_OPTION_ROTATE),
+            tec_voltage_max=handle.get_Option(
+                self._sdk.TOUPCAM_OPTION_TEC_VOLTAGE_MAX
+            ),
+            hflip=bool(handle.get_HFlip()),
+            vflip=bool(handle.get_VFlip()),
+        )
+
+    def _replay_persistent_native_state(
+        self,
+        handle: Any,
+        state: _PersistentNativeState,
+    ) -> None:
+        current = self._snapshot_persistent_native_state(handle)
+        if current.gain != state.gain:
+            handle.put_ExpoAGain(state.gain)
+        if current.exposure_us != state.exposure_us:
+            handle.put_ExpoTime(state.exposure_us)
+        if current.auto_exposure != state.auto_exposure:
+            handle.put_AutoExpoEnable(state.auto_exposure)
+        if current.tec_target_deci_c != state.tec_target_deci_c:
+            handle.put_Temperature(state.tec_target_deci_c)
+        if current.tec_voltage_max != state.tec_voltage_max:
+            handle.put_Option(
+                self._sdk.TOUPCAM_OPTION_TEC_VOLTAGE_MAX,
+                state.tec_voltage_max,
+            )
+        if current.tec_enabled != state.tec_enabled:
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_TEC, state.tec_enabled)
+        if current.fan != state.fan:
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_FAN, state.fan)
+        if current.rotate != state.rotate:
+            handle.put_Option(self._sdk.TOUPCAM_OPTION_ROTATE, state.rotate)
+        if current.hflip != state.hflip:
+            handle.put_HFlip(state.hflip)
+        if current.vflip != state.vflip:
+            handle.put_VFlip(state.vflip)
 
     def _pace_reused_trigger(self) -> None:
         """Allow the device's completed-frame pipeline to accept the next trigger."""

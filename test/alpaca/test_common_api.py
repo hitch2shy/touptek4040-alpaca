@@ -58,8 +58,11 @@ def test_common_identification_strings_match_approved_device(client):
 def test_error_and_success_envelopes_preserve_transactions(client):
     unsupported = client.simulate_put(
         "/api/v1/camera/0/action",
-        params={"ClientTransactionID": "23"},
-        json={"Action": "x", "Parameters": ""},
+        json={
+            "Action": "x",
+            "Parameters": "",
+            "ClientTransactionID": "23",
+        },
     )
     assert unsupported.status_code == 200
     assert unsupported.json["ClientTransactionID"] == 23
@@ -98,15 +101,16 @@ def test_unsupported_common_puts_parse_parameters_before_business_error(
     assert response.json["ErrorNumber"] == 0x401
 
 
-def test_connected_put_is_synchronous_and_case_insensitive(disconnected_client):
+def test_connected_put_requires_exact_parameter_casing(disconnected_client):
     response = disconnected_client.simulate_put(
         "/api/v1/camera/0/connected",
         json={"cOnNeCtEd": "true"},
     )
-    assert response.json["ErrorNumber"] == 0
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == 0x401
     assert (
         disconnected_client.simulate_get("/api/v1/camera/0/connected").json["Value"]
-        is True
+        is False
     )
 
 

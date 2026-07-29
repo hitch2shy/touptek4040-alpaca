@@ -1,6 +1,9 @@
 import { mutate } from "./api.js";
 
 const byId = (id) => document.getElementById(id);
+let confirmedHeaterLevel = null;
+let renderedHeaterMaximum = null;
+let heaterWritable = false;
 
 export function readSettings() {
   return {
@@ -27,6 +30,58 @@ export function writeSettings(settings) {
   byId("roi-height").value = String(settings.roi.height);
   byId("target-temperature").value = String(settings.targetTemperature);
   byId("cooler-on").checked = settings.coolerOn;
+}
+
+export function writeHeaterState(state) {
+  const heater = byId("heater-level");
+  const status = byId("heater-status");
+  const maximum = Number.isInteger(state.heaterMaxLevel)
+    && state.heaterMaxLevel >= 0
+    ? state.heaterMaxLevel
+    : null;
+  if (renderedHeaterMaximum !== maximum) {
+    const options = [];
+    const off = document.createElement("option");
+    off.value = "0";
+    off.textContent = "Off";
+    options.push(off);
+    for (let level = 1; level <= (maximum ?? 0); level += 1) {
+      const option = document.createElement("option");
+      option.value = String(level);
+      option.textContent = String(level);
+      options.push(option);
+    }
+    heater.replaceChildren(...options);
+    renderedHeaterMaximum = maximum;
+  }
+
+  const confirmed = Number.isInteger(state.heaterLevel)
+    && state.heaterLevel >= 0
+    && (maximum == null || state.heaterLevel <= maximum)
+    ? state.heaterLevel
+    : null;
+  if (confirmed != null) {
+    confirmedHeaterLevel = confirmed;
+    heater.value = String(confirmed);
+  }
+  heaterWritable = state.heaterWritable === true;
+  heater.disabled = !heaterWritable;
+
+  if (!state.connected) {
+    status.textContent = "Not connected";
+  } else if (maximum == null) {
+    status.textContent = "Read failed";
+  } else if (!state.heaterSupported) {
+    status.textContent = "Not supported";
+  } else if (confirmed == null) {
+    status.textContent = "Read failed";
+  } else if (!heaterWritable) {
+    status.textContent = state.cameraState === "exposing"
+      ? `Level ${confirmed} · Exposing`
+      : `Level ${confirmed} · Read only`;
+  } else {
+    status.textContent = confirmed === 0 ? "Off" : `Level ${confirmed}`;
+  }
 }
 
 export function bindSettings(onApplied, onError) {
@@ -82,4 +137,37 @@ export function bindSettings(onApplied, onError) {
     "change",
     () => applyCooling("coolerOn"),
   );
+  byId("heater-level").addEventListener("change", async () => {
+    const heater = byId("heater-level");
+    const status = byId("heater-status");
+    const previous = confirmedHeaterLevel;
+    heater.disabled = true;
+    status.textContent = "Applying…";
+    try {
+      const result = await mutate(
+        "/web/v1/heater",
+        { heaterLevel: Number(heater.value) },
+      );
+      if (
+        !Number.isInteger(result.heaterLevel)
+        || result.heaterLevel < 0
+      ) {
+        throw new Error("Camera returned an invalid heater level");
+      }
+      confirmedHeaterLevel = result.heaterLevel;
+      heater.value = String(result.heaterLevel);
+      status.textContent = result.heaterLevel === 0
+        ? "Off"
+        : `Level ${result.heaterLevel}`;
+      onApplied();
+    } catch (error) {
+      if (previous != null) heater.value = String(previous);
+      status.textContent = previous == null
+        ? "Write failed"
+        : `Write failed · Level ${previous}`;
+      onError(error);
+    } finally {
+      heater.disabled = !heaterWritable;
+    }
+  });
 }

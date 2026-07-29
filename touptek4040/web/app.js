@@ -2,7 +2,12 @@ import { eventStream, getJson, mutate } from "./api.js";
 import { bindImageViewer, setGeneration } from "./image-viewer.js";
 import { authoritativeReadout } from "./generation-contract.js";
 import { bindLogs, refreshLogs } from "./log-view.js";
-import { bindSettings, readSettings, writeSettings } from "./settings-sync.js";
+import {
+  bindSettings,
+  readSettings,
+  writeHeaterState,
+  writeSettings,
+} from "./settings-sync.js";
 
 const byId = (id) => document.getElementById(id);
 let currentState = null;
@@ -36,6 +41,7 @@ function applyState(state) {
   byId("abort-button").disabled = !state.connected || state.cameraState !== "exposing";
   byId("apply-settings").disabled = !state.connected || state.cameraState !== "idle";
   byId("status-readout").textContent = authoritativeReadout(state);
+  writeHeaterState(state);
 
   const exposing = state.cameraState === "exposing";
   byId("exposure-progress").hidden = !exposing;

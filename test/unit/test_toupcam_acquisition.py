@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import Event
 from datetime import timezone
+import time
 
 import numpy as np
 import pytest
@@ -17,10 +18,16 @@ from test.fixtures.fake_toupcam import (
     E_UNEXPECTED,
     FakeHResultError,
     FakeSdk,
+    OPTION_FAN,
+    OPTION_ROTATE,
+    OPTION_TEC,
+    OPTION_TECTARGET,
+    OPTION_TEC_VOLTAGE_MAX,
     OPTION_HEAT,
     FLAG_HEAT,
 )
-from touptek4040.camera_contract import ReadoutMode, Roi
+from touptek4040.camera_contract import ExposureSettings, ReadoutMode, Roi
+from touptek4040.camera_coordinator import CameraCoordinator
 from touptek4040.errors import (
     CameraBusyError,
     CameraCleanupError,
@@ -257,6 +264,131 @@ def test_structural_change_stops_reconfigures_and_restarts(camera: ToupTekCamera
     )
 
 
+def test_structural_reopen_replays_persistent_state_on_a_fresh_handle() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    old_handle = camera._handle
+    old_handle.gain = 321
+    old_handle.exposure_us = 54_321
+    old_handle.auto_exposure = False
+    old_handle.options[OPTION_TECTARGET] = -123
+    old_handle.options[OPTION_TEC] = 0
+    old_handle.options[OPTION_FAN] = 3
+    old_handle.options[OPTION_ROTATE] = 180
+    old_handle.options[OPTION_TEC_VOLTAGE_MAX] = 88
+    old_handle.hflip = True
+    old_handle.vflip = True
+    sdk.calls.clear()
+
+    frame = camera.acquire(
+        0.02,
+        Roi(2, 4, 32, 24),
+        2,
+        ReadoutMode.RAW8,
+    )
+
+    new_handle = camera._handle
+    assert new_handle is not old_handle
+    assert old_handle.closed is True
+    assert frame.gain == 321
+    assert new_handle.gain == 321
+    assert new_handle.exposure_us == 20_000
+    assert new_handle.auto_exposure is False
+    assert new_handle.options[OPTION_TECTARGET] == -123
+    assert new_handle.options[OPTION_TEC] == 0
+    assert new_handle.options[OPTION_FAN] == 3
+    assert new_handle.options[OPTION_ROTATE] == 180
+    assert new_handle.options[OPTION_TEC_VOLTAGE_MAX] == 88
+    assert new_handle.hflip is True
+    assert new_handle.vflip is True
+    stop_index = sdk.calls.index(("Stop",))
+    assert sdk.calls.index(("get_Option", OPTION_FAN)) < stop_index
+    replay_calls = sdk.calls[sdk.calls.index(("Open", f"sn:{camera.serial}")) + 1 :]
+    assert ("put_Temperature", -123) in replay_calls
+    assert ("put_ExpoTime", 54_321) in replay_calls
+    assert replay_calls.index(("put_ExpoTime", 54_321)) < replay_calls.index(
+        ("put_ExpoTime", 20_000)
+    )
+
+
+def test_structural_reopen_does_not_rewrite_equal_fresh_handle_state() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+
+    def reject_redundant_temperature_write(handle) -> None:
+        handle.put_temperature_error = AssertionError(
+            "equal TEC target must not be rewritten"
+        )
+
+    sdk.next_open_setup = reject_redundant_temperature_write
+    sdk.calls.clear()
+
+    camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    replay_calls = sdk.calls[sdk.calls.index(("Open", f"sn:{camera.serial}")) + 1 :]
+    assert ("put_Temperature", -100) not in replay_calls
+    assert ("put_ExpoAGain", 100) not in replay_calls
+    for option in (
+        OPTION_TEC,
+        OPTION_FAN,
+        OPTION_ROTATE,
+        OPTION_TEC_VOLTAGE_MAX,
+    ):
+        assert not any(
+            call[:2] == ("put_Option", option) for call in replay_calls
+        )
+    assert not any(call[0] in {"put_HFlip", "put_VFlip"} for call in replay_calls)
+
+
+def test_structural_reopen_snapshot_failure_keeps_old_handle_owned() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    old_handle = camera._handle
+    old_handle.get_option_errors[OPTION_FAN] = FakeHResultError(E_FAIL)
+    opens_before = len(sdk.Toupcam.handles)
+
+    with pytest.raises(CameraError):
+        camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    assert camera._handle is old_handle
+    assert old_handle.closed is False
+    assert len(sdk.Toupcam.handles) == opens_before
+
+
+def test_structural_reopen_replay_failure_closes_and_quarantines_fresh_handle() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    camera._handle.options[OPTION_FAN] = 3
+
+    def fail_fan_replay(handle) -> None:
+        handle.put_option_errors[OPTION_FAN] = FakeHResultError(E_FAIL)
+
+    sdk.next_open_setup = fail_fan_replay
+
+    with pytest.raises(CameraError):
+        camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    fresh_handle = sdk.Toupcam.handle
+    assert fresh_handle.closed is True
+    assert camera._handle is None
+    assert fresh_handle.started is False
+    open_index = max(
+        index for index, call in enumerate(sdk.calls) if call[0] == "Open"
+    )
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in sdk.calls[open_index + 1 :]
+    )
+
+
 def test_camera_is_stopped_when_trigger_fails(camera: ToupTekCamera) -> None:
     """An SDK error must not strand the camera in its running state."""
     camera._handle.trigger_error = FakeHResultError(E_TIMEOUT)
@@ -430,6 +562,88 @@ def test_disconnect_waits_for_abort_stop_and_all_native_calls(
             exposure.result(1)
         disconnect.result(1)
     assert camera._sdk.calls[-1] == ("Close",)
+
+
+def test_disconnect_during_configuration_prevents_start_and_trigger(
+    camera: ToupTekCamera,
+) -> None:
+    handle = camera._handle
+    handle.block_put_option = True
+    handle.put_option_release.clear()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        acquisition = pool.submit(
+            camera.acquire,
+            0.01,
+            Roi(0, 0, 32, 32),
+            1,
+            ReadoutMode.RAW12,
+        )
+        assert handle.put_option_entered.wait(1)
+        disconnect = pool.submit(camera.disconnect)
+        deadline = camera._monotonic() + 1.0
+        while not camera._disconnecting and camera._monotonic() < deadline:
+            camera._sleeper(0.001)
+        assert camera._disconnecting is True
+        handle.put_option_release.set()
+
+        with pytest.raises(CameraNotConnectedError):
+            acquisition.result(1)
+        disconnect.result(1)
+
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in camera._sdk.calls
+    )
+    assert handle.closed is True
+
+
+@pytest.mark.parametrize("path", ["formal", "preview"])
+def test_coordinator_disconnect_during_configuration_prevents_native_start(
+    path: str,
+) -> None:
+    sdk = FakeSdk()
+    sdk.resolution = (32, 32)
+    camera = ToupTekCamera("TP241025143218C92B01151AEC40CB7", sdk=sdk)
+    coordinator = CameraCoordinator(lambda _source: camera, "hardware")
+    coordinator.set_connected_sync(True)
+    handle = camera._handle
+    handle.block_put_option = True
+    handle.put_option_release.clear()
+    sdk.calls.clear()
+
+    if path == "formal":
+        coordinator.start_exposure(
+            0.01,
+            True,
+            settings=lambda _capabilities: ExposureSettings(
+                Roi(0, 0, 16, 16),
+                1,
+                ReadoutMode.RAW12,
+                100,
+            ),
+        )
+    else:
+        coordinator.start_preview(lambda _frame: None)
+    assert handle.put_option_entered.wait(1)
+
+    coordinator.disconnect_async()
+    deadline = time.monotonic() + 1.0
+    while not camera._disconnecting and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert camera._disconnecting is True
+    handle.put_option_release.set()
+    deadline = time.monotonic() + 1.0
+    while coordinator.snapshot().connecting and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert coordinator.snapshot().connected is False
+    assert coordinator.snapshot().connecting is False
+    assert not any(
+        call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
+        for call in sdk.calls
+    )
+    assert camera._handle is None
 
 
 def test_abort_before_final_commit_discards_the_built_frame(
@@ -749,6 +963,7 @@ def test_cancelled_start_control_never_reaches_native_acquisition(
         call[0] in {"StartPullModeWithCallback", "TriggerSyncV4"}
         for call in camera._sdk.calls
     )
+
 
 @pytest.mark.parametrize("operation", ["read", "write"])
 def test_heater_operations_are_serialized_behind_an_active_exposure(

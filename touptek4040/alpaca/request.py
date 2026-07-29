@@ -1,4 +1,4 @@
-"""Case-insensitive Alpaca request parameter parsing."""
+"""ASCOM Alpaca GET-query and PUT-form request parameter parsing."""
 
 from __future__ import annotations
 
@@ -26,23 +26,59 @@ def _casefolded_fields(value: Any, source: str) -> dict[str, Any]:
     for key, field_value in value.items():
         if not isinstance(key, str):
             raise TypeError(f"{source} parameter names must be strings")
-        fields[key.casefold()] = field_value
+        folded = key.casefold()
+        if folded in fields:
+            raise TypeError(f"{source} contains duplicate parameter names")
+        fields[folded] = field_value
     return fields
 
 
-def _request_fields(request: Any) -> dict[str, Any]:
+def _exact_fields(value: Any, source: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{source} parameters must be a mapping")
+
+    fields: dict[str, Any] = {}
+    folded_names: set[str] = set()
+    for key, field_value in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{source} parameter names must be strings")
+        folded = key.casefold()
+        if folded in folded_names:
+            raise TypeError(f"{source} contains duplicate parameter names")
+        folded_names.add(folded)
+        fields[key] = field_value
+    return fields
+
+
+def _request_fields(request: Any) -> tuple[dict[str, Any], bool]:
     try:
-        fields = _casefolded_fields(request.params, "query")
         method = request.method
         if not isinstance(method, str):
             raise TypeError("request method must be a string")
         if method.casefold() == "put":
-            fields.update(_casefolded_fields(request.media, "PUT media"))
-        return fields
+            if getattr(request, "content_length", _MISSING) in (None, 0):
+                return {}, True
+            return _exact_fields(request.media, "PUT media"), True
+        return _casefolded_fields(request.params, "query"), False
     except AlpacaError:
         raise
     except Exception as exc:
         raise _invalid_parameters(exc) from exc
+
+
+def _parameter_value(request: Any, name: str) -> Any:
+    fields, exact = _request_fields(request)
+    lookup = name if exact else name.casefold()
+    value = fields.get(lookup, _MISSING)
+    if value is _MISSING and exact:
+        if any(key.casefold() == name.casefold() for key in fields):
+            raise RequestParseError(
+                INVALID_VALUE,
+                f"Invalid parameter name casing: {name}",
+            )
+    return value
 
 
 def get_parameter(
@@ -53,7 +89,7 @@ def get_parameter(
     """Return a case-insensitive parameter, with PUT media taking precedence."""
 
     try:
-        value = _request_fields(request).get(name.casefold(), _MISSING)
+        value = _parameter_value(request, name)
     except AlpacaError:
         raise
     except Exception as exc:
@@ -72,12 +108,12 @@ def get_parameter(
 def client_transaction_id(request: Any) -> int:
     """Parse the optional uint32 ClientTransactionID, defaulting to zero."""
 
-    value = _request_fields(request).get("clienttransactionid", _MISSING)
+    value = _parameter_value(request, "ClientTransactionID")
     if value is _MISSING:
         return 0
 
     if isinstance(value, bool):
-        transaction_id = 0
+        transaction_id = -1
     elif isinstance(value, int):
         transaction_id = value
     elif isinstance(value, str):
@@ -86,7 +122,7 @@ def client_transaction_id(request: Any) -> int:
             or not value.isascii()
             or not value.isdecimal()
         ):
-            transaction_id = 0
+            transaction_id = -1
         else:
             significant_digits = value.lstrip("0")
             if not significant_digits:
@@ -95,14 +131,14 @@ def client_transaction_id(request: Any) -> int:
                 try:
                     transaction_id = int(significant_digits)
                 except (TypeError, ValueError, OverflowError):
-                    transaction_id = 0
+                    transaction_id = -1
     else:
-        transaction_id = 0
+        transaction_id = -1
 
-    if not 1 <= transaction_id <= _UINT32_MAX:
+    if not 0 <= transaction_id <= _UINT32_MAX:
         raise RequestParseError(
             INVALID_VALUE,
-            "ClientTransactionID must be an integer from 1 through 4294967295",
+            "ClientTransactionID must be an unsigned 32-bit integer",
         )
     return transaction_id
 
@@ -110,7 +146,7 @@ def client_transaction_id(request: Any) -> int:
 def client_id(request: Any) -> int:
     """Validate the optional unsigned 32-bit Alpaca ClientID."""
 
-    value = _request_fields(request).get("clientid", _MISSING)
+    value = _parameter_value(request, "ClientID")
     if value is _MISSING:
         return 0
 

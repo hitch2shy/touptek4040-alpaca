@@ -262,8 +262,9 @@ def test_invalid_raw12_publication_has_stable_json_and_imagebytes_driver_error(
     coordinator,
     api_camera,
 ):
+    parameters = {"numx": "NumX", "numy": "NumY"}
     for command, value in (("numx", 16), ("numy", 16)):
-        response = _put(client, command, **{command: value})
+        response = _put(client, command, **{parameters[command]: value})
         assert response.json["ErrorNumber"] == 0
     api_camera.pixel_value = 4096
 

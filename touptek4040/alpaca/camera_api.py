@@ -437,9 +437,17 @@ class CameraApi:
 
     def _stop_exposure(self) -> None:
         self._require_connected()
+        state = self._coordinator.snapshot().camera_state
+        if state is CameraState.IDLE:
+            return
+        if state is CameraState.EXPOSING:
+            raise AlpacaError(
+                METHOD_NOT_IMPLEMENTED,
+                "StopExposure is not supported; use AbortExposure",
+            )
         raise AlpacaError(
-            METHOD_NOT_IMPLEMENTED,
-            "StopExposure is not supported; use AbortExposure",
+            INVALID_OPERATION,
+            f"StopExposure is not valid while state is {state.name}",
         )
 
     def _require_connected(self) -> None:

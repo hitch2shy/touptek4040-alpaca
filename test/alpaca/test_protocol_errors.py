@@ -126,3 +126,27 @@ def test_official_form_encoded_put_still_uses_task7_parsing(client):
     assert response.json["ClientTransactionID"] == 33
     assert response.json["ErrorNumber"] == 0
     assert client.simulate_get("/api/v1/camera/0/gain").json["Value"] == 250
+
+
+def test_put_wrong_member_casing_is_http_400_but_echoes_exact_ctid(client):
+    response = client.simulate_put(
+        "/api/v1/camera/0/gain",
+        body="gain=250&ClientTransactionID=33",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json["ClientTransactionID"] == 33
+    assert response.json["ErrorNumber"] == 0x401
+
+
+def test_put_wrong_ctid_casing_is_http_400_and_does_not_echo_it(client):
+    response = client.simulate_put(
+        "/api/v1/camera/0/abortexposure",
+        body="clienttransactionid=33",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json["ClientTransactionID"] == 0
+    assert response.json["ErrorNumber"] == 0x401

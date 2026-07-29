@@ -14,6 +14,13 @@ from touptek4040.camera_contract import (
     Roi,
 )
 from touptek4040.camera_coordinator import CameraState
+from touptek4040.errors import (
+    CameraBusyError,
+    CameraError,
+    CameraInvalidValueError,
+    CameraNotConnectedError,
+    CameraNotSupportedError,
+)
 from touptek4040.image_workspace import ImageWorkspace
 
 
@@ -28,6 +35,15 @@ class WebCoordinator:
         self.preview_active = False
         self.target_temperature_c = -10.0
         self.cooler_on = False
+        self.camera_state = CameraState.IDLE
+        self.heater_supported = True
+        self.heater_max_level = 5
+        self._heater_level = 0
+        self.heater_capability_reads = 0
+        self.heater_level_reads = 0
+        self.heater_writes: list[int] = []
+        self.heater_read_error: Exception | None = None
+        self.heater_write_error: Exception | None = None
         self.events = SimpleNamespace(subscribe=lambda: None)
         pixels = np.arange(256, dtype=np.uint16).reshape(16, 16)
         pixels[8, 8] = 4095
@@ -57,7 +73,7 @@ class WebCoordinator:
         return SimpleNamespace(
             connected=self.connected,
             connecting=False,
-            camera_state=CameraState.IDLE,
+            camera_state=self.camera_state,
             image_ready=True,
             percent_completed=None,
             error=None,
@@ -95,6 +111,52 @@ class WebCoordinator:
 
     def set_cooler_on_if_idle(self, value: bool) -> None:
         self.cooler_on = value
+
+    @property
+    def heater_supported(self) -> bool:
+        self.heater_capability_reads += 1
+        return self._heater_supported
+
+    @heater_supported.setter
+    def heater_supported(self, value: bool) -> None:
+        self._heater_supported = value
+
+    @property
+    def heater_max_level(self) -> int:
+        self.heater_capability_reads += 1
+        return self._heater_max_level
+
+    @heater_max_level.setter
+    def heater_max_level(self, value: int) -> None:
+        self._heater_max_level = value
+
+    @property
+    def heater_level(self) -> int:
+        self.heater_level_reads += 1
+        if self.heater_read_error is not None:
+            raise self.heater_read_error
+        return self._heater_level
+
+    def set_heater_level_if_idle(self, value: int) -> None:
+        if not self.connected:
+            raise CameraNotConnectedError("camera is not connected")
+        if self.camera_state is not CameraState.IDLE:
+            raise CameraBusyError("camera is exposing")
+        if not self.heater_supported:
+            raise CameraNotSupportedError("camera does not support a heater")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= self.heater_max_level
+        ):
+            raise CameraInvalidValueError("heater level is outside the supported range")
+        if self.heater_write_error is not None:
+            error = self.heater_write_error
+            if isinstance(error, CameraError):
+                raise error
+            raise CameraError(str(error))
+        self._heater_level = value
+        self.heater_writes.append(value)
 
     @property
     def temperature_c(self) -> float:

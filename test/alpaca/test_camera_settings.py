@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 import threading
+import time
+from types import SimpleNamespace
 
+import falcon.testing
 import pytest
 
 from touptek4040.alpaca.responses import (
@@ -11,6 +16,10 @@ from touptek4040.alpaca.responses import (
     METHOD_NOT_IMPLEMENTED,
     VALUE_NOT_SET,
 )
+from touptek4040.camera_coordinator import CameraCoordinator, CameraState
+from touptek4040.camera_owner import OwnerStartupSpec
+from touptek4040.camera_proxy import CameraOwnerProxy
+from touptek4040.config import OwnerConfig
 
 
 def get_value(client, command: str):
@@ -204,7 +213,8 @@ def test_valid_lexemes_defer_to_busy_state(
 @pytest.mark.parametrize("command", ["binx", "biny"])
 @pytest.mark.parametrize("binning", range(1, 9))
 def test_writing_either_bin_axis_synchronizes_both(command, binning, client):
-    response = put_value(client, command, command, str(binning))
+    parameter = {"binx": "BinX", "biny": "BinY"}[command]
+    response = put_value(client, command, parameter, str(binning))
     assert response.json["ErrorNumber"] == 0
     assert get_value(client, "binx") == binning
     assert get_value(client, "biny") == binning
@@ -534,10 +544,10 @@ def test_abort_exposure_delegates_to_coordinator(client, coordinator, api_camera
     assert api_camera.abort_calls >= 1
 
 
-def test_stop_exposure_is_not_implemented_and_canstop_is_false(client):
+def test_stop_exposure_is_idle_noop_and_canstop_is_false(client):
     assert get_value(client, "canstopexposure") is False
     response = client.simulate_put("/api/v1/camera/0/stopexposure")
-    assert response.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
+    assert response.json["ErrorNumber"] == 0
 
 
 def test_start_exposure_validates_parameters_without_native_exceptions(client):
@@ -549,10 +559,13 @@ def test_start_exposure_validates_parameters_without_native_exceptions(client):
     assert response.json["ErrorNumber"] == INVALID_VALUE
 
 
-def test_start_exposure_validates_the_nearest_integer_microsecond(client, coordinator):
+@pytest.mark.parametrize("requested", ["0", "0.0000004", "0.0000116", "0.000012"])
+def test_dark_or_bias_clamps_subminimum_duration_to_hardware_minimum(
+    client, coordinator, requested
+):
     response = client.simulate_put(
         "/api/v1/camera/0/startexposure",
-        json={"Duration": "0.0000116", "Light": "false"},
+        json={"Duration": requested, "Light": "false"},
     )
     assert response.json["ErrorNumber"] == 0
     thread = coordinator._exposure_thread
@@ -560,6 +573,16 @@ def test_start_exposure_validates_the_nearest_integer_microsecond(client, coordi
     thread.join()
     assert coordinator.frame is not None
     assert coordinator.frame.duration_s == 0.000012
+    assert get_value(client, "lastexposureduration") == 0.000012
+
+
+def test_light_zero_duration_is_invalid(client):
+    response = client.simulate_put(
+        "/api/v1/camera/0/startexposure",
+        json={"Duration": "0", "Light": "true"},
+    )
+
+    assert response.json["ErrorNumber"] == INVALID_VALUE
 
 
 def test_stop_exposure_is_not_implemented_while_exposing(
@@ -576,3 +599,198 @@ def test_stop_exposure_is_not_implemented_while_exposing(
     )
     response = client.simulate_put("/api/v1/camera/0/stopexposure")
     assert response.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param(1, id="waiting"),
+        pytest.param(3, id="reading"),
+        pytest.param(4, id="download"),
+        pytest.param(5, id="error"),
+    ],
+)
+def test_stop_exposure_rejects_nonidle_nonexposing_states(
+    client, coordinator, monkeypatch, state
+):
+    from touptek4040.camera_coordinator import CameraSnapshot, CameraState
+
+    monkeypatch.setattr(
+        coordinator,
+        "snapshot",
+        lambda: CameraSnapshot(
+            True,
+            False,
+            CameraState(state),
+            False,
+            0,
+            None,
+        ),
+    )
+
+    response = client.simulate_put("/api/v1/camera/0/stopexposure")
+
+    assert response.json["ErrorNumber"] == INVALID_OPERATION
+
+
+def test_owner_backed_dark_zero_and_idle_stop_preserve_camera_v4_semantics(
+    tmp_path: Path,
+):
+    client, coordinator, state_path = _owner_backed_alpaca_client(tmp_path)
+    try:
+        started = client.simulate_put(
+            "/api/v1/camera/0/startexposure",
+            json={"Duration": "0", "Light": "false"},
+        )
+        assert started.json["ErrorNumber"] == 0
+        _wait_until(
+            lambda: coordinator.snapshot().camera_state is CameraState.IDLE
+            and coordinator.frame is not None
+        )
+
+        owner_state = _read_owner_state(state_path)
+        acquire_events = [
+            event
+            for event in owner_state["events"]
+            if event["operation"] == "acquire"
+        ]
+        assert acquire_events[-1]["duration_s"] == 0.000012
+        assert get_value(client, "lastexposureduration") == 0.000012
+
+        light_zero = client.simulate_put(
+            "/api/v1/camera/0/startexposure",
+            json={"Duration": "0", "Light": "true"},
+        )
+        assert light_zero.json["ErrorNumber"] == INVALID_VALUE
+        assert len(
+            [
+                event
+                for event in _read_owner_state(state_path)["events"]
+                if event["operation"] == "acquire"
+            ]
+        ) == 1
+
+        stopped = client.simulate_put("/api/v1/camera/0/stopexposure")
+        assert stopped.json["ErrorNumber"] == 0
+    finally:
+        _close_owner_backed_coordinator(coordinator)
+
+
+def test_owner_backed_in_progress_stop_reports_method_not_implemented(
+    tmp_path: Path,
+):
+    client, coordinator, state_path = _owner_backed_alpaca_client(
+        tmp_path,
+        block_acquire=True,
+    )
+    try:
+        started = client.simulate_put(
+            "/api/v1/camera/0/startexposure",
+            json={"Duration": "1", "Light": "true"},
+        )
+        assert started.json["ErrorNumber"] == 0
+        _wait_until(
+            lambda: bool(
+                coordinator._camera is not None
+                and coordinator._camera.exposing
+            )
+        )
+        time.sleep(0.05)
+        assert any(
+            event["operation"] == "acquire"
+            for event in _read_owner_state(state_path)["events"]
+        )
+        assert coordinator.snapshot().camera_state is CameraState.EXPOSING
+
+        stopped = client.simulate_put("/api/v1/camera/0/stopexposure")
+
+        assert stopped.json["ErrorNumber"] == METHOD_NOT_IMPLEMENTED
+        aborted = client.simulate_put("/api/v1/camera/0/abortexposure")
+        assert aborted.json["ErrorNumber"] == 0
+        _wait_until(
+            lambda: coordinator.snapshot().camera_state is CameraState.IDLE
+        )
+    finally:
+        _close_owner_backed_coordinator(coordinator)
+
+
+def _owner_backed_alpaca_client(
+    tmp_path: Path,
+    *,
+    block_acquire: bool = False,
+):
+    from run_alpaca import RuntimeCameraCoordinator
+    from touptek4040.alpaca.app import create_app
+
+    state_path = tmp_path / "owner-state.json"
+    proxy = CameraOwnerProxy(
+        owner_config=OwnerConfig(
+            startup_timeout_s=2,
+            connect_timeout_s=2,
+            command_timeout_s=1,
+            exposure_overhead_s=1,
+            exposure_multiplier=1,
+            abort_timeout_s=1,
+            disconnect_timeout_s=2,
+        ),
+        runtime_directory=tmp_path,
+        startup_spec=OwnerStartupSpec(
+            serial="TP241025143218C92B01151AEC40CB7",
+            backend_module="test.fixtures.fake_owner_backend",
+            backend_factory="create_backend",
+            backend_arguments={
+                "state_path": str(state_path),
+                "block_acquire": block_acquire,
+            },
+        ),
+    )
+    coordinator = RuntimeCameraCoordinator(
+        lambda _source: proxy,
+        "owner-backed-test",
+        supervisor_close=proxy.close,
+    )
+    config = SimpleNamespace(
+        camera=SimpleNamespace(
+            serial="TP241025143218C92B01151AEC40CB7",
+            readout_mode="RAW 12-bit",
+            gain=100,
+        ),
+        web=SimpleNamespace(enabled=False),
+    )
+    coordinator.set_connected_sync(True)
+    client = falcon.testing.TestClient(create_app(coordinator, config))
+    for command, parameter in (("numx", "NumX"), ("numy", "NumY")):
+        response = client.simulate_put(
+            f"/api/v1/camera/0/{command}",
+            json={parameter: 16},
+        )
+        assert response.json["ErrorNumber"] == 0
+    return (
+        client,
+        coordinator,
+        state_path,
+    )
+
+
+def _read_owner_state(path: Path) -> dict[str, object]:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.005)
+    raise AssertionError("owner state was not published")
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition was not reached before timeout")
+        time.sleep(0.005)
+
+
+def _close_owner_backed_coordinator(coordinator: CameraCoordinator) -> None:
+    import run_alpaca
+
+    run_alpaca.close_camera_coordinator(coordinator)

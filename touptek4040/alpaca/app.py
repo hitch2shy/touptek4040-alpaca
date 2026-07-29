@@ -238,10 +238,6 @@ def _error_response(
 
 
 def _request_client_id(request: falcon.Request) -> int:
-    if request.method == "PUT" and request.content_length in (None, 0):
-        query_only = SimpleNamespace(method="GET", params=request.params)
-        client_id(query_only)
-        return client_transaction_id(query_only)
     client_id(request)
     return client_transaction_id(request)
 

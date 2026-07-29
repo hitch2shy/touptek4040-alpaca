@@ -120,6 +120,10 @@ class WebConsole:
         self._settings_lock = threading.RLock()
         self._target_temperature_c = -10.0
         self._cooler_on = False
+        self._heater_supported = False
+        self._heater_max_level: int | None = None
+        self._heater_level: int | None = None
+        self._heater_update_lock = threading.Lock()
         self.logs = LogBuffer()
         self.logs.append(
             "warning",
@@ -218,6 +222,32 @@ class WebConsole:
             "coolerOn": settings["coolerOn"],
         }
 
+    def update_heater(self, payload: object) -> dict[str, object]:
+        body = _object_with_keys(
+            payload,
+            {"heaterLevel"},
+            required={"heaterLevel"},
+        )
+        if len(body) != 1:
+            raise ValueError("Invalid request body")
+        level = body["heaterLevel"]
+        if isinstance(level, bool) or not isinstance(level, int):
+            raise ValueError("Invalid request body")
+        with self._heater_update_lock:
+            self.coordinator.set_heater_level_if_idle(level)
+            confirmed = self.coordinator.heater_level
+            if (
+                isinstance(confirmed, bool)
+                or not isinstance(confirmed, int)
+                or confirmed < 0
+            ):
+                raise CameraError("camera returned an invalid heater level")
+            with self._settings_lock:
+                self._heater_supported = True
+                self._heater_level = confirmed
+        self.logs.append("info", f"Dew heater set to level {confirmed}")
+        return {"heaterLevel": confirmed}
+
     def state(self) -> dict[str, object]:
         snapshot = self.coordinator.snapshot()
         generation = self.display_generation()
@@ -243,6 +273,11 @@ class WebConsole:
         except Exception:
             cooler_power = None
         state_number = int(snapshot.camera_state)
+        heater_state = self._heater_state(
+            connected=bool(snapshot.connected),
+            connecting=bool(snapshot.connecting),
+            state_number=state_number,
+        )
         image = None
         if generation is not None:
             readout_mode = (
@@ -272,12 +307,76 @@ class WebConsole:
             "settings": acquisition_settings,
             "temperature": temperature,
             "coolerPower": cooler_power,
+            **heater_state,
             "error": (
                 safe_exception_text(snapshot.error)
                 if snapshot.error is not None
                 else None
             ),
         }
+
+    def _heater_state(
+        self,
+        *,
+        connected: bool,
+        connecting: bool,
+        state_number: int,
+    ) -> dict[str, object]:
+        if not connected or connecting:
+            with self._settings_lock:
+                self._heater_supported = False
+                self._heater_max_level = None
+                self._heater_level = None
+            return _heater_media(False, None, None, False)
+
+        if state_number != 0:
+            with self._settings_lock:
+                return _heater_media(
+                    self._heater_supported,
+                    self._heater_max_level,
+                    self._heater_level,
+                    False,
+                )
+
+        try:
+            supported = self.coordinator.heater_supported
+            if not isinstance(supported, bool):
+                raise CameraError("camera returned invalid heater support")
+            if not supported:
+                with self._settings_lock:
+                    self._heater_supported = False
+                    self._heater_max_level = 0
+                    self._heater_level = None
+                return _heater_media(False, 0, None, False)
+            maximum = self.coordinator.heater_max_level
+            if (
+                isinstance(maximum, bool)
+                or not isinstance(maximum, int)
+                or maximum < 0
+            ):
+                raise CameraError("camera returned an invalid heater maximum")
+        except Exception:
+            return _heater_media(False, None, None, False)
+
+        try:
+            level = self.coordinator.heater_level
+            if (
+                isinstance(level, bool)
+                or not isinstance(level, int)
+                or not 0 <= level <= maximum
+            ):
+                raise CameraError("camera returned an invalid heater level")
+        except Exception:
+            with self._settings_lock:
+                self._heater_supported = True
+                self._heater_max_level = maximum
+            return _heater_media(True, maximum, None, False)
+
+        with self._settings_lock:
+            self._heater_supported = True
+            self._heater_max_level = maximum
+            self._heater_level = level
+        return _heater_media(True, maximum, level, True)
 
     def display_generation(self) -> ImageGeneration | None:
         preview = getattr(self.coordinator, "preview_generation", None)
@@ -364,7 +463,14 @@ def register_web_console(
             f"/web/v1/{command}",
             WebJsonResource(console, command),
         )
-    for command in ("connection", "preview", "exposure", "abort", "cooling"):
+    for command in (
+        "connection",
+        "preview",
+        "exposure",
+        "abort",
+        "cooling",
+        "heater",
+    ):
         app.add_route(
             f"/web/v1/{command}",
             WebMutationResource(console, command),
@@ -499,6 +605,9 @@ class WebMutationResource:
                 response.status = falcon.HTTP_202
             elif self._command == "cooling":
                 response.media = self._console.update_cooling(body)
+                response.status = falcon.HTTP_200
+            elif self._command == "heater":
+                response.media = self._console.update_heater(body)
                 response.status = falcon.HTTP_200
             else:
                 response.media = self._console.update_settings(body)
@@ -818,6 +927,20 @@ def _settings_media(settings: WebSettings) -> dict[str, object]:
         "readoutMode": settings.readout_mode,
         "gain": settings.gain,
         "roi": asdict(settings.roi),
+    }
+
+
+def _heater_media(
+    supported: bool,
+    maximum: int | None,
+    level: int | None,
+    writable: bool,
+) -> dict[str, object]:
+    return {
+        "heaterSupported": supported,
+        "heaterLevel": level,
+        "heaterMaxLevel": maximum,
+        "heaterWritable": writable,
     }
 
 

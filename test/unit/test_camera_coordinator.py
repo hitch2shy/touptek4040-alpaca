@@ -22,6 +22,7 @@ from touptek4040.errors import (
     CameraError,
     CameraInvalidValueError,
     CameraNotConnectedError,
+    CameraNotSupportedError,
     CameraOperationCancelledError,
 )
 
@@ -87,6 +88,18 @@ class ControlledCamera:
         self.disconnect_error: Exception | None = None
         self.failure: Exception | None = None
         self._gain = 100
+        self._heater_supported = True
+        self._heater_max_level = 5
+        self._heater_level = 0
+        self.heater_capability_reads = 0
+        self.heater_level_reads = 0
+        self.heater_writes: list[int] = []
+        self.heater_set_started = threading.Event()
+        self.heater_set_release = threading.Event()
+        self.heater_set_release.set()
+        self.block_heater_set = False
+        self.active_heater_sets = 0
+        self.max_active_heater_sets = 0
         self.gain_error: Exception | None = None
         self.block_gain = False
         self.gain_started = threading.Event()
@@ -189,6 +202,37 @@ class ControlledCamera:
             raise self.gain_error
         self._gain = value
 
+    @property
+    def heater_supported(self) -> bool:
+        self.heater_capability_reads += 1
+        return self._heater_supported
+
+    @property
+    def heater_max_level(self) -> int:
+        self.heater_capability_reads += 1
+        return self._heater_max_level
+
+    @property
+    def heater_level(self) -> int:
+        self.heater_level_reads += 1
+        return self._heater_level
+
+    @heater_level.setter
+    def heater_level(self, value: int) -> None:
+        self.heater_set_started.set()
+        self.active_heater_sets += 1
+        self.max_active_heater_sets = max(
+            self.max_active_heater_sets,
+            self.active_heater_sets,
+        )
+        try:
+            if self.block_heater_set:
+                self.heater_set_release.wait(2.0)
+            self._heater_level = value
+            self.heater_writes.append(value)
+        finally:
+            self.active_heater_sets -= 1
+
     def abort(self) -> None:
         self.abort_count += 1
         if self.abort_error is not None:
@@ -244,6 +288,7 @@ def controlled_camera():
         camera.release_frame()
     camera.connect_release.set()
     camera.disconnect_release.set()
+    camera.heater_set_release.set()
 
 
 @pytest.fixture
@@ -719,6 +764,94 @@ def test_coordinator_is_the_only_gateway_to_capabilities_and_cooling(
     assert coordinator.cooler_power_percent == 50.0
 
 
+@pytest.mark.parametrize("level", range(6))
+def test_coordinator_validates_and_writes_device_heater_levels(
+    coordinator,
+    controlled_camera,
+    level,
+):
+    coordinator.set_heater_level_if_idle(level)
+
+    assert controlled_camera.heater_writes == [level]
+    assert coordinator.heater_supported is True
+    assert coordinator.heater_max_level == 5
+    assert coordinator.heater_level == level
+
+
+@pytest.mark.parametrize("level", [True, 1.0, "1", -1, 6])
+def test_coordinator_rejects_invalid_heater_levels_without_writing(
+    coordinator,
+    controlled_camera,
+    level,
+):
+    with pytest.raises(CameraInvalidValueError):
+        coordinator.set_heater_level_if_idle(level)
+
+    assert controlled_camera.heater_writes == []
+
+
+def test_coordinator_rejects_unsupported_heater_without_writing(
+    coordinator,
+    controlled_camera,
+):
+    controlled_camera._heater_supported = False
+
+    with pytest.raises(CameraNotSupportedError):
+        coordinator.set_heater_level_if_idle(0)
+
+    assert controlled_camera.heater_writes == []
+
+
+def test_heater_write_during_exposure_stops_before_owner_or_camera_access(
+    coordinator,
+    controlled_camera,
+):
+    coordinator.start_exposure(0.1, True)
+    controlled_camera.wait_for_acquisitions(1)
+    reads_before = controlled_camera.heater_capability_reads
+
+    with pytest.raises(CameraBusyError):
+        coordinator.set_heater_level_if_idle(2)
+
+    assert controlled_camera.heater_capability_reads == reads_before
+    assert controlled_camera.heater_writes == []
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+def test_concurrent_heater_writes_share_the_coordinator_linearization_point(
+    coordinator,
+    controlled_camera,
+):
+    controlled_camera.block_heater_set = True
+    controlled_camera.heater_set_release.clear()
+    first = threading.Thread(
+        target=coordinator.set_heater_level_if_idle,
+        args=(1,),
+    )
+    second = threading.Thread(
+        target=coordinator.set_heater_level_if_idle,
+        args=(2,),
+    )
+
+    first.start()
+    assert controlled_camera.heater_set_started.wait(1)
+    second.start()
+    time.sleep(0.05)
+
+    assert controlled_camera.max_active_heater_sets == 1
+    assert controlled_camera.heater_writes == []
+
+    controlled_camera.heater_set_release.set()
+    first.join(1)
+    second.join(1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert controlled_camera.max_active_heater_sets == 1
+    assert controlled_camera.heater_writes == [1, 2]
+
+
 def test_disconnected_coordinator_rejects_cooling_access():
     coordinator = CameraCoordinator(lambda source: ControlledCamera(), "controlled")
 
@@ -746,8 +879,23 @@ def test_exposure_duration_is_quantized_and_accepts_inclusive_microsecond_bounds
 
 
 @pytest.mark.parametrize(
+    "requested",
+    [0.0, 0.0000004, 0.000011, 0.0000116, 0.000012],
+)
+def test_dark_or_bias_duration_clamps_to_hardware_minimum(
+    coordinator, controlled_camera, requested
+):
+    coordinator.start_exposure(requested, False)
+    controlled_camera.wait_for_acquisitions(1)
+
+    assert controlled_camera.requested_durations == [0.000012]
+    coordinator.abort_exposure()
+    controlled_camera.release_frame()
+
+
+@pytest.mark.parametrize(
     "duration_s",
-    [0.0000004, 0.000011, 3_600.000001, float("nan"), float("inf")],
+    [0.0, 0.0000004, 0.000011, 3_600.000001, float("nan"), float("inf")],
 )
 def test_invalid_quantized_duration_is_rejected_before_state_changes(
     coordinator, controlled_camera, duration_s
@@ -756,6 +904,22 @@ def test_invalid_quantized_duration_is_rejected_before_state_changes(
 
     with pytest.raises(CameraInvalidValueError):
         coordinator.start_exposure(duration_s, True)
+
+    assert coordinator.snapshot() == before
+    assert controlled_camera.acquire_count == 0
+
+
+@pytest.mark.parametrize(
+    "duration_s",
+    [-0.000001, 3_600.000001, float("nan"), float("inf")],
+)
+def test_dark_or_bias_rejects_negative_nonfinite_or_overmax_duration(
+    coordinator, controlled_camera, duration_s
+):
+    before = coordinator.snapshot()
+
+    with pytest.raises(CameraInvalidValueError):
+        coordinator.start_exposure(duration_s, False)
 
     assert coordinator.snapshot() == before
     assert controlled_camera.acquire_count == 0

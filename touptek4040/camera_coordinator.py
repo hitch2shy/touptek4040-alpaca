@@ -26,6 +26,7 @@ from .errors import (
     CameraError,
     CameraInvalidValueError,
     CameraNotConnectedError,
+    CameraNotSupportedError,
     CameraOperationCancelledError,
     CameraTimeoutError,
     safe_camera_error,
@@ -232,7 +233,8 @@ class CameraCoordinator:
         validate: Callable[[CameraCapabilities], None] | None = None,
         settings: Callable[[CameraCapabilities], ExposureSettings] | None = None,
     ) -> None:
-        del light  # The camera has no mechanical shutter.
+        if not isinstance(light, bool):
+            raise CameraInvalidValueError("light must be boolean")
         if validate is not None and not callable(validate):
             raise CameraInvalidValueError("exposure validator must be callable")
         if settings is not None and not callable(settings):
@@ -244,7 +246,7 @@ class CameraCoordinator:
         with self._condition:
             camera = self._require_available_camera_locked()
             self._require_exposure_startable_locked()
-            duration = self._validated_duration(duration_s)
+            duration = self._validated_duration(duration_s, light)
             capabilities = camera.capabilities
             if validate is not None:
                 validate(capabilities)
@@ -311,6 +313,25 @@ class CameraCoordinator:
             camera = self._require_available_camera_locked()
             self._require_idle_locked()
             camera.cooler_on = enabled
+
+    def set_heater_level_if_idle(self, level: int) -> None:
+        with self._condition:
+            camera = self._require_available_camera_locked()
+            self._require_idle_locked()
+            if isinstance(level, bool) or not isinstance(level, int):
+                raise CameraInvalidValueError(
+                    "heater level must be an integer"
+                )
+            if not camera.heater_supported:
+                raise CameraNotSupportedError(
+                    "camera does not support a heater"
+                )
+            maximum = camera.heater_max_level
+            if level < 0 or level > maximum:
+                raise CameraInvalidValueError(
+                    f"heater level must be an integer from 0 to {maximum}"
+                )
+            camera.heater_level = level
 
     def abort_exposure(self) -> None:
         with self._condition:
@@ -479,6 +500,18 @@ class CameraCoordinator:
     @property
     def cooler_power_percent(self) -> float:
         return self._available_camera().cooler_power_percent
+
+    @property
+    def heater_supported(self) -> bool:
+        return self._available_camera().heater_supported
+
+    @property
+    def heater_max_level(self) -> int:
+        return self._available_camera().heater_max_level
+
+    @property
+    def heater_level(self) -> int:
+        return self._available_camera().heater_level
 
     def _connect_worker(self, generation: int) -> None:
         camera: CameraContract | None = None
@@ -954,18 +987,22 @@ class CameraCoordinator:
         )
 
     @staticmethod
-    def _validated_duration(duration_s: float) -> float:
+    def _validated_duration(duration_s: float, light: bool = True) -> float:
         if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)):
             raise CameraInvalidValueError("duration_s must be numeric")
         duration = float(duration_s)
         if not math.isfinite(duration):
             raise CameraInvalidValueError("duration_s must be finite")
+        if duration < 0:
+            raise CameraInvalidValueError("duration_s must be non-negative")
         exposure_us = round(duration * 1_000_000)
-        if not 12 <= exposure_us <= 3_600_000_000:
+        if exposure_us > 3_600_000_000 or (light and exposure_us < 12):
             raise CameraInvalidValueError(
-                "duration_s must quantize to between 12 and "
+                "light duration_s must quantize to between 12 and "
                 "3600000000 microseconds"
             )
+        if not light:
+            exposure_us = max(12, exposure_us)
         return exposure_us / 1_000_000
 
     @staticmethod

@@ -23,10 +23,11 @@ def _wait_until(predicate, timeout: float = 1.0) -> None:
 
 
 def _complete_small_exposure(client, coordinator) -> None:
+    parameters = {"numx": "NumX", "numy": "NumY"}
     for command, value in (("numx", 16), ("numy", 16)):
         response = client.simulate_put(
             f"/api/v1/camera/0/{command}",
-            json={command: value},
+            json={parameters[command]: value},
         )
         assert response.json["ErrorNumber"] == 0
     started = client.simulate_put(

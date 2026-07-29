@@ -94,11 +94,11 @@ def test_duration_validation_and_settings_snapshot_share_one_linearization(
     responses = {}
     original = CameraCoordinator._validated_duration
 
-    def paused_validation(duration_s):
+    def paused_validation(duration_s, light=True):
         if threading.current_thread().name == "exposure-put":
             validation_entered.set()
             assert allow_validation.wait(1.0)
-        return original(duration_s)
+        return original(duration_s, light)
 
     monkeypatch.setattr(
         CameraCoordinator,
@@ -141,13 +141,10 @@ def test_duration_validation_and_settings_snapshot_share_one_linearization(
         writer.join(1.0)
 
 
-def test_stop_exposure_is_not_implemented_when_capability_is_false(
+def test_stop_exposure_is_idle_noop_but_not_implemented_during_exposure(
     client, coordinator, api_camera
 ):
-    assert (
-        _put(client, "stopexposure").json["ErrorNumber"]
-        == METHOD_NOT_IMPLEMENTED
-    )
+    assert _put(client, "stopexposure").json["ErrorNumber"] == 0
     api_camera.release_acquisition.clear()
     assert (
         _put(client, "startexposure", Duration="1", Light="true").json[
@@ -191,7 +188,13 @@ def test_ascom_one_pixel_odd_origin_roi_reaches_camera_adapter(
         ("numx", 1),
         ("numy", 1),
     ):
-        assert _put(client, command, **{command: value}).json["ErrorNumber"] == 0
+        parameter = {
+            "startx": "StartX",
+            "starty": "StartY",
+            "numx": "NumX",
+            "numy": "NumY",
+        }[command]
+        assert _put(client, command, **{parameter: value}).json["ErrorNumber"] == 0
 
     assert (
         _put(client, "startexposure", Duration="0.01", Light="true").json[

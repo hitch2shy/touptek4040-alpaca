@@ -31,6 +31,11 @@ from touptek4040.sim_camera import SimCamera
 
 
 APPROVED_SERIAL = "TP241025143218C92B01151AEC40CB7"
+PARENT_SDK_MODULES = {
+    "touptek4040.toupcam_camera",
+    "touptek4040.toupcam_loader",
+    "_touptek4040_toupcam",
+}
 
 
 class _BlockingDisconnectBackend(FakeOwnerBackend):
@@ -78,6 +83,7 @@ def test_real_runtime_owner_and_heater_execute_only_in_spawned_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = _active_child_pids()
+    loaded_sdk_modules = PARENT_SDK_MODULES.intersection(sys.modules)
     state_path = tmp_path / "real-owner-state.json"
     proxies: list[CameraOwnerProxy] = []
     _install_spawned_fake_proxy(monkeypatch, proxies, state_path)
@@ -87,8 +93,7 @@ def test_real_runtime_owner_and_heater_execute_only_in_spawned_pid(
 
     try:
         assert resolved.camera.serial == APPROVED_SERIAL
-        assert "touptek4040.toupcam_camera" not in sys.modules
-        assert "touptek4040.toupcam_loader" not in sys.modules
+        assert PARENT_SDK_MODULES.intersection(sys.modules) == loaded_sdk_modules
         coordinator.set_connected_sync(True)
         proxy = proxies[0]
         state = _read_state(state_path)
@@ -104,8 +109,7 @@ def test_real_runtime_owner_and_heater_execute_only_in_spawned_pid(
         assert state["heater_level"] == 3
         assert state["counts"]["get_heater_level"] == 3
         assert state["counts"]["set_heater_level"] == 1
-        assert "touptek4040.toupcam_camera" not in sys.modules
-        assert "touptek4040.toupcam_loader" not in sys.modules
+        assert PARENT_SDK_MODULES.intersection(sys.modules) == loaded_sdk_modules
     finally:
         run_alpaca.close_camera_coordinator(coordinator)
 

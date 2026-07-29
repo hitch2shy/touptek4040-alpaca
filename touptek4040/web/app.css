@@ -15,7 +15,9 @@ body {
 button, input, select { font: inherit; }
 button, select, input { color: inherit; }
 button { cursor: pointer; }
-button:disabled { cursor: not-allowed; opacity: .48; }
+button:disabled,
+input:disabled,
+select:disabled { cursor: not-allowed; opacity: .48; }
 
 :focus-visible {
   outline: 2px solid var(--focus);
@@ -320,6 +322,12 @@ input[type="range"] {
 }
 
 .switch-field input { accent-color: var(--signal); }
+.heater-field { margin: 2px 0 0; }
+.heater-field small {
+  color: var(--text-muted);
+  font: 10px/1.4 var(--mono);
+  text-align: right;
+}
 .field-message { min-height: 18px; margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
 .field-message.error { color: #ff9b9d; }
 

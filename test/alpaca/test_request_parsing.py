@@ -21,16 +21,24 @@ class FakeRequest:
     [
         ("GET", {"CLIENTTRANSACTIONID": "17"}, {}, 17),
         ("GET", {"clientTransactionId": "18"}, {}, 18),
-        ("PUT", {}, {"ClIeNtTrAnSaCtIoNiD": "19"}, 19),
+        ("PUT", {}, {"ClientTransactionID": "19"}, 19),
     ],
 )
-def test_client_transaction_id_is_case_insensitive_for_get_and_put(
+def test_client_transaction_id_uses_get_casefold_and_exact_put_name(
     method: str,
     params: dict[str, Any],
     media: dict[str, Any],
     expected: int,
 ) -> None:
     assert client_transaction_id(FakeRequest(method, params, media)) == expected
+
+
+@pytest.mark.parametrize("name", ["clienttransactionid", "CLIENTTRANSACTIONID"])
+def test_put_rejects_wrong_client_transaction_id_casing(name: str) -> None:
+    with pytest.raises(AlpacaError) as exc_info:
+        client_transaction_id(FakeRequest("PUT", media={name: "19"}))
+
+    assert exc_info.value.number == INVALID_VALUE
 
 
 @pytest.mark.parametrize("method", ["GET", "PUT"])
@@ -75,9 +83,6 @@ def test_supplied_invalid_client_id_is_rejected(invalid: Any) -> None:
     "invalid",
     [
         "",
-        0,
-        "0",
-        "000",
         "1.0",
         -1,
         "-1",
@@ -122,13 +127,16 @@ def test_extremely_long_client_transaction_id_does_not_leak_int_error(
 @pytest.mark.parametrize(
     ("valid", "expected"),
     [
+        (0, 0),
+        ("0", 0),
+        ("000", 0),
         (1, 1),
         (0xFFFFFFFF, 0xFFFFFFFF),
         ("1", 1),
         ("4294967295", 0xFFFFFFFF),
     ],
 )
-def test_client_transaction_id_accepts_only_positive_uint32_values(
+def test_client_transaction_id_accepts_unsigned_uint32_values(
     valid: int | str,
     expected: int,
 ) -> None:
@@ -143,15 +151,41 @@ def test_get_parameters_are_case_insensitive() -> None:
     assert get_parameter(request, "Duration") == "1.25"
 
 
-def test_put_media_overrides_query_parameters_case_insensitively() -> None:
+def test_put_uses_only_exactly_named_form_parameters() -> None:
     request = FakeRequest(
         "PUT",
         {"Gain": "100", "ClientTransactionID": "7"},
-        {"gAiN": "250", "CLIENTTRANSACTIONID": "8"},
+        {"Gain": "250", "ClientTransactionID": "8"},
     )
 
-    assert get_parameter(request, "GAIN") == "250"
+    assert get_parameter(request, "Gain") == "250"
     assert client_transaction_id(request) == 8
+
+
+@pytest.mark.parametrize("name", ["gain", "GAIN", "gAiN"])
+def test_put_rejects_wrong_member_parameter_casing(name: str) -> None:
+    with pytest.raises(AlpacaError) as exc_info:
+        get_parameter(FakeRequest("PUT", media={name: "250"}), "Gain")
+
+    assert exc_info.value.number == INVALID_VALUE
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "media"),
+    [
+        ("GET", {"ClientID": "1", "clientid": "2"}, {}),
+        ("PUT", {}, {"ClientID": "1", "clientid": "2"}),
+    ],
+)
+def test_duplicate_casefolded_protocol_keys_are_rejected(
+    method: str,
+    params: dict[str, Any],
+    media: dict[str, Any],
+) -> None:
+    with pytest.raises(AlpacaError) as exc_info:
+        client_id(FakeRequest(method, params, media))
+
+    assert exc_info.value.number == INVALID_VALUE
 
 
 def test_get_ignores_media_parameters() -> None:
