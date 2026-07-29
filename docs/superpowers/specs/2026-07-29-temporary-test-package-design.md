@@ -28,20 +28,23 @@ dist/ToupTek4040-Test/
 ├── ToupTek4040Alpaca.exe
 ├── toupcam.dll
 ├── touptek4040.json
-└── 使用说明.txt
+├── 使用说明.txt
+├── BUILD-INFO.txt
+└── _runtime/
 ```
 
 The same directory is archived as `dist/ToupTek4040-Test.zip`.
 
-The distribution contains only the Windows x64 SDK DLL. It does not contain
-`toupcam.lib`, the x86 DLL, SDK source, test files, or the legacy INI example.
-The distributed JSON file contains the approved camera serial and portable
-relative paths only.
+The `_runtime` directory contains only the Python and PyInstaller runtime
+dependencies required by the two executables. The distribution contains only
+the Windows x64 SDK DLL. It does not contain `toupcam.lib`, the x86 DLL, SDK
+source, test files, or the legacy INI example. The SDK Python wrapper is frozen
+as bytecode rather than distributed as source. The distributed JSON file
+contains the approved camera serial and portable relative paths only.
 
-Both executables carry the same application icon. A build identity in the
-package records the source commit, dirty-worktree status, build time, and the
-temporary-test designation so operator feedback can be traced to the exact
-artifact.
+Both executables carry the same application icon. `BUILD-INFO.txt` records the
+source commit, dirty-worktree status, build time, and the temporary-test
+designation so operator feedback can be traced to the exact artifact.
 
 ## Application Roles
 
@@ -138,6 +141,8 @@ Automated distribution checks require:
 - x64 `toupcam.dll`;
 - `touptek4040.json`;
 - `使用说明.txt`;
+- `BUILD-INFO.txt`;
+- one private `_runtime` dependency directory;
 - absence of `touptek4040.ini`, `.lib`, x86 SDK files, and test sources;
 - valid multi-size ICO association;
 - executable-directory JSON resolution;
