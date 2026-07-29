@@ -1,0 +1,33 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0 -- G:\ToupTek_4040\.worktrees\touptek4040-alpaca\.venv64\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: G:\ToupTek_4040\.worktrees\touptek4040-alpaca\test
+configfile: pytest.ini
+collecting ... collected 0 items / 2 errors
+
+=================================== ERRORS ====================================
+__________________ ERROR collecting unit/test_entrypoints.py __________________
+ImportError while importing test module 'G:\ToupTek_4040\.worktrees\touptek4040-alpaca\test\unit\test_entrypoints.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\Hitch\AppData\Local\Programs\Python\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\unit\test_entrypoints.py:8: in <module>
+    import run_alpaca
+E   ModuleNotFoundError: No module named 'run_alpaca'
+_____________ ERROR collecting smoke/test_simulator_roundtrip.py ______________
+ImportError while importing test module 'G:\ToupTek_4040\.worktrees\touptek4040-alpaca\test\smoke\test_simulator_roundtrip.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\Hitch\AppData\Local\Programs\Python\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\smoke\test_simulator_roundtrip.py:12: in <module>
+    import run_alpaca
+E   ModuleNotFoundError: No module named 'run_alpaca'
+=========================== short test summary info ===========================
+ERROR test\unit\test_entrypoints.py
+ERROR test\smoke\test_simulator_roundtrip.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!
+============================== 2 errors in 0.28s ==============================

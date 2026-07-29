@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,12 +45,15 @@ from .responses import (
 )
 
 _DRIVER_ERROR = 0x500
+_LOG = logging.getLogger(__name__)
 
 
 def create_app(coordinator: Any, config: Any) -> falcon.App:
     """Create an application with every manifest-defined non-image route."""
 
-    app = falcon.App(middleware=[SecurityHeadersMiddleware()])
+    app = falcon.App(
+        middleware=[_RequestLoggingMiddleware(), SecurityHeadersMiddleware()]
+    )
     allocator = ServerTransactionIdAllocator()
     camera_api = CameraApi(coordinator, config)
     common_api = CommonApi(coordinator, camera_api)
@@ -97,6 +102,32 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
         resource.add(spec)
     app.add_sink(_invalid_path)
     return app
+
+
+class _RequestLoggingMiddleware:
+    """Record route and outcome without logging query strings or request bodies."""
+
+    def process_request(self, request: falcon.Request, response: falcon.Response) -> None:
+        del response
+        request.context.request_started = time.monotonic()
+
+    def process_response(
+        self,
+        request: falcon.Request,
+        response: falcon.Response,
+        resource: object,
+        req_succeeded: bool,
+    ) -> None:
+        del resource
+        started = getattr(request.context, "request_started", time.monotonic())
+        _LOG.info(
+            "%s %s -> %s in %.1f ms%s",
+            request.method,
+            request.path,
+            response.status_code,
+            (time.monotonic() - started) * 1000.0,
+            "" if req_succeeded else " (request failed)",
+        )
 
 
 class _EndpointResource:
