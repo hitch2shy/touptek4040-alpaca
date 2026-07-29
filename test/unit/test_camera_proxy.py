@@ -6,6 +6,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import numpy as np
 import pytest
@@ -57,6 +58,8 @@ class FakeConnection:
         self.generation = generation
         self.control = control
         self.responses: deque[object] = deque()
+        self.late_response: object | None = None
+        self.poll_timeouts: list[float] = []
         self.closed = False
 
     def send(self, payload: object) -> None:
@@ -72,6 +75,43 @@ class FakeConnection:
         if self.control:
             self.responses.append({"operation": operation, "ok": True})
             return
+        if operation == "acquire":
+            if behavior == "missing_ack":
+                return
+            actual_duration_s = self.factory.actual_duration_s
+            if actual_duration_s is None:
+                actual_duration_s = round(
+                    float(payload["arguments"]["duration_s"]) * 1_000_000
+                ) / 1_000_000
+            ack: dict[str, object] = {
+                "protocol_version": PROTOCOL_VERSION,
+                "owner_generation": self.generation,
+                "request_id": payload["request_id"],
+                "operation": "acquire",
+                "actual_duration_s": actual_duration_s,
+            }
+            if behavior == "stale_ack":
+                ack["owner_generation"] = self.generation + 1
+            elif behavior == "wrong_version_ack":
+                ack["protocol_version"] = PROTOCOL_VERSION + 1
+            elif behavior == "wrong_request_ack":
+                ack["request_id"] = int(payload["request_id"]) + 1
+            elif behavior == "wrong_operation_ack":
+                ack["operation"] = "connect"
+            elif behavior == "malformed_ack":
+                ack["actual_duration_s"] = True
+            elif behavior == "out_of_range_ack":
+                ack["actual_duration_s"] = 3600.000001
+            elif behavior == "nonfinite_ack":
+                ack["actual_duration_s"] = float("nan")
+            elif behavior == "overflow_ack":
+                ack["actual_duration_s"] = 10**1000
+            if behavior == "late_ack":
+                self.late_response = ack
+                return
+            if behavior == "duplicate_ack":
+                self.responses.append(dict(ack))
+            self.responses.append(ack)
         result = self.factory.result_for(operation, payload)
         response: dict[str, object] = {
             "protocol_version": PROTOCOL_VERSION,
@@ -89,6 +129,12 @@ class FakeConnection:
         self.responses.append(response)
 
     def poll(self, _timeout: float = 0.0) -> bool:
+        self.poll_timeouts.append(_timeout)
+        if self.late_response is not None:
+            time.sleep(_timeout)
+            self.responses.append(self.late_response)
+            self.late_response = None
+            return False
         return bool(self.responses)
 
     def recv(self) -> object:
@@ -106,6 +152,7 @@ class ScriptedFactory:
         self.behaviors: dict[tuple[int, str], str] = {}
         self.sessions: list[SimpleNamespace] = []
         self.next_pid = 4100
+        self.actual_duration_s: float | None = None
 
     def start(self, startup_spec, generation: int, registry_path: Path):
         del startup_spec, registry_path
@@ -151,6 +198,11 @@ class ScriptedFactory:
         if operation == "get_heater_level":
             return {"value": 2}
         if operation == "acquire":
+            actual_duration_s = self.actual_duration_s
+            if actual_duration_s is None:
+                actual_duration_s = round(
+                    float(arguments["duration_s"]) * 1_000_000
+                ) / 1_000_000
             return {
                 "descriptor": {
                     "protocol_version": 1,
@@ -165,7 +217,7 @@ class ScriptedFactory:
                 },
                 "frame": {
                     "started_utc": datetime.now(timezone.utc).isoformat(),
-                    "duration_s": arguments["duration_s"],
+                    "duration_s": actual_duration_s,
                     "binning": arguments["binning"],
                     "roi": arguments["roi"],
                     "readout_mode": arguments["readout_mode"],
@@ -317,6 +369,35 @@ def test_operation_deadlines_are_selected_by_operation(tmp_path: Path):
     assert proxy._supervisor.deadline_for(
         "acquire", actual_duration_s=0.25
     ) == pytest.approx(0.419)
+
+
+def test_acquire_uses_owner_acknowledged_duration_for_remaining_deadline(
+    tmp_path: Path,
+):
+    factory = ScriptedFactory()
+    factory.actual_duration_s = 0.25
+    proxy = make_proxy(
+        tmp_path,
+        factory,
+        owner_config=OwnerConfig(
+            startup_timeout_s=0.05,
+            connect_timeout_s=0.05,
+            command_timeout_s=0.033,
+            exposure_overhead_s=0.044,
+            exposure_multiplier=1.5,
+            abort_timeout_s=0.05,
+            disconnect_timeout_s=0.05,
+        ),
+    )
+    proxy.connect()
+
+    frame = proxy.acquire(
+        0.001, Roi(0, 0, 2, 2), 1, ReadoutMode.RAW12
+    )
+
+    command = factory.sessions[0].command_connection
+    assert frame.duration_s == 0.25
+    assert any(timeout > 0.40 for timeout in command.poll_timeouts)
 
 
 def test_real_spawn_factory_round_trips_and_releases_a_shared_frame(tmp_path: Path):

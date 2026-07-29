@@ -35,22 +35,22 @@ from .errors import (
     safe_camera_error,
 )
 from .owner_protocol import (
+    MAX_EXPOSURE_DURATION_S,
     MAX_UINT64,
+    MIN_EXPOSURE_DURATION_S,
     PROTOCOL_VERSION,
     FrameDescriptor,
     OwnerProtocolError,
     OwnerRequest,
     OwnerResponse,
     OwnerResponseTracker,
+    decode_acquire_start_ack,
     encode_request,
 )
 from .shared_frames import SharedFrameError, SharedFrameRegistry
 
 
 _PROCESS_TERMINATION_ALLOWANCE_S = 0.25
-_MAX_EXPOSURE_DURATION_S = 3600.0
-
-
 @dataclass(slots=True)
 class OwnerProcessSession:
     """The exact process and private endpoints belonging to one generation."""
@@ -277,29 +277,29 @@ class OwnerSupervisor:
                     "exposure was cancelled before owner acquisition started"
                 )
             try:
-                response = self._request_locked(
-                    "acquire",
-                    {
-                        "duration_s": actual_duration_s,
-                        "roi": {
-                            "x": roi.x,
-                            "y": roi.y,
-                            "width": roi.width,
-                            "height": roi.height,
-                        },
-                        "binning": binning,
-                        "readout_mode": int(readout_mode),
-                    },
-                    self.deadline_for(
-                        "acquire", actual_duration_s=actual_duration_s
-                    ),
+                response, acknowledged_duration_s = (
+                    self._acquire_request_locked(
+                        {
+                            "duration_s": actual_duration_s,
+                            "roi": {
+                                "x": roi.x,
+                                "y": roi.y,
+                                "width": roi.width,
+                                "height": roi.height,
+                            },
+                            "binning": binning,
+                            "readout_mode": int(readout_mode),
+                        }
+                    )
                 )
                 if self._session is not acquire_session:
                     raise CameraOwnerProtocolError(
                         "owner generation failed before frame reconstruction"
                     )
                 descriptor, frame_values = self._frame_response(
-                    response, failed_session=acquire_session
+                    response,
+                    acknowledged_duration_s=acknowledged_duration_s,
+                    failed_session=acquire_session,
                 )
                 try:
                     pixels = self._registry.consume(descriptor)
@@ -491,6 +491,104 @@ class OwnerSupervisor:
             self._fail_owner(error, failed_session=failed_session)
         raise AssertionError("unreachable")
 
+    def _acquire_request_locked(
+        self,
+        arguments: Mapping[str, object],
+    ) -> tuple[OwnerResponse, float]:
+        failed_session = self._session
+        try:
+            return self._acquire_exchange(arguments)
+        except CameraTimeoutError as error:
+            self._fail_owner(error, failed_session=failed_session)
+        except CameraOwnerProtocolError as error:
+            self._fail_owner(error, failed_session=failed_session)
+        raise AssertionError("unreachable")
+
+    def _acquire_exchange(
+        self,
+        arguments: Mapping[str, object],
+    ) -> tuple[OwnerResponse, float]:
+        session = self._session
+        tracker = self._response_tracker
+        if session is None or tracker is None:
+            raise CameraOwnerProtocolError(
+                "camera owner session is unavailable"
+            )
+        if self._next_request_id > MAX_UINT64:
+            raise CameraOwnerProtocolError("owner request IDs are exhausted")
+        request = OwnerRequest(
+            PROTOCOL_VERSION,
+            self._generation,
+            self._next_request_id,
+            "acquire",
+            arguments,
+        )
+        self._next_request_id += 1
+        start_deadline = (
+            time.monotonic() + self._config.command_timeout_s
+        )
+        try:
+            session.command_connection.send(encode_request(request))
+            start_payload = self._receive_until(
+                session,
+                start_deadline,
+                "acquire start acknowledgement",
+            )
+            try:
+                acknowledgement = decode_acquire_start_ack(
+                    start_payload, request
+                )
+            except OwnerProtocolError as error:
+                raise CameraOwnerProtocolError(
+                    "camera owner returned an invalid acquire start "
+                    f"acknowledgement: {error}"
+                ) from error
+            final_payload = self._receive_until(
+                session,
+                time.monotonic()
+                + self.deadline_for(
+                    "acquire",
+                    actual_duration_s=acknowledgement.actual_duration_s,
+                ),
+                "acquire completion",
+            )
+        except CameraError:
+            raise
+        except (EOFError, OSError) as error:
+            raise CameraOwnerProtocolError(
+                f"camera owner transport failed during acquire: {error}"
+            ) from error
+        try:
+            response = tracker.decode(final_payload, request)
+        except OwnerProtocolError as error:
+            raise CameraOwnerProtocolError(
+                f"camera owner returned an invalid acquire response: {error}"
+            ) from error
+        if response.error is not None:
+            if response.error.code == "invalid_request":
+                raise CameraInvalidValueError(response.error.message)
+            raise CameraError(response.error.message)
+        return response, acknowledgement.actual_duration_s
+
+    def _receive_until(
+        self,
+        session: OwnerProcessSession | Any,
+        deadline: float,
+        phase: str,
+    ) -> object:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CameraTimeoutError(
+                    f"camera owner {phase} timed out"
+                )
+            if session.command_connection.poll(remaining):
+                return session.command_connection.recv()
+            if not session.process.is_alive():
+                raise CameraOwnerProtocolError(
+                    f"camera owner exited during {phase}"
+                )
+
     def _exchange(
         self,
         operation: str,
@@ -549,6 +647,7 @@ class OwnerSupervisor:
         self,
         response: OwnerResponse,
         *,
+        acknowledged_duration_s: float,
         failed_session: OwnerProcessSession | Any | None = None,
     ) -> tuple[FrameDescriptor, dict[str, object]]:
         result = _require_result_object(response, {"descriptor", "frame"})
@@ -561,6 +660,10 @@ class OwnerSupervisor:
                     "frame descriptor belongs to a stale generation"
                 )
             frame_values = _frame_values_from_payload(frame_payload)
+            if frame_values["duration_s"] != acknowledged_duration_s:
+                raise OwnerProtocolError(
+                    "frame duration does not match start acknowledgement"
+                )
         except (OwnerProtocolError, TypeError, ValueError) as error:
             self._protocol_failure(
                 f"owner frame response is invalid: {error}",
@@ -949,10 +1052,12 @@ def _validated_exposure_duration(value: object) -> float:
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(float(value))
-        or not 0 <= float(value) <= _MAX_EXPOSURE_DURATION_S
+        or not MIN_EXPOSURE_DURATION_S
+        <= float(value)
+        <= MAX_EXPOSURE_DURATION_S
     ):
         raise CameraInvalidValueError(
-            "exposure duration must be finite and between 0 and 3600 seconds"
+            "exposure duration must be finite and between 0.000012 and 3600 seconds"
         )
     return float(value)
 
@@ -1079,7 +1184,7 @@ def _frame_values_from_payload(payload: object) -> dict[str, object]:
     if started_utc.tzinfo is None or started_utc.utcoffset() is None:
         raise OwnerProtocolError("frame timestamp must include a UTC offset")
     duration_s = _require_finite_response_number(payload["duration_s"])
-    if not 0 <= duration_s <= _MAX_EXPOSURE_DURATION_S:
+    if not MIN_EXPOSURE_DURATION_S <= duration_s <= MAX_EXPOSURE_DURATION_S:
         raise OwnerProtocolError("frame duration is outside the supported range")
     binning = payload["binning"]
     gain = payload["gain"]

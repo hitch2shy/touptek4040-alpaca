@@ -14,6 +14,8 @@ PROTOCOL_VERSION: int = 1
 
 MAX_UINT64 = (1 << 64) - 1
 PRODUCT_SHARED_MEMORY_PREFIX = "touptek4040-"
+MIN_EXPOSURE_DURATION_S = 0.000012
+MAX_EXPOSURE_DURATION_S = 3600.0
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -138,6 +140,69 @@ class OwnerResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class AcquireStartAck:
+    """Distinct correlation message sent before blocking acquisition work."""
+
+    protocol_version: int
+    owner_generation: int
+    request_id: int
+    operation: str
+    actual_duration_s: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "protocol_version",
+            _validate_protocol_version(self.protocol_version),
+        )
+        object.__setattr__(
+            self,
+            "owner_generation",
+            _validate_uint64(
+                self.owner_generation,
+                "owner_generation",
+                allow_zero=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "request_id",
+            _validate_uint64(
+                self.request_id, "request_id", allow_zero=True
+            ),
+        )
+        if self.operation != "acquire":
+            raise OwnerProtocolError(
+                "acquire start acknowledgement operation must be acquire"
+            )
+        duration = self.actual_duration_s
+        if isinstance(duration, bool) or not isinstance(
+            duration, (int, float)
+        ):
+            raise OwnerProtocolError(
+                "actual_duration_s is outside the supported camera range"
+            )
+        try:
+            finite_duration = float(duration)
+        except (OverflowError, ValueError) as error:
+            raise OwnerProtocolError(
+                "actual_duration_s is outside the supported camera range"
+            ) from error
+        if (
+            not math.isfinite(finite_duration)
+            or not MIN_EXPOSURE_DURATION_S
+            <= finite_duration
+            <= MAX_EXPOSURE_DURATION_S
+        ):
+            raise OwnerProtocolError(
+                "actual_duration_s is outside the supported camera range"
+            )
+        object.__setattr__(
+            self, "actual_duration_s", finite_duration
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FrameDescriptor:
     """The validated description of one raw frame owned by shared memory."""
 
@@ -226,6 +291,66 @@ def encode_request(request: OwnerRequest) -> dict[str, object]:
         "operation": request.operation,
         "arguments": _wire_json_value(dict(request.arguments)),
     }
+
+
+def encode_acquire_start_ack(
+    acknowledgement: AcquireStartAck,
+) -> dict[str, object]:
+    """Encode one exact command-start acknowledgement."""
+    if not isinstance(acknowledgement, AcquireStartAck):
+        raise OwnerProtocolError(
+            "acknowledgement must be an AcquireStartAck"
+        )
+    return {
+        "protocol_version": acknowledgement.protocol_version,
+        "owner_generation": acknowledgement.owner_generation,
+        "request_id": acknowledgement.request_id,
+        "operation": acknowledgement.operation,
+        "actual_duration_s": acknowledgement.actual_duration_s,
+    }
+
+
+def decode_acquire_start_ack(
+    payload: object,
+    expected: OwnerRequest,
+) -> AcquireStartAck:
+    """Decode an acknowledgement correlated to one acquire request."""
+    if not isinstance(expected, OwnerRequest):
+        raise OwnerProtocolError("expected request must be an OwnerRequest")
+    if expected.operation != "acquire":
+        raise OwnerProtocolError(
+            "acquire start acknowledgement requires an acquire request"
+        )
+    object_payload = _as_object(
+        payload, "acquire start acknowledgement"
+    )
+    _require_exact_keys(
+        object_payload,
+        {
+            "protocol_version",
+            "owner_generation",
+            "request_id",
+            "operation",
+            "actual_duration_s",
+        },
+        "acquire start acknowledgement",
+    )
+    acknowledgement = AcquireStartAck(
+        object_payload["protocol_version"],
+        object_payload["owner_generation"],
+        object_payload["request_id"],
+        object_payload["operation"],
+        object_payload["actual_duration_s"],
+    )
+    if acknowledgement.owner_generation != expected.owner_generation:
+        raise OwnerProtocolError(
+            "acknowledgement owner_generation does not match request"
+        )
+    if acknowledgement.request_id != expected.request_id:
+        raise OwnerProtocolError(
+            "acknowledgement request_id does not match request"
+        )
+    return acknowledgement
 
 
 def decode_request(payload: object) -> OwnerRequest:

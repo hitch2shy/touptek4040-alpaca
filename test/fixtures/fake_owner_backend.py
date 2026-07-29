@@ -98,7 +98,12 @@ class FakeOwnerBackend:
 
     def acquire(self, duration_s: float, roi: Roi, binning: int, readout_mode: ReadoutMode, control=None) -> Frame:
         self._require_connected()
-        self._record("acquire")
+        if control is None:
+            self._record("acquire", duration_s=duration_s)
+        elif not control.commit_start(
+            lambda: self._record("acquire", duration_s=duration_s)
+        ):
+            raise RuntimeError("fake acquisition was cancelled before start")
         if self._block_acquire:
             deadline = time.monotonic() + 10
             while not self._abort_requested.wait(0.01):

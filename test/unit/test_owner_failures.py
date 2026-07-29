@@ -68,6 +68,64 @@ def test_timed_out_exposure_is_not_retried_or_published(tmp_path: Path):
     assert proxy.confirmed_heater_level is None
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "stale_ack",
+        "wrong_version_ack",
+        "wrong_request_ack",
+        "wrong_operation_ack",
+        "malformed_ack",
+        "nonfinite_ack",
+        "overflow_ack",
+        "out_of_range_ack",
+        "duplicate_ack",
+    ],
+)
+def test_invalid_acquire_start_ack_fails_exact_generation_without_retry(
+    tmp_path: Path, corruption: str
+):
+    factory = ScriptedFactory()
+    proxy = make_proxy(tmp_path, factory)
+    proxy.connect()
+    generation = proxy.owner_generation
+    failed_process = factory.sessions[-1].process
+    factory.behaviors[(generation, "acquire")] = corruption
+
+    with pytest.raises(CameraOwnerProtocolError):
+        proxy.acquire(
+            0.001, Roi(0, 0, 2, 2), 1, ReadoutMode.RAW12
+        )
+
+    assert factory.calls["acquire"] == 1
+    assert factory.calls["release_frame"] == 0
+    assert failed_process.terminate_calls == 1
+    assert proxy.owner_generation == generation + 1
+    assert proxy.connected is False
+
+
+@pytest.mark.parametrize("behavior", ["missing_ack", "late_ack"])
+def test_missing_or_late_acquire_start_ack_times_out_without_retry(
+    tmp_path: Path, behavior: str
+):
+    factory = ScriptedFactory()
+    proxy = make_proxy(tmp_path, factory)
+    proxy.connect()
+    generation = proxy.owner_generation
+    failed_process = factory.sessions[-1].process
+    factory.behaviors[(generation, "acquire")] = behavior
+
+    with pytest.raises(CameraTimeoutError):
+        proxy.acquire(
+            0.001, Roi(0, 0, 2, 2), 1, ReadoutMode.RAW12
+        )
+
+    assert factory.calls["acquire"] == 1
+    assert failed_process.terminate_calls == 1
+    assert proxy.owner_generation == generation + 1
+    assert proxy.connected is False
+
+
 def test_timed_out_heater_write_is_not_retried_and_invalidates_confirmation(tmp_path: Path):
     factory = ScriptedFactory()
     proxy = make_proxy(tmp_path, factory)

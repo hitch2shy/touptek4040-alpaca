@@ -15,7 +15,12 @@ import pytest
 
 from test.fixtures.fake_owner_backend import ExplodingOwnerPayload
 from touptek4040.camera_owner import OwnerStartupSpec, _create_toupcam_backend, camera_owner_main
-from touptek4040.owner_protocol import OwnerRequest, decode_response, encode_request
+from touptek4040.owner_protocol import (
+    OwnerRequest,
+    decode_acquire_start_ack,
+    decode_response,
+    encode_request,
+)
 
 
 class OwnerHarness:
@@ -50,6 +55,9 @@ class OwnerHarness:
         request = OwnerRequest(1, self._generation, self._request_id, operation, arguments)
         self._command_parent.send(encode_request(request))
         assert self._command_parent.poll(3), f"owner did not answer {operation}"
+        if operation == "acquire":
+            decode_acquire_start_ack(self._command_parent.recv(), request)
+            assert self._command_parent.poll(3), "owner did not finish acquire"
         response = decode_response(self._command_parent.recv(), request)
         assert response.error is None, response.error
         assert isinstance(response.result, dict)
@@ -59,6 +67,9 @@ class OwnerHarness:
         request = OwnerRequest(1, self._generation, request_id, operation, arguments)
         self._command_parent.send(encode_request(request))
         assert self._command_parent.poll(3)
+        if operation == "acquire":
+            decode_acquire_start_ack(self._command_parent.recv(), request)
+            assert self._command_parent.poll(3)
         return decode_response(self._command_parent.recv(), request)
 
     def close(self) -> None:
@@ -116,7 +127,7 @@ def test_owner_publishes_and_releases_a_frame(owner_harness: OwnerHarness):
     response = owner_harness.request(
         "acquire",
         {
-            "duration_s": 0.001,
+            "duration_s": 0.0000124,
             "roi": {"x": 0, "y": 0, "width": 2, "height": 2},
             "binning": 1,
             "readout_mode": 0,
@@ -125,8 +136,54 @@ def test_owner_publishes_and_releases_a_frame(owner_harness: OwnerHarness):
 
     descriptor = response["descriptor"]
     assert isinstance(descriptor, dict)
+    assert response["frame"]["duration_s"] == 0.000012
     owner_harness.request("release_frame", {"descriptor": descriptor})
     assert owner_harness.request("diagnostics", {})["owned_frame_count"] == 0
+
+
+def test_owner_acknowledges_microsecond_clamp_before_blocking_acquire(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {"block_acquire": True, "state_path": str(state_path)},
+    )
+    try:
+        harness.request("connect", {})
+        harness._request_id += 1
+        request = OwnerRequest(
+            1,
+            harness._generation,
+            harness._request_id,
+            "acquire",
+            {
+                "duration_s": 0.0000124,
+                "roi": {"x": 0, "y": 0, "width": 2, "height": 2},
+                "binning": 1,
+                "readout_mode": 0,
+            },
+        )
+        harness._command_parent.send(encode_request(request))
+
+        assert harness._command_parent.poll(1)
+        ack = decode_acquire_start_ack(
+            harness._command_parent.recv(), request
+        )
+        assert ack.actual_duration_s == 0.000012
+        state = _read_fake_backend_state(state_path)
+        assert state["counts"]["acquire"] == 1
+        assert state["events"][-1]["duration_s"] == 0.000012
+        assert harness._command_parent.poll(0.05) is False
+        assert harness.process.is_alive()
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(1)
+        assert harness._control_parent.recv()["ok"] is True
+        assert harness._command_parent.poll(1)
+        response = decode_response(harness._command_parent.recv(), request)
+        assert response.error is not None
+    finally:
+        harness.close()
 
 
 def test_normal_owner_disconnect_restores_the_connect_time_heater_level(tmp_path: Path):

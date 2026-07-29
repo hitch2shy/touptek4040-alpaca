@@ -12,11 +12,15 @@ import json
 import pytest
 
 from touptek4040.owner_protocol import (
+    MAX_EXPOSURE_DURATION_S,
+    MIN_EXPOSURE_DURATION_S,
     PROTOCOL_VERSION,
+    AcquireStartAck,
     OwnerError,
     OwnerProtocolError,
     OwnerRequest,
     OwnerResponseTracker,
+    decode_acquire_start_ack,
     decode_request,
     decode_response,
     encode_request,
@@ -254,3 +258,82 @@ def test_explicit_response_tracker_rejects_a_duplicate_generation_and_request_id
     assert first.result == {"connected": True}
     with pytest.raises(OwnerProtocolError):
         tracker.decode(payload, expected)
+
+
+def test_acquire_start_ack_is_a_distinct_exact_versioned_schema():
+    request = OwnerRequest(
+        PROTOCOL_VERSION,
+        7,
+        42,
+        "acquire",
+        {
+            "duration_s": 0.0000124,
+            "roi": {"x": 0, "y": 0, "width": 2, "height": 2},
+            "binning": 1,
+            "readout_mode": 0,
+        },
+    )
+
+    ack = decode_acquire_start_ack(
+        {
+            "protocol_version": 1,
+            "owner_generation": 7,
+            "request_id": 42,
+            "operation": "acquire",
+            "actual_duration_s": 0.000012,
+        },
+        request,
+    )
+
+    assert ack == AcquireStartAck(1, 7, 42, "acquire", 0.000012)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.__setitem__("actual_duration_s", True),
+        lambda payload: payload.__setitem__("actual_duration_s", float("nan")),
+        lambda payload: payload.__setitem__("actual_duration_s", 10**1000),
+        lambda payload: payload.__setitem__(
+            "actual_duration_s", MIN_EXPOSURE_DURATION_S / 2
+        ),
+        lambda payload: payload.__setitem__(
+            "actual_duration_s", MAX_EXPOSURE_DURATION_S + 0.000001
+        ),
+        lambda payload: payload.__setitem__("owner_generation", 8),
+        lambda payload: payload.__setitem__("request_id", 43),
+        lambda payload: payload.__setitem__("protocol_version", 2),
+        lambda payload: payload.__setitem__("operation", "connect"),
+        lambda payload: payload.__setitem__("extra", None),
+        lambda payload: payload.pop("actual_duration_s"),
+    ],
+)
+def test_acquire_start_ack_rejects_malformed_or_uncorrelated_payloads(mutation):
+    request = OwnerRequest(1, 7, 42, "acquire", {})
+    payload = {
+        "protocol_version": 1,
+        "owner_generation": 7,
+        "request_id": 42,
+        "operation": "acquire",
+        "actual_duration_s": 0.001,
+    }
+    mutation(payload)
+
+    with pytest.raises(OwnerProtocolError):
+        decode_acquire_start_ack(payload, request)
+
+
+def test_acquire_start_ack_decoder_rejects_a_non_acquire_request():
+    request = OwnerRequest(1, 7, 42, "connect", {})
+
+    with pytest.raises(OwnerProtocolError):
+        decode_acquire_start_ack(
+            {
+                "protocol_version": 1,
+                "owner_generation": 7,
+                "request_id": 42,
+                "operation": "acquire",
+                "actual_duration_s": 0.001,
+            },
+            request,
+        )

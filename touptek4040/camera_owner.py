@@ -14,19 +14,58 @@ from typing import Any
 from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
 from .owner_backend import OwnerBackend
 from .owner_protocol import (
+    MAX_EXPOSURE_DURATION_S,
+    MIN_EXPOSURE_DURATION_S,
+    AcquireStartAck,
     FrameDescriptor,
     OwnerError,
     OwnerProtocolError,
     OwnerRequest,
     OwnerResponse,
-PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
     decode_request,
+    encode_acquire_start_ack,
 )
 from .shared_frames import SharedFrameRegistry
 
 
 APPROVED_CAMERA_SERIAL = "TP241025143218C92B01151AEC40CB7"
 APPROVED_CAMERA_MODEL = "sMAX16AM-U3-CL-GPS"
+
+
+class _OwnerAcquireStartControl:
+    """Emit one start acknowledgement after the backend commits its claim."""
+
+    def __init__(
+        self,
+        request: OwnerRequest,
+        actual_duration_s: float,
+        send_command_start: Any,
+    ) -> None:
+        self._request = request
+        self._actual_duration_s = actual_duration_s
+        self._send_command_start = send_command_start
+        self.acknowledged = False
+
+    def commit_start(self, claim: Any) -> bool:
+        if self.acknowledged:
+            raise OwnerProtocolError(
+                "backend committed acquire start more than once"
+            )
+        claim()
+        self._send_command_start(
+            encode_acquire_start_ack(
+                AcquireStartAck(
+                    PROTOCOL_VERSION,
+                    self._request.owner_generation,
+                    self._request.request_id,
+                    "acquire",
+                    self._actual_duration_s,
+                )
+            )
+        )
+        self.acknowledged = True
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +224,7 @@ def camera_owner_main(
                 response = _handle_command(
                     payload, generation, backend, registry, owned_descriptors,
                     connected, saved_heater_level, disconnect_backend,
-                    report_cleanup_error,
+                    report_cleanup_error, command_connection.send,
                 )
             except BaseException as error:
                 if isinstance(request, OwnerRequest):
@@ -259,6 +298,7 @@ def _handle_command(
     saved_heater_level: int | None,
     disconnect_backend: Any,
     report_cleanup_error: Any,
+    send_command_start: Any,
 ) -> tuple[dict[str, object], bool, int | None, bool]:
     request: OwnerRequest | None = None
     try:
@@ -274,6 +314,7 @@ def _handle_command(
             saved_heater_level,
             disconnect_backend,
             report_cleanup_error,
+            send_command_start,
         )
         return _response_payload(request, result=result), connected, saved_heater_level, shutdown
     except BaseException as error:
@@ -291,6 +332,7 @@ def _dispatch(
     saved_heater_level: int | None,
     disconnect_backend: Any,
     report_cleanup_error: Any,
+    send_command_start: Any,
 ) -> tuple[dict[str, object], bool, int | None, bool]:
     operation = request.operation
     arguments = request.arguments
@@ -320,7 +362,23 @@ def _dispatch(
         return _capabilities_payload(backend.capabilities), connected, saved_heater_level, False
     if operation == "acquire":
         duration_s, roi, binning, readout_mode = _acquire_arguments(arguments)
-        frame = backend.acquire(duration_s, roi, binning, readout_mode)
+        actual_duration_s = _clamped_exposure_duration(duration_s)
+        start_control = _OwnerAcquireStartControl(
+            request,
+            actual_duration_s,
+            send_command_start,
+        )
+        frame = backend.acquire(
+            actual_duration_s,
+            roi,
+            binning,
+            readout_mode,
+            start_control,
+        )
+        if not start_control.acknowledged:
+            raise OwnerProtocolError(
+                "backend completed acquire without a start acknowledgement"
+            )
         descriptor = registry.publish(frame.pixels, _frame_pixel_metadata(frame))
         try:
             result = {"descriptor": _descriptor_payload(descriptor), "frame": _frame_payload(frame)}
@@ -475,6 +533,17 @@ def _acquire_arguments(arguments: Mapping[str, object]) -> tuple[float, Roi, int
         return duration_s, roi, binning, ReadoutMode(readout_value)
     except ValueError as error:
         raise OwnerProtocolError("unsupported readout_mode") from error
+
+
+def _clamped_exposure_duration(duration_s: float) -> float:
+    exposure_us = round(duration_s * 1_000_000)
+    minimum_us = round(MIN_EXPOSURE_DURATION_S * 1_000_000)
+    maximum_us = round(MAX_EXPOSURE_DURATION_S * 1_000_000)
+    if not minimum_us <= exposure_us <= maximum_us:
+        raise OwnerProtocolError(
+            "duration_s is outside the supported camera range"
+        )
+    return exposure_us / 1_000_000
 
 
 def _capabilities_payload(capabilities: CameraCapabilities) -> dict[str, object]:
