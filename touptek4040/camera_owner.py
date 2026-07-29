@@ -82,7 +82,8 @@ def camera_owner_main(
     owned_descriptors: dict[str, FrameDescriptor] = {}
     stop_requested = Event()
     cleanup_errors: list[str] = []
-    last_request_id = 0
+    last_request_id: int | None = None
+    backend_may_own_handle = False
 
     def report_cleanup_error(error: BaseException) -> None:
         if len(cleanup_errors) < 4:
@@ -96,8 +97,8 @@ def camera_owner_main(
         saved_heater_level = None
 
     def disconnect_backend() -> None:
-        nonlocal connected
-        if backend is None or not connected:
+        nonlocal connected, backend_may_own_handle
+        if backend is None or not backend_may_own_handle:
             return
         restoration_error: BaseException | None = None
         try:
@@ -108,6 +109,7 @@ def camera_owner_main(
             backend.disconnect()
         finally:
             connected = False
+        backend_may_own_handle = False
         if restoration_error is not None:
             raise restoration_error
 
@@ -119,9 +121,13 @@ def camera_owner_main(
                 message = control_connection.recv()
             except (EOFError, OSError):
                 return
-            if not isinstance(message, Mapping) or set(message) != {"operation"}:
+            if not isinstance(message, Mapping):
+                control_connection.send({"operation": "rejected", "ok": False, "error": "control message must be an object"})
                 continue
-            operation = message["operation"]
+            operation = message.get("operation")
+            if not isinstance(operation, str):
+                control_connection.send({"operation": "rejected", "ok": False, "error": "control operation is required"})
+                continue
             if operation == "shutdown":
                 if backend is not None:
                     try:
@@ -131,13 +137,15 @@ def camera_owner_main(
                         control_connection.send({"operation": "shutdown", "ok": False, "error": str(error)[:256]})
                 stop_requested.set()
                 continue
-            if operation == "abort" and backend is not None:
+            if operation == "abort" and backend is not None and connected:
                 try:
                     backend.abort()
                     control_connection.send({"operation": "abort", "ok": True})
                 except BaseException as error:
                     control_connection.send({"operation": "abort", "ok": False, "error": str(error)[:256]})
-            elif operation != "abort":
+            elif operation == "abort":
+                control_connection.send({"operation": "abort", "ok": False, "error": "camera is not connected"})
+            else:
                 control_connection.send({"operation": "rejected", "ok": False, "error": "unsupported control operation"})
 
     control_thread: Thread | None = None
@@ -148,6 +156,7 @@ def camera_owner_main(
             raise OwnerProtocolError("startup_spec must be an OwnerStartupSpec")
         registry = SharedFrameRegistry(generation, Path(registry_path))
         backend = _instantiate_backend(startup_spec)
+        backend_may_own_handle = True
         control_thread = Thread(target=control_loop, name="camera-owner-control", daemon=True)
         control_thread.start()
         while not stop_requested.is_set():
@@ -162,7 +171,7 @@ def camera_owner_main(
                 request = decode_request(payload)
                 if request.owner_generation != generation:
                     raise OwnerProtocolError("request belongs to a different owner generation")
-                if request.request_id <= last_request_id:
+                if last_request_id is not None and request.request_id <= last_request_id:
                     raise OwnerProtocolError("request_id must increase monotonically")
                 last_request_id = request.request_id
                 response = _handle_command(
@@ -187,7 +196,7 @@ def camera_owner_main(
         report_cleanup_error(error)
     finally:
         stop_requested.set()
-        if backend is not None and connected:
+        if backend is not None and backend_may_own_handle:
             try:
                 backend.abort()
             except BaseException as error:
@@ -265,7 +274,7 @@ def _dispatch(
             try:
                 saved_heater_level = backend.heater_level if backend.heater_supported else None
             except BaseException:
-                backend.disconnect()
+                disconnect_backend()
                 raise
             connected = True
         return {"connected": True}, connected, saved_heater_level, False

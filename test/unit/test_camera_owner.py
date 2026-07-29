@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import time
 from threading import Thread
+import subprocess
 
 import pytest
 
@@ -179,3 +180,69 @@ def test_control_shutdown_aborts_a_truly_blocked_spawned_acquisition(tmp_path: P
         assert failure
     finally:
         harness.close()
+
+
+def test_request_id_zero_then_one_are_accepted_and_zero_replay_is_rejected(owner_harness: OwnerHarness):
+    first = owner_harness.raw_request(0, "handshake", {})
+    second = owner_harness.raw_request(1, "diagnostics", {})
+    replay = owner_harness.raw_request(0, "handshake", {})
+
+    assert first.error is None
+    assert second.error is None
+    assert replay.error is not None
+
+
+def test_control_messages_always_receive_a_bounded_response(owner_harness: OwnerHarness):
+    for message in ({}, {"operation": "unsupported"}, {"operation": "abort"}):
+        owner_harness._control_parent.send(message)
+        assert owner_harness._control_parent.poll(3)
+        response = owner_harness._control_parent.recv()
+        assert response["ok"] is False
+        assert len(response["error"]) <= 256
+
+
+def test_fresh_interpreter_import_of_owner_does_not_import_sdk_loader(tmp_path: Path):
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import touptek4040.camera_owner; assert 'touptek4040.toupcam_loader' not in sys.modules"],
+        cwd=tmp_path.parent,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_outer_cleanup_retries_failed_snapshot_rollback_disconnect(tmp_path: Path):
+    restoration_log = tmp_path / "restored.txt"
+    harness = OwnerHarness(tmp_path, {"fail_snapshot": True, "fail_disconnects": 1, "restore_log_path": str(restoration_log)})
+    try:
+        response = harness.raw_request(1, "connect", {})
+        assert response.error is not None
+        harness._request_id = 1
+    finally:
+        harness.close()
+    assert restoration_log.read_text(encoding="utf-8") == "2"
+
+
+def test_control_abort_unblocks_a_blocked_acquisition_without_stopping_owner(tmp_path: Path):
+    harness = OwnerHarness(tmp_path, {"block_acquire": True})
+    try:
+        harness.request("connect", {})
+        failure: list[BaseException] = []
+        worker = Thread(target=lambda: _capture_acquire_failure(harness, failure))
+        worker.start()
+        time.sleep(0.1)
+        harness._control_parent.send({"operation": "abort"})
+        assert harness._control_parent.poll(3)
+        assert harness._control_parent.recv()["ok"] is True
+        worker.join(3)
+        assert failure and harness.process.is_alive()
+    finally:
+        harness.close()
+
+
+def _capture_acquire_failure(harness: OwnerHarness, failures: list[BaseException]) -> None:
+    try:
+        harness.request("acquire", {"duration_s": 1, "roi": {"x": 0, "y": 0, "width": 2, "height": 2}, "binning": 1, "readout_mode": 0})
+    except BaseException as error:
+        failures.append(error)
