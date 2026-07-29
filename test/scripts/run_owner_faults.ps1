@@ -6,6 +6,135 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public static class OwnerFaultPhysicalPath
+{
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint OpenExisting = 3;
+    private const uint ShareRead = 1;
+    private const uint ShareWrite = 2;
+    private const uint ShareDelete = 4;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        StringBuilder path,
+        uint pathLength,
+        uint flags);
+
+    public static string GetFinalDirectoryPath(string path)
+    {
+        using (SafeFileHandle handle = CreateFile(
+            path,
+            0,
+            ShareRead | ShareWrite | ShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero))
+        {
+            if (handle.IsInvalid)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            StringBuilder buffer = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandle(
+                handle,
+                buffer,
+                (uint)buffer.Capacity,
+                0);
+            if (length == 0 || length >= buffer.Capacity)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return buffer.ToString();
+        }
+    }
+}
+"@
+
+function Get-PhysicalDirectoryPath {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $finalPath = [OwnerFaultPhysicalPath]::GetFinalDirectoryPath(
+        [System.IO.Path]::GetFullPath($LiteralPath)
+    )
+    if ($finalPath.StartsWith("\\?\UNC\")) {
+        $finalPath = "\\" + $finalPath.Substring(8)
+    }
+    elseif ($finalPath.StartsWith("\\?\")) {
+        $finalPath = $finalPath.Substring(4)
+    }
+    return [System.IO.Path]::GetFullPath($finalPath).TrimEnd("\")
+}
+
+function Assert-OfficialResultDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$ResultDirectory
+    )
+
+    $physicalRepositoryRoot = Get-PhysicalDirectoryPath $RepositoryRoot
+    $expectedPhysicalDirectory = [System.IO.Path]::GetFullPath(
+        (Join-Path $physicalRepositoryRoot "test\results\owner-faults")
+    ).TrimEnd("\")
+    $expectedPhysicalParent = Split-Path -Parent $expectedPhysicalDirectory
+    $physicalParent = Get-PhysicalDirectoryPath (
+        Split-Path -Parent $ResultDirectory
+    )
+    if (
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            $physicalParent,
+            $expectedPhysicalParent
+        )
+    ) {
+        throw "Official evidence parent resolves outside the repository"
+    }
+
+    if (-not (Test-Path -LiteralPath $ResultDirectory)) {
+        New-Item -ItemType Directory -Path $ResultDirectory | Out-Null
+    }
+
+    $directoryInfo = Get-Item -LiteralPath $ResultDirectory -Force
+    if (-not $directoryInfo.PSIsContainer) {
+        throw "Official evidence path is not a directory"
+    }
+    if (
+        ($directoryInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne
+        0
+    ) {
+        throw "Official evidence directory is a reparse point"
+    }
+
+    $physicalResultDirectory = Get-PhysicalDirectoryPath $ResultDirectory
+    if (
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            $physicalResultDirectory,
+            $expectedPhysicalDirectory
+        )
+    ) {
+        throw "Official evidence directory resolves outside the repository"
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $python = Join-Path $repoRoot ".venv64\Scripts\python.exe"
 $officialResultDirectory = Join-Path $repoRoot "test\results\owner-faults"
@@ -37,6 +166,16 @@ if ($ValidationOnly) {
     $summaryMarkdown = Join-Path $resultDirectory "validation-summary.md"
 } else {
     $resultDirectory = $officialResultDirectory
+    try {
+        Assert-OfficialResultDirectory $repoRoot $resultDirectory
+    }
+    catch {
+        Write-Error (
+            "Refusing unsafe official evidence directory before cleanup: " +
+            $_.Exception.Message
+        )
+        exit 65
+    }
     $jsonLines = Join-Path $resultDirectory "cases.jsonl"
     $summaryJson = Join-Path $resultDirectory "summary.json"
     $summaryMarkdown = Join-Path $resultDirectory "summary.md"

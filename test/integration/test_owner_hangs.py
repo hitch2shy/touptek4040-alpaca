@@ -6,6 +6,7 @@ import multiprocessing
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 import time
@@ -594,6 +595,77 @@ def test_validation_only_cannot_target_official_result_directory(
     assert completed.returncode != 0
     assert official_summary.read_bytes() == before
     assert not validation_summary.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
+def test_official_runner_rejects_redirected_result_directory(
+    tmp_path: Path,
+) -> None:
+    source_script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_owner_faults.ps1"
+    )
+    isolated_repo = tmp_path / "repo"
+    scripts_directory = isolated_repo / "test" / "scripts"
+    results_parent = isolated_repo / "test" / "results"
+    external_directory = tmp_path / "external"
+    scripts_directory.mkdir(parents=True)
+    results_parent.mkdir(parents=True)
+    external_directory.mkdir()
+    isolated_script = scripts_directory / source_script.name
+    shutil.copy2(source_script, isolated_script)
+
+    sentinel = external_directory / "sentinel.txt"
+    sentinel.write_text("outside", encoding="utf-8")
+    protected_contents = {}
+    for name in ("cases.jsonl", "summary.json", "summary.md"):
+        protected_contents[name] = f"EXTERNAL-{name}"
+        (external_directory / name).write_text(
+            protected_contents[name],
+            encoding="utf-8",
+        )
+
+    redirected_directory = results_parent / "owner-faults"
+    junction = subprocess.run(
+        [
+            "cmd",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(redirected_directory),
+            str(external_directory),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if junction.returncode != 0:
+        pytest.skip(
+            "directory junction creation unavailable: "
+            + (junction.stderr or junction.stdout).strip()
+        )
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(isolated_script),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "outside"
+    for name, expected in protected_contents.items():
+        assert (external_directory / name).read_text(
+            encoding="utf-8"
+        ) == expected
 
 
 def _valid_runner_records() -> list[dict[str, object]]:
