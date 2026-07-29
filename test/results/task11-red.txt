@@ -1,0 +1,22 @@
+Task 11 RED
+=============
+
+Command:
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/web -v
+
+Initial result:
+21 collected; 16 failed, 5 passed.
+
+Expected failures:
+- /ui/ and no-build assets were not registered.
+- /web/v1 state, capabilities, mutation, image, FITS, and analysis routes
+  were not registered.
+- Web mutation CSRF/content-type/header enforcement did not exist.
+- CSP, nosniff, frame-ancestor, and referrer headers did not exist.
+
+The pre-existing invalid-path sink already rejected traversal and returned 400
+for unknown Web routes. The schema tests were tightened before implementation
+to assert the Web error envelope rather than accepting that unrelated 400.
+
+Confirmed RED after tightening:
+21 collected; 20 failed, 1 passed (the existing traversal rejection).

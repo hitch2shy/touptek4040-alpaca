@@ -7,6 +7,7 @@ from typing import Any
 
 import falcon
 
+from ..web_console import SecurityHeadersMiddleware, register_web_console
 from ..errors import (
     CameraBusyError,
     CameraError,
@@ -47,7 +48,7 @@ _DRIVER_ERROR = 0x500
 def create_app(coordinator: Any, config: Any) -> falcon.App:
     """Create an application with every manifest-defined non-image route."""
 
-    app = falcon.App()
+    app = falcon.App(middleware=[SecurityHeadersMiddleware()])
     allocator = ServerTransactionIdAllocator()
     camera_api = CameraApi(coordinator, config)
     common_api = CommonApi(coordinator, camera_api)
@@ -71,6 +72,9 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
         "/setup/v1/{device_type}/{device_number}/setup",
         DeviceSetupResource(),
     )
+    web_config = getattr(config, "web", None)
+    if web_config is None or getattr(web_config, "enabled", True):
+        register_web_console(app, coordinator, config)
 
     resources: dict[tuple[str, str], _EndpointResource] = {}
     for spec in CAMERA_V4_ENDPOINTS:

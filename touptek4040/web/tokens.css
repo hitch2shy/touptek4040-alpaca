@@ -1,0 +1,27 @@
+:root {
+  color-scheme: dark;
+  --surface-base: #080b0f;
+  --surface-chassis: #0d1117;
+  --surface-pane: #111720;
+  --surface-raised: #18202a;
+  --surface-input: #0a0f15;
+  --line-subtle: #293442;
+  --line-strong: #3d4d5e;
+  --text-primary: #f1f5f8;
+  --text-secondary: #aebbc8;
+  --text-muted: #8997a5;
+  --signal: #58b8d1;
+  --signal-strong: #73d1e6;
+  --signal-dim: #173640;
+  --warning: #e4ac55;
+  --warning-dim: #3b2d18;
+  --danger: #f06e70;
+  --danger-dim: #3f1c22;
+  --success: #70c99a;
+  --focus: #9fe6f3;
+  --radius-control: 6px;
+  --radius-panel: 10px;
+  --shadow-overlay: 0 12px 34px rgb(0 0 0 / 45%);
+  --sans: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+}

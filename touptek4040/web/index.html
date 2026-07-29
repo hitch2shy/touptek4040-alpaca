@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ToupTek 4040 Control Console</title>
+  <link rel="stylesheet" href="/ui/tokens.css">
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <header class="status-bar" aria-label="Camera status">
+    <div class="identity">
+      <span class="product-name">ToupTek 4040</span>
+      <span class="model-name">sMAX16AM-U3-CL-GPS</span>
+      <span id="mobile-serial" class="mobile-serial">Not selected</span>
+    </div>
+    <dl class="status-readouts">
+      <div><dt>Link</dt><dd id="status-connection" data-tone="muted">Offline</dd></div>
+      <div><dt>State</dt><dd id="status-state">Idle</dd></div>
+      <div><dt>Readout</dt><dd id="status-readout">RAW 12-bit</dd></div>
+      <div><dt>Sensor</dt><dd>4096 × 4096 · 9 µm</dd></div>
+      <div><dt>CCD</dt><dd id="status-temperature">—</dd></div>
+      <div><dt>Serial</dt><dd id="status-serial">Not selected</dd></div>
+    </dl>
+    <div class="safety-notice" role="note">
+      <svg aria-hidden="true"><use href="/ui/icons.svg#shield"></use></svg>
+      <span><strong>Trusted LAN only.</strong> No TLS or account authentication.</span>
+    </div>
+  </header>
+
+  <main class="instrument">
+    <aside class="control-rail" aria-labelledby="acquisition-title">
+      <div class="rail-heading">
+        <p class="pane-index">Acquisition</p>
+        <h1 id="acquisition-title">Camera control</h1>
+      </div>
+
+      <section class="control-section command-section" aria-labelledby="session-heading">
+        <div class="section-heading">
+          <h2 id="session-heading">Session</h2>
+          <span id="connection-dot" class="state-dot" aria-hidden="true"></span>
+        </div>
+        <div class="command-grid">
+          <button id="connect-button" class="button primary" type="button">
+            <svg aria-hidden="true"><use href="/ui/icons.svg#link"></use></svg>
+            <span>Connect</span>
+          </button>
+          <button id="preview-button" class="button secondary" type="button" disabled>
+            <svg aria-hidden="true"><use href="/ui/icons.svg#eye"></use></svg>
+            <span>Start preview</span>
+          </button>
+          <button id="abort-button" class="button danger" type="button" disabled>
+            <svg aria-hidden="true"><use href="/ui/icons.svg#stop"></use></svg>
+            <span>Abort</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="control-section" aria-labelledby="exposure-heading">
+        <h2 id="exposure-heading">Exposure</h2>
+        <label class="field">
+          <span>Duration</span>
+          <span class="input-with-unit">
+            <input id="exposure-duration" type="number" min="0.0001" max="86400" step="0.1" value="1">
+            <span>s</span>
+          </span>
+        </label>
+        <button id="expose-button" class="button primary full-width" type="button" disabled>
+          Start exposure
+        </button>
+        <div id="exposure-progress" class="exposure-progress" hidden>
+          <div class="progress-track" aria-hidden="true"><span id="progress-fill"></span></div>
+          <span id="progress-label">0%</span>
+        </div>
+      </section>
+
+      <section class="control-section" aria-labelledby="geometry-heading">
+        <h2 id="geometry-heading">Geometry &amp; readout</h2>
+        <div class="field-pair">
+          <label class="field">
+            <span>Binning</span>
+            <select id="binning">
+              <option value="1">1 × 1</option><option value="2">2 × 2</option>
+              <option value="3">3 × 3</option><option value="4">4 × 4</option>
+              <option value="5">5 × 5</option><option value="6">6 × 6</option>
+              <option value="7">7 × 7</option><option value="8">8 × 8</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Readout</span>
+            <select id="readout-mode">
+              <option>RAW 12-bit</option>
+              <option>RAW 8-bit</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span>Gain <output id="gain-value" for="gain">100</output></span>
+          <input id="gain" type="range" min="100" max="1650" step="1" value="100">
+        </label>
+        <fieldset class="roi-fields">
+          <legend>ROI in binned pixels</legend>
+          <label><span>X</span><input id="roi-x" type="number" min="0" value="0"></label>
+          <label><span>Y</span><input id="roi-y" type="number" min="0" value="0"></label>
+          <label><span>Width</span><input id="roi-width" type="number" min="1" value="4096"></label>
+          <label><span>Height</span><input id="roi-height" type="number" min="1" value="4096"></label>
+        </fieldset>
+        <button id="apply-settings" class="button secondary full-width" type="button" disabled>
+          Apply acquisition settings
+        </button>
+        <p id="settings-message" class="field-message" aria-live="polite"></p>
+      </section>
+
+      <section class="control-section" aria-labelledby="cooling-heading">
+        <h2 id="cooling-heading">Cooling</h2>
+        <div class="field-pair cooling-row">
+          <label class="field">
+            <span>Target</span>
+            <span class="input-with-unit">
+              <input id="target-temperature" type="number" min="-50" max="40" step="0.5" value="-10">
+              <span>°C</span>
+            </span>
+          </label>
+          <label class="switch-field">
+            <input id="cooler-on" type="checkbox">
+            <span>Cooler</span>
+          </label>
+        </div>
+      </section>
+    </aside>
+
+    <section class="viewport-pane" aria-labelledby="viewport-title">
+      <div class="viewport-toolbar">
+        <div>
+          <p class="pane-index">Current generation</p>
+          <h2 id="viewport-title">Scientific image</h2>
+        </div>
+        <div class="viewport-meta" aria-live="polite">
+          <span id="generation-label">No generation</span>
+          <a id="fits-link" class="button quiet" href="/web/v1/image.fits" download aria-disabled="true">
+            <svg aria-hidden="true"><use href="/ui/icons.svg#download"></use></svg>
+            FITS
+          </a>
+        </div>
+      </div>
+      <div id="image-stage" class="image-stage" tabindex="0" aria-label="Image viewport. Use arrow keys to move the pixel cursor and Enter to inspect.">
+        <div id="image-empty" class="viewport-state">
+          <svg aria-hidden="true"><use href="/ui/icons.svg#sensor"></use></svg>
+          <h3>No image generation</h3>
+          <p>Connect the camera, then start Preview or an exposure.</p>
+        </div>
+        <div id="image-loading" class="viewport-state skeleton-state" hidden>
+          <span class="skeleton-block"></span>
+          <p>Rendering display stretch…</p>
+        </div>
+        <div id="image-error" class="viewport-state error-state" hidden>
+          <svg aria-hidden="true"><use href="/ui/icons.svg#warning"></use></svg>
+          <h3>Image unavailable</h3>
+          <p id="image-error-copy">Check camera state and retry.</p>
+        </div>
+        <img id="science-image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="Latest monochrome camera frame" hidden>
+        <div id="pixel-cursor" class="pixel-cursor" hidden></div>
+      </div>
+      <div class="viewport-footer">
+        <span id="pixel-readout" aria-live="polite">Pixel —</span>
+        <span>Display stretch only · scientific pixels unchanged</span>
+      </div>
+    </section>
+
+    <aside class="analysis-rail" aria-labelledby="analysis-title">
+      <div class="rail-heading">
+        <p class="pane-index">Measurement</p>
+        <h2 id="analysis-title">Image analysis</h2>
+      </div>
+
+      <section class="analysis-section stats-section" aria-labelledby="statistics-heading">
+        <div class="section-heading">
+          <h3 id="statistics-heading">Statistics</h3>
+          <button id="refresh-analysis" class="icon-button" type="button" aria-label="Refresh analysis">
+            <svg aria-hidden="true"><use href="/ui/icons.svg#refresh"></use></svg>
+          </button>
+        </div>
+        <dl class="stat-list">
+          <div><dt>Minimum</dt><dd id="stat-min">—</dd></div>
+          <div><dt>Maximum</dt><dd id="stat-max">—</dd></div>
+          <div><dt>Mean</dt><dd id="stat-mean">—</dd></div>
+          <div><dt>σ</dt><dd id="stat-sigma">—</dd></div>
+          <div><dt>FWHM X</dt><dd id="stat-fwhm-x">—</dd></div>
+          <div><dt>FWHM Y</dt><dd id="stat-fwhm-y">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="analysis-section" aria-labelledby="histogram-heading">
+        <div class="section-heading">
+          <h3 id="histogram-heading">Histogram</h3>
+          <span id="histogram-range">0 — 4095</span>
+        </div>
+        <canvas id="histogram" width="288" height="116" aria-label="Pixel value histogram"></canvas>
+      </section>
+
+      <section class="analysis-section stretch-section" aria-labelledby="stretch-heading">
+        <h3 id="stretch-heading">Display stretch</h3>
+        <label class="field">
+          <span>Black point <output id="black-value" for="black-point">0</output></span>
+          <input id="black-point" type="range" min="0" max="4094" value="0">
+        </label>
+        <label class="field">
+          <span>White point <output id="white-value" for="white-point">4095</output></span>
+          <input id="white-point" type="range" min="1" max="4095" value="4095">
+        </label>
+        <label class="field">
+          <span>Gamma <output id="gamma-value" for="gamma">1.00</output></span>
+          <input id="gamma" type="range" min="0.1" max="5" step="0.05" value="1">
+        </label>
+        <button id="auto-stretch" class="button secondary full-width" type="button">Auto stretch</button>
+      </section>
+    </aside>
+  </main>
+
+  <section class="log-dock" aria-labelledby="log-title">
+    <header>
+      <div>
+        <p class="pane-index">Timeline</p>
+        <h2 id="log-title">Operational log</h2>
+      </div>
+      <div class="log-actions">
+        <label>
+          <span class="visually-hidden">Log level</span>
+          <select id="log-level">
+            <option value="all">All levels</option>
+            <option value="info">Info</option>
+            <option value="warning">Warnings</option>
+            <option value="error">Errors</option>
+          </select>
+        </label>
+        <button id="pause-logs" class="button quiet" type="button">Pause</button>
+        <button id="export-logs" class="button quiet" type="button">
+          <svg aria-hidden="true"><use href="/ui/icons.svg#download"></use></svg>
+          Export
+        </button>
+      </div>
+    </header>
+    <ol id="log-list" class="log-list" aria-live="polite"></ol>
+    <p id="log-empty" class="log-empty">No entries at this level.</p>
+  </section>
+
+  <div id="toast-region" class="toast-region" aria-live="assertive"></div>
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

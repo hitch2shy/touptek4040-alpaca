@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-29T01:40:00Z",
+  "title": "Design System: ToupTek 4040 Control Console",
+  "extensions": {
+    "colorMeta": {
+      "surface-base": {
+        "role": "neutral",
+        "displayName": "Black Image Bay",
+        "tonalRamp": ["#050709", "#080b0f", "#111820", "#27323d", "#4b5967", "#7d8995", "#b8c0c8", "#eef1f4"]
+      },
+      "surface-pane": {
+        "role": "neutral",
+        "displayName": "Graphite Instrument Pane",
+        "tonalRamp": ["#070a0e", "#0d1219", "#111720", "#28333f", "#4c5967", "#7e8995", "#bac1c8", "#f0f2f4"]
+      },
+      "signal": {
+        "role": "primary",
+        "displayName": "Acquisition Cyan",
+        "tonalRamp": ["#09252d", "#123b47", "#1d5666", "#2d7689", "#58b8d1", "#83cde0", "#b5e2ec", "#edf9fb"]
+      },
+      "warning": {
+        "role": "secondary",
+        "displayName": "Boundary Amber",
+        "tonalRamp": ["#2a1d0b", "#463015", "#6b491f", "#9a6d31", "#e4ac55", "#ecc57d", "#f4dcae", "#fff8e9"]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Abort Red",
+        "tonalRamp": ["#311015", "#511a21", "#78272e", "#aa3d43", "#f06e70", "#f59495", "#fac0c1", "#fff0f0"]
+      },
+      "success": {
+        "role": "secondary",
+        "displayName": "Connected Green",
+        "tonalRamp": ["#0c281a", "#17432d", "#246142", "#38875f", "#70c99a", "#95d9b3", "#bce8d1", "#effaf4"]
+      }
+    },
+    "typographyMeta": {
+      "title": {
+        "displayName": "Pane title",
+        "purpose": "Product title and primary pane headings."
+      },
+      "body": {
+        "displayName": "Operating copy",
+        "purpose": "Controls, explanations, and action labels."
+      },
+      "label": {
+        "displayName": "Instrument label",
+        "purpose": "Compact pane indices and status terms."
+      },
+      "data": {
+        "displayName": "Measurement data",
+        "purpose": "Pixels, coordinates, temperatures, timestamps, identifiers, and logs."
+      }
+    },
+    "shadows": [
+      {
+        "name": "sticky-session",
+        "value": "0 8px 18px rgb(0 0 0 / 28%)",
+        "purpose": "Separates the mobile Session strip only while it overlaps scrolled content."
+      },
+      {
+        "name": "transient-overlay",
+        "value": "0 12px 34px rgb(0 0 0 / 45%)",
+        "purpose": "Reserved for toasts and transient overlays."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-color",
+        "value": "160ms ease-out",
+        "purpose": "Button and control state color transitions."
+      },
+      {
+        "name": "exposure-progress",
+        "value": "180ms ease-out",
+        "purpose": "Transform-only exposure progress feedback."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "analysis-below",
+        "value": "1180px"
+      },
+      {
+        "name": "single-flow",
+        "value": "760px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary acquisition button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Starts a primary camera action while preserving familiar button behavior.",
+      "html": "<button class=\"ds-button-primary\" type=\"button\">Start exposure</button>",
+      "css": ".ds-button-primary { min-height: 34px; padding: 7px 11px; border: 1px solid #3d91a7; border-radius: 6px; background: #236b7d; color: #f1f5f8; font: 620 14px/1.45 \"Segoe UI\", system-ui, sans-serif; transition: background-color 160ms ease-out, border-color 160ms ease-out; } .ds-button-primary:hover { border-color: #73d1e6; background: #287c90; } .ds-button-primary:active { background: #10171f; } .ds-button-primary:focus-visible { outline: 2px solid #9fe6f3; outline-offset: 2px; }"
+    },
+    {
+      "name": "Abort button",
+      "kind": "button",
+      "description": "The only destructive control; always adjacent to connection and Preview.",
+      "html": "<button class=\"ds-button-abort\" type=\"button\">Abort</button>",
+      "css": ".ds-button-abort { min-height: 34px; padding: 7px 11px; border: 1px solid #865054; border-radius: 6px; background: #3f1c22; color: #ffb7b8; font: 620 14px/1.45 \"Segoe UI\", system-ui, sans-serif; transition: background-color 160ms ease-out, border-color 160ms ease-out; } .ds-button-abort:hover { border-color: #f06e70; background: #54252c; } .ds-button-abort:focus-visible { outline: 2px solid #9fe6f3; outline-offset: 2px; } .ds-button-abort:disabled { cursor: not-allowed; opacity: .48; }"
+    },
+    {
+      "name": "Instrument input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Compact numeric or textual entry in the acquisition rail.",
+      "html": "<label class=\"ds-field\"><span>Duration</span><input value=\"1\" aria-label=\"Duration in seconds\"></label>",
+      "css": ".ds-field { display: flex; gap: 7px; flex-direction: column; color: #aebbc8; font: 12px/1.45 \"Segoe UI\", system-ui, sans-serif; } .ds-field input { min-height: 34px; padding: 6px 9px; border: 1px solid #3d4d5e; border-radius: 6px; background: #0a0f15; color: #f1f5f8; font: 14px/1.45 \"Segoe UI\", system-ui, sans-serif; } .ds-field input:hover { border-color: #586b7e; } .ds-field input:focus-visible { outline: 2px solid #9fe6f3; outline-offset: 2px; }"
+    },
+    {
+      "name": "Live status readout",
+      "kind": "custom",
+      "description": "A term and live measurement in the persistent status rail.",
+      "html": "<dl class=\"ds-status\"><div><dt>STATE</dt><dd>Exposing</dd></div><div><dt>CCD</dt><dd>-12.4 °C</dd></div></dl>",
+      "css": ".ds-status { display: flex; margin: 0; border: 1px solid #293442; background: #0d1117; color: #f1f5f8; } .ds-status div { min-width: 100px; padding: 8px 14px; border-right: 1px solid #293442; } .ds-status dt { color: #8997a5; font: 650 11px/1.4 \"Segoe UI\", system-ui, sans-serif; letter-spacing: .055em; } .ds-status dd { margin: 2px 0 0; color: #73d1e6; font: 12px/1.5 \"Cascadia Mono\", Consolas, monospace; }"
+    },
+    {
+      "name": "Scientific image stage",
+      "kind": "custom",
+      "description": "The deep, image-majority viewport with a generation label and non-scientific stretch boundary.",
+      "html": "<section class=\"ds-viewport\"><header>Generation 42</header><div class=\"ds-image\">SCIENTIFIC IMAGE</div><footer>Display stretch only · scientific pixels unchanged</footer></section>",
+      "css": ".ds-viewport { display: grid; grid-template-rows: auto minmax(240px, 1fr) auto; min-width: 440px; border: 1px solid #293442; background: #090c10; color: #f1f5f8; font: 14px/1.45 \"Segoe UI\", system-ui, sans-serif; } .ds-viewport header, .ds-viewport footer { padding: 9px 14px; color: #8997a5; font: 11px/1.5 \"Cascadia Mono\", Consolas, monospace; } .ds-image { display: grid; place-items: center; background: #020304; color: #aebbc8; }"
+    },
+    {
+      "name": "Operational log row",
+      "kind": "custom",
+      "description": "Escaped, aligned diagnostic output in the persistent bottom timeline.",
+      "html": "<div class=\"ds-log\"><time>2026-07-29T01:40:00.000Z</time><strong>WARNING</strong><span>Trusted LAN boundary is active.</span></div>",
+      "css": ".ds-log { display: grid; grid-template-columns: 190px 66px 1fr; gap: 10px; padding: 5px 16px; border-bottom: 1px solid #171e27; background: #0a0e13; color: #f1f5f8; font: 11px/1.5 \"Cascadia Mono\", Consolas, monospace; } .ds-log time { color: #8997a5; } .ds-log strong { color: #e4ac55; font-weight: 650; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Calibrated Control Room",
+    "overview": "This is an operating surface for acquiring and judging scientific images, not a dashboard assembled from interchangeable cards. The console feels like a precise optical instrument used in low ambient light. Expression comes from measured alignment, legible state color, dense but calm data, and the changing image itself.",
+    "keyCharacteristics": [
+      "The scientific image is always the largest visual object.",
+      "Controls are grouped by acquisition sequence, not by equal-sized cards.",
+      "State, warning, and error colors carry operational meaning only.",
+      "Numeric data aligns for rapid comparison.",
+      "Logs remain visible, filterable, pausable, and exportable."
+    ],
+    "rules": [
+      {
+        "name": "The Signal Integrity Rule",
+        "body": "Accent colors never decorate neutral content; each colored element must communicate selection, activity, warning, or failure.",
+        "section": "colors"
+      },
+      {
+        "name": "The Measurement Type Rule",
+        "body": "Monospace is reserved for values that operators compare or copy; actions, headings, and explanatory text remain sans-serif.",
+        "section": "typography"
+      },
+      {
+        "name": "The Image Majority Rule",
+        "body": "At workstation widths, the viewport owns more area than either side rail and cannot be reduced to a thumbnail by secondary panels.",
+        "section": "layout"
+      },
+      {
+        "name": "The Chassis Rule",
+        "body": "Resting panes share edges and tonal layers. Shadows indicate transient overlap or sticky state, never ordinary containment.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep connection, CameraState, RAW mode, temperature, and serial identity visible.",
+      "Do show loading, empty, disconnected, exposing, aborted, and failed states explicitly.",
+      "Do preserve keyboard focus, readable contrast, and reduced-motion behavior.",
+      "Do keep display stretching visibly separate from scientific data and downloads."
+    ],
+    "donts": [
+      "Don't reuse COSMOS66 device names, 8120 dimensions, HDR 18-bit, PICam, labeled gain modes, or 1/2/4-only binning.",
+      "Don't hide Abort inside a menu or modal.",
+      "Don't use equal-weight metric cards as the primary layout.",
+      "Don't invent stars, benchmark claims, customers, or decorative telemetry."
+    ]
+  }
+}
