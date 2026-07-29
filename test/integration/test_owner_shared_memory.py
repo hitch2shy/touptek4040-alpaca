@@ -7,7 +7,6 @@ import multiprocessing
 from multiprocessing import shared_memory
 import os
 from pathlib import Path
-import time
 from typing import Any
 
 import pytest
@@ -38,14 +37,13 @@ def _claim_crash() -> bool:
 
 
 def _publish_event(crash_point: str, name: str | None = None) -> None:
-    _CRASH_EVENTS.put(
+    _CRASH_EVENTS.send(
         {
             "crash_point": crash_point,
             "pid": os.getpid(),
             "name": name,
         }
     )
-    time.sleep(0.03)
 
 
 class _CrashSendConnection(_ObservedConnection):
@@ -126,7 +124,7 @@ class _CrashProcessFactory:
     def __init__(self, crash_point: str) -> None:
         self.context = multiprocessing.get_context("spawn")
         self.crash_point = crash_point
-        self.events = self.context.Queue()
+        self.event_parent, self.event_child = self.context.Pipe(duplex=False)
         self.claimed = self.context.Value("b", 0)
 
     def start(
@@ -146,7 +144,7 @@ class _CrashProcessFactory:
                 generation,
                 str(registry_path),
                 self.crash_point,
-                self.events,
+                self.event_child,
                 self.claimed,
             ),
         )
@@ -189,7 +187,8 @@ def run_shared_memory_crash(
                 1,
                 ReadoutMode.RAW12,
             )
-        event = factory.events.get(timeout=1)
+        assert factory.event_parent.poll(1)
+        event = factory.event_parent.recv()
         owner_pid = int(event["pid"])
         names = [event["name"]] if isinstance(event.get("name"), str) else []
         registry_names = _registry_names(registry_path)

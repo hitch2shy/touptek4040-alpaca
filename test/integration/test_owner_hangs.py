@@ -6,7 +6,7 @@ import multiprocessing
 import json
 import os
 from pathlib import Path
-import queue
+import subprocess
 import threading
 import time
 from typing import Any
@@ -23,7 +23,27 @@ from touptek4040.config import OwnerConfig
 from touptek4040.errors import CameraError
 
 
-_FAULT_QUEUE: Any = None
+REQUIRED_HARD_BOUNDARIES = {
+    "startup",
+    "connect",
+    "get",
+    "set",
+    "trigger",
+    "heater_read",
+    "heater_write",
+    "frame_publication",
+    "abort",
+    "disconnect",
+}
+REQUIRED_CRASH_POINTS = {
+    "before_creation",
+    "after_creation",
+    "after_descriptor_send",
+    "after_proxy_copy_before_release_ack",
+}
+
+
+_FAULT_EVENTS: Any = None
 _FAULT_CLAIMED: Any = None
 _SELECTED_BOUNDARY = ""
 _CURRENT_REQUEST = threading.local()
@@ -68,21 +88,25 @@ class HangingOwnerBackend(FakeOwnerBackend):
     """Real owner backend that blocks once at one selected SDK boundary."""
 
     def connect(self) -> None:
-        _hang_once("connect")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "connect":
+            _hang_once("connect")
         super().connect()
 
     def disconnect(self) -> None:
-        _hang_once("disconnect")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "disconnect":
+            _hang_once("disconnect")
         super().disconnect()
 
     @property
     def gain(self) -> int:
-        _hang_once("get")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "get_gain":
+            _hang_once("get")
         return super().gain
 
     @gain.setter
     def gain(self, value: int) -> None:
-        _hang_once("set")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "set_gain":
+            _hang_once("set")
         FakeOwnerBackend.gain.fset(self, value)
 
     def acquire(
@@ -93,11 +117,13 @@ class HangingOwnerBackend(FakeOwnerBackend):
         readout_mode: ReadoutMode,
         control: Any = None,
     ) -> Frame:
-        _hang_once("trigger")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "acquire":
+            _hang_once("trigger")
         return super().acquire(duration_s, roi, binning, readout_mode, control)
 
     def abort(self) -> None:
-        _hang_once("abort")
+        if getattr(_CURRENT_REQUEST, "operation", None) == "abort":
+            _hang_once("abort")
         super().abort()
 
     @property
@@ -122,23 +148,25 @@ def create_hanging_backend(
 def _hang_once(boundary: str) -> None:
     if boundary != _SELECTED_BOUNDARY:
         return
+    _observe_invocation(boundary)
     with _FAULT_CLAIMED.get_lock():
         if _FAULT_CLAIMED.value:
             return
         _FAULT_CLAIMED.value = 1
-    _FAULT_QUEUE.put(
+    threading.Event().wait()
+
+
+def _observe_invocation(boundary: str) -> None:
+    if _FAULT_EVENTS is None:
+        return
+    _FAULT_EVENTS.send(
         {
             "boundary": boundary,
             "pid": os.getpid(),
             "generation": getattr(_CURRENT_REQUEST, "generation", None),
             "request_id": getattr(_CURRENT_REQUEST, "request_id", None),
-            "call_count": 1,
         }
     )
-    # Give multiprocessing.Queue's feeder thread time to make the evidence
-    # parent-visible before this exact process is forcibly terminated.
-    time.sleep(0.03)
-    threading.Event().wait()
 
 
 def _fault_owner_main(
@@ -148,11 +176,11 @@ def _fault_owner_main(
     generation: int,
     registry_path: str,
     selected_boundary: str,
-    fault_queue: Any,
+    fault_events: Any,
     fault_claimed: Any,
 ) -> None:
-    global _FAULT_QUEUE, _FAULT_CLAIMED, _SELECTED_BOUNDARY
-    _FAULT_QUEUE = fault_queue
+    global _FAULT_EVENTS, _FAULT_CLAIMED, _SELECTED_BOUNDARY
+    _FAULT_EVENTS = fault_events
     _FAULT_CLAIMED = fault_claimed
     _SELECTED_BOUNDARY = selected_boundary
     _CURRENT_REQUEST.generation = generation
@@ -188,7 +216,7 @@ class _FaultProcessFactory:
     def __init__(self, boundary: str) -> None:
         self.context = multiprocessing.get_context("spawn")
         self.boundary = boundary
-        self.events = self.context.Queue()
+        self.event_parent, self.event_child = self.context.Pipe(duplex=False)
         self.claimed = self.context.Value("b", 0)
 
     def start(
@@ -208,7 +236,7 @@ class _FaultProcessFactory:
                 generation,
                 str(registry_path),
                 self.boundary,
-                self.events,
+                self.event_child,
                 self.claimed,
             ),
         )
@@ -219,13 +247,8 @@ class _FaultProcessFactory:
 
     def drain(self) -> list[dict[str, object]]:
         events: list[dict[str, object]] = []
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            try:
-                events.append(self.events.get(timeout=0.02))
-            except queue.Empty:
-                if events:
-                    break
+        while self.event_parent.poll(0.02):
+            events.append(self.event_parent.recv())
         return events
 
 
@@ -283,9 +306,13 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
         elapsed = time.monotonic() - started
         events = factory.drain()
         matching = [event for event in events if event["boundary"] == boundary]
-        assert len(matching) == 1, events
-        event = matching[0]
-        assert event["call_count"] == 1
+        hung_events = [
+            event
+            for event in matching
+            if event["generation"] == hung_generation
+        ]
+        assert hung_events, events
+        event = hung_events[0]
         hung_pid = int(event["pid"])
         result = {
             "elapsed_s": elapsed,
@@ -294,7 +321,9 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
             "hung_generation": hung_generation,
             "terminated_pid": proxy.last_terminated_pid,
             "hung_pid_alive": _pid_alive(hung_pid),
-            "operation_count": event["call_count"],
+            "operation_count": _count_generation_invocations(
+                events, boundary, hung_generation
+            ),
             "request_id": event["request_id"],
             "replacement_generation": proxy.owner_generation,
             "replacement_connected": proxy.connected,
@@ -309,6 +338,125 @@ def _pid_alive(pid: int) -> bool:
     from touptek4040.shared_frames import SharedFrameRegistry
 
     return not SharedFrameRegistry._pid_is_dead(pid)
+
+
+def _count_generation_invocations(
+    events: list[dict[str, object]],
+    boundary: str,
+    generation: int,
+) -> int:
+    return sum(
+        1
+        for event in events
+        if event.get("boundary") == boundary
+        and event.get("generation") == generation
+    )
+
+
+def test_operation_count_uses_every_matching_invocation() -> None:
+    events = [
+        {"boundary": "trigger", "pid": 10, "generation": 4, "request_id": 2},
+        {"boundary": "trigger", "pid": 10, "generation": 4, "request_id": 2},
+        {"boundary": "trigger", "pid": 11, "generation": 5, "request_id": 2},
+    ]
+
+    assert _count_generation_invocations(events, "trigger", 4) == 2
+
+
+@pytest.mark.parametrize(
+    ("mutation", "manifest_violations", "failed_rows"),
+    [
+        ("substitute", 2, 2),
+        ("duplicate", 2, 3),
+        ("extra", 1, 1),
+        ("duplicate_operation", 0, 1),
+    ],
+)
+def test_fault_runner_rejects_corrupt_case_evidence(
+    mutation: str,
+    manifest_violations: int,
+    failed_rows: int,
+    tmp_path: Path,
+) -> None:
+    records = _valid_runner_records()
+    if mutation == "substitute":
+        records[0]["name"] = "unknown-boundary"
+    elif mutation == "duplicate":
+        records[1] = dict(records[0])
+    elif mutation == "extra":
+        records.append(dict(records[0], name="unexpected"))
+    else:
+        records[0]["operation_count"] = 2
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output_directory = tmp_path / "audit"
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_owner_faults.ps1"
+            ),
+            "-CasesInput",
+            str(cases_path),
+            "-OutputDirectory",
+            str(output_directory),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    summary = json.loads(
+        (output_directory / "summary.json").read_text(encoding="utf-8-sig")
+    )
+    assert summary["passed"] is False
+    assert summary["violations"]
+    assert summary["counters"]["manifestViolations"] == manifest_violations
+    assert (
+        summary["counters"]["duplicateOperationViolations"]
+        == (1 if mutation == "duplicate_operation" else 0)
+    )
+    assert (
+        sum(case["status"] == "FAIL" for case in summary["cases"])
+        == failed_rows
+    )
+
+
+def _valid_runner_records() -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for name in sorted(REQUIRED_HARD_BOUNDARIES):
+        records.append(
+            {
+                "kind": "hard-boundary",
+                "name": name,
+                "elapsed_s": 0.1,
+                "hard_bound_s": 1.0,
+                "hung_pid_alive": False,
+                "operation_count": 1,
+                "replacement_connected": False,
+            }
+        )
+    for name in sorted(REQUIRED_CRASH_POINTS):
+        records.append(
+            {
+                "kind": "shared-memory",
+                "name": name,
+                "owner_pid_alive": False,
+                "registry_names": [],
+                "live_segment_names": [],
+            }
+        )
+    return records
 
 
 def _record_result(result: dict[str, object]) -> None:
