@@ -1,24 +1,45 @@
 [CmdletBinding()]
 param(
     [string]$CasesInput = "",
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [switch]$ValidationOnly
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $python = Join-Path $repoRoot ".venv64\Scripts\python.exe"
-$resultDirectory = if ($OutputDirectory) {
-    [System.IO.Path]::GetFullPath($OutputDirectory)
-} else {
-    Join-Path $repoRoot "test\results\owner-faults"
+$officialResultDirectory = Join-Path $repoRoot "test\results\owner-faults"
+if (-not $ValidationOnly -and ($CasesInput -or $OutputDirectory)) {
+    Write-Error (
+        "CasesInput and OutputDirectory are validation-only; official audits " +
+        "always run fresh spawned tests and use the official result directory"
+    )
+    exit 64
 }
-$jsonLines = if ($CasesInput) {
-    [System.IO.Path]::GetFullPath($CasesInput)
-} else {
-    Join-Path $resultDirectory "cases.jsonl"
+if ($ValidationOnly -and (-not $CasesInput -or -not $OutputDirectory)) {
+    Write-Error "ValidationOnly requires CasesInput and OutputDirectory"
+    exit 64
 }
-$summaryJson = Join-Path $resultDirectory "summary.json"
-$summaryMarkdown = Join-Path $resultDirectory "summary.md"
+
+if ($ValidationOnly) {
+    $resultDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+    $jsonLines = [System.IO.Path]::GetFullPath($CasesInput)
+    $summaryJson = Join-Path $resultDirectory "validation-summary.json"
+    $summaryMarkdown = Join-Path $resultDirectory "validation-summary.md"
+} else {
+    $resultDirectory = $officialResultDirectory
+    if (Test-Path -LiteralPath $resultDirectory) {
+        $resolvedResultDirectory = (Resolve-Path -LiteralPath $resultDirectory).Path
+        if ($resolvedResultDirectory -ne $officialResultDirectory) {
+            Write-Error "Refusing to delete a non-official evidence directory"
+            exit 65
+        }
+        Remove-Item -LiteralPath $resultDirectory -Recurse -Force
+    }
+    $jsonLines = Join-Path $resultDirectory "cases.jsonl"
+    $summaryJson = Join-Path $resultDirectory "summary.json"
+    $summaryMarkdown = Join-Path $resultDirectory "summary.md"
+}
 
 New-Item -ItemType Directory -Force -Path $resultDirectory | Out-Null
 foreach ($path in @($summaryJson, $summaryMarkdown)) {
@@ -28,10 +49,7 @@ foreach ($path in @($summaryJson, $summaryMarkdown)) {
 }
 
 $pytestExitCode = 0
-if (-not $CasesInput) {
-    if (Test-Path -LiteralPath $jsonLines) {
-        Remove-Item -LiteralPath $jsonLines -Force
-    }
+if (-not $ValidationOnly) {
     $env:TOUPTEK_OWNER_FAULT_RESULTS = $jsonLines
     Push-Location $repoRoot
     try {
@@ -88,7 +106,7 @@ $counters = [ordered]@{
     liveChildViolations = 0
     registryLeakViolations = 0
     liveSegmentViolations = 0
-    duplicateOperationViolations = 0
+    generationInvocationViolations = 0
     elapsedBoundViolations = 0
     connectedReplacementViolations = 0
 }
@@ -130,11 +148,46 @@ foreach ($case in $cases) {
             $caseViolations.Add("exact child remains alive")
             $counters.liveChildViolations++
         }
-        if ([int]$case.operation_count -ne 1) {
+        $hungKey = [string]$case.hung_generation
+        $replacementKey = [string]$case.replacement_generation
+        $countProperties = @(
+            $case.invocations_by_generation.PSObject.Properties
+        )
+        $countKeys = @($countProperties | ForEach-Object { $_.Name })
+        $hungProperty = $countProperties |
+            Where-Object Name -eq $hungKey |
+            Select-Object -First 1
+        $replacementProperty = $countProperties |
+            Where-Object Name -eq $replacementKey |
+            Select-Object -First 1
+        $expectedReplacementCount = if ($case.name -eq "startup") { 1 } else { 0 }
+        if (
+            -not $hungProperty -or
+            [int]$hungProperty.Value -ne 1
+        ) {
             $caseViolations.Add(
-                "duplicate acquisition/operation count $($case.operation_count)"
+                "failed generation $hungKey invocation count must be exactly 1"
             )
-            $counters.duplicateOperationViolations++
+            $counters.generationInvocationViolations++
+        }
+        if (
+            -not $replacementProperty -or
+            [int]$replacementProperty.Value -ne $expectedReplacementCount
+        ) {
+            $caseViolations.Add(
+                "replacement generation $replacementKey invocation count must be " +
+                "exactly $expectedReplacementCount"
+            )
+            $counters.generationInvocationViolations++
+        }
+        $expectedGenerationKeys = @($hungKey, $replacementKey)
+        $unexpectedGenerationKeyCount = @(
+            $countKeys |
+                Where-Object { $_ -notin $expectedGenerationKeys }
+        ).Count
+        if ($unexpectedGenerationKeyCount -ne 0) {
+            $caseViolations.Add("unexpected owner generation invocation evidence")
+            $counters.generationInvocationViolations++
         }
         if ([double]$case.elapsed_s -gt [double]$case.hard_bound_s) {
             $caseViolations.Add("elapsed bound exceeded")
@@ -190,7 +243,9 @@ foreach ($key in $requiredKeys) {
 
 $passed = $violations.Count -eq 0
 $summary = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
+    mode = if ($ValidationOnly) { "validation-only" } else { "official-fresh-audit" }
+    auditEligible = -not $ValidationOnly
     generatedUtc = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
     passed = $passed
     pytestExitCode = $pytestExitCode
@@ -204,7 +259,11 @@ $summary | ConvertTo-Json -Depth 10 |
     Set-Content -LiteralPath $summaryJson -Encoding UTF8
 
 $lines = [System.Collections.Generic.List[string]]::new()
-$lines.Add("# Camera Owner Fault Audit")
+$lines.Add($(if ($ValidationOnly) {
+        "# Camera Owner Fault Evidence Validation (Not an Audit)"
+    } else {
+        "# Camera Owner Fault Audit"
+    }))
 $lines.Add("")
 $lines.Add("- Result: " + $(if ($passed) { "PASS" } else { "FAIL" }))
 $lines.Add("- Cases: $($cases.Count) / $($requiredKeys.Count)")
@@ -214,7 +273,8 @@ $lines.Add("- Live child violations: $($counters.liveChildViolations)")
 $lines.Add("- Registry leak violations: $($counters.registryLeakViolations)")
 $lines.Add("- Live segment violations: $($counters.liveSegmentViolations)")
 $lines.Add(
-    "- Duplicate operation violations: $($counters.duplicateOperationViolations)"
+    "- Generation invocation violations: " +
+    "$($counters.generationInvocationViolations)"
 )
 $lines.Add("- Hard-bound violations: $($counters.elapsedBoundViolations)")
 $lines.Add(
@@ -238,6 +298,10 @@ if ($violations.Count -gt 0) {
 }
 $lines | Set-Content -LiteralPath $summaryMarkdown -Encoding UTF8
 
+if ($ValidationOnly) {
+    Write-Host "Validation-only result written: $summaryJson"
+    exit 2
+}
 if (-not $passed) {
     Write-Error "Camera owner fault audit failed. See $summaryJson"
     exit 1

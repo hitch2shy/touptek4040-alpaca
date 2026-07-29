@@ -314,6 +314,11 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
         assert hung_events, events
         event = hung_events[0]
         hung_pid = int(event["pid"])
+        invocation_counts = _invocation_counts_by_generation(
+            events, boundary
+        )
+        invocation_counts.setdefault(str(hung_generation), 0)
+        invocation_counts.setdefault(str(proxy.owner_generation), 0)
         result = {
             "elapsed_s": elapsed,
             "hard_bound_s": 2.1 if boundary == "startup" else 0.9,
@@ -321,9 +326,7 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
             "hung_generation": hung_generation,
             "terminated_pid": proxy.last_terminated_pid,
             "hung_pid_alive": _pid_alive(hung_pid),
-            "operation_count": _count_generation_invocations(
-                events, boundary, hung_generation
-            ),
+            "invocations_by_generation": invocation_counts,
             "request_id": event["request_id"],
             "replacement_generation": proxy.owner_generation,
             "replacement_connected": proxy.connected,
@@ -340,27 +343,32 @@ def _pid_alive(pid: int) -> bool:
     return not SharedFrameRegistry._pid_is_dead(pid)
 
 
-def _count_generation_invocations(
+def _invocation_counts_by_generation(
     events: list[dict[str, object]],
     boundary: str,
-    generation: int,
-) -> int:
-    return sum(
-        1
-        for event in events
-        if event.get("boundary") == boundary
-        and event.get("generation") == generation
-    )
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        if event.get("boundary") != boundary:
+            continue
+        generation = event.get("generation")
+        assert isinstance(generation, int)
+        key = str(generation)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
-def test_operation_count_uses_every_matching_invocation() -> None:
+def test_invocation_counts_preserve_each_owner_generation() -> None:
     events = [
         {"boundary": "trigger", "pid": 10, "generation": 4, "request_id": 2},
         {"boundary": "trigger", "pid": 10, "generation": 4, "request_id": 2},
         {"boundary": "trigger", "pid": 11, "generation": 5, "request_id": 2},
     ]
 
-    assert _count_generation_invocations(events, "trigger", 4) == 2
+    assert _invocation_counts_by_generation(events, "trigger") == {
+        "4": 2,
+        "5": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -369,7 +377,7 @@ def test_operation_count_uses_every_matching_invocation() -> None:
         ("substitute", 2, 2),
         ("duplicate", 2, 3),
         ("extra", 1, 1),
-        ("duplicate_operation", 0, 1),
+        ("replacement_generation", 0, 1),
     ],
 )
 def test_fault_runner_rejects_corrupt_case_evidence(
@@ -386,7 +394,7 @@ def test_fault_runner_rejects_corrupt_case_evidence(
     elif mutation == "extra":
         records.append(dict(records[0], name="unexpected"))
     else:
-        records[0]["operation_count"] = 2
+        records[0]["invocations_by_generation"]["2"] = 1
     cases_path = tmp_path / "cases.jsonl"
     cases_path.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
@@ -409,6 +417,7 @@ def test_fault_runner_rejects_corrupt_case_evidence(
             str(cases_path),
             "-OutputDirectory",
             str(output_directory),
+            "-ValidationOnly",
         ],
         capture_output=True,
         text=True,
@@ -417,19 +426,59 @@ def test_fault_runner_rejects_corrupt_case_evidence(
 
     assert completed.returncode != 0
     summary = json.loads(
-        (output_directory / "summary.json").read_text(encoding="utf-8-sig")
+        (output_directory / "validation-summary.json").read_text(
+            encoding="utf-8-sig"
+        )
     )
     assert summary["passed"] is False
     assert summary["violations"]
     assert summary["counters"]["manifestViolations"] == manifest_violations
     assert (
-        summary["counters"]["duplicateOperationViolations"]
-        == (1 if mutation == "duplicate_operation" else 0)
+        summary["counters"]["generationInvocationViolations"]
+        == (1 if mutation == "replacement_generation" else 0)
     )
     assert (
         sum(case["status"] == "FAIL" for case in summary["cases"])
         == failed_rows
     )
+
+
+def test_official_runner_rejects_stale_cases_override(
+    tmp_path: Path,
+) -> None:
+    stale_cases = tmp_path / "stale-cases.jsonl"
+    stale_cases.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in _valid_runner_records()
+        ),
+        encoding="utf-8",
+    )
+    output_directory = tmp_path / "official"
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "run_owner_faults.ps1"
+            ),
+            "-CasesInput",
+            str(stale_cases),
+            "-OutputDirectory",
+            str(output_directory),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode != 0
+    assert not (output_directory / "summary.json").exists()
 
 
 def _valid_runner_records() -> list[dict[str, object]]:
@@ -442,7 +491,12 @@ def _valid_runner_records() -> list[dict[str, object]]:
                 "elapsed_s": 0.1,
                 "hard_bound_s": 1.0,
                 "hung_pid_alive": False,
-                "operation_count": 1,
+                "hung_generation": 1,
+                "replacement_generation": 2,
+                "invocations_by_generation": {
+                    "1": 1,
+                    "2": 1 if name == "startup" else 0,
+                },
                 "replacement_connected": False,
             }
         )
@@ -493,7 +547,15 @@ def test_hung_owner_boundary_is_bounded_and_replaced_disconnected(
     assert result["elapsed_s"] <= result["hard_bound_s"]
     assert result["terminated_pid"] == result["hung_pid"]
     assert result["hung_pid_alive"] is False
-    assert result["operation_count"] == 1
+    counts = result["invocations_by_generation"]
+    assert counts[str(result["hung_generation"])] == 1
+    assert counts[str(result["replacement_generation"])] == (
+        1 if boundary == "startup" else 0
+    )
+    assert set(counts) == {
+        str(result["hung_generation"]),
+        str(result["replacement_generation"]),
+    }
     assert isinstance(result["request_id"], int)
     assert result["request_id"] >= 0
     assert result["replacement_generation"] != result["hung_generation"]

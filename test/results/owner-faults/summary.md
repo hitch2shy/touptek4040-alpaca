@@ -7,7 +7,7 @@
 - Live child violations: 0
 - Registry leak violations: 0
 - Live segment violations: 0
-- Duplicate operation violations: 0
+- Generation invocation violations: 0
 - Hard-bound violations: 0
 - Connected replacement violations: 0
 
