@@ -54,6 +54,7 @@ _STATIC_ASSETS = {
     "image-viewer.js",
     "settings-sync.js",
     "log-view.js",
+    "generation-contract.js",
 }
 _STATE_NAMES = {
     0: "idle",
@@ -63,6 +64,10 @@ _STATE_NAMES = {
     4: "download",
     5: "error",
 }
+
+
+class GenerationConflictError(Exception):
+    """The requested immutable image generation is no longer current."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +120,6 @@ class WebConsole:
         self._settings_lock = threading.RLock()
         self._target_temperature_c = -10.0
         self._cooler_on = False
-        self._preview_requested = False
         self.logs = LogBuffer()
         self.logs.append(
             "warning",
@@ -125,24 +129,26 @@ class WebConsole:
     def settings(self) -> dict[str, object]:
         with self._settings_lock:
             settings = self._settings
-            try:
-                target_temperature = float(
-                    self.coordinator.target_temperature_c
-                )
-                cooler_on = bool(self.coordinator.cooler_on)
+            cached_target = self._target_temperature_c
+            cached_cooler = self._cooler_on
+        try:
+            target_temperature = float(self.coordinator.target_temperature_c)
+            cooler_on = bool(self.coordinator.cooler_on)
+            with self._settings_lock:
                 self._target_temperature_c = target_temperature
                 self._cooler_on = cooler_on
-            except Exception:
-                target_temperature = self._target_temperature_c
-                cooler_on = self._cooler_on
+        except Exception:
+            target_temperature = cached_target
+            cooler_on = cached_cooler
         return {
-            "binning": settings.binning,
-            "readoutMode": settings.readout_mode,
-            "gain": settings.gain,
-            "roi": asdict(settings.roi),
+            **_settings_media(settings),
             "targetTemperature": target_temperature,
             "coolerOn": cooler_on,
         }
+
+    def acquisition_settings(self) -> dict[str, object]:
+        with self._settings_lock:
+            return _settings_media(self._settings)
 
     def update_settings(self, payload: object) -> dict[str, object]:
         body = _object_with_keys(
@@ -171,12 +177,12 @@ class WebConsole:
         )
         candidate = WebSettings(binning, readout_mode, gain, roi)
 
-        def validate(capabilities: Any) -> None:
+        def commit(capabilities: Any) -> None:
             _validate_settings(candidate, capabilities)
+            with self._settings_lock:
+                self._settings = candidate
 
-        self.coordinator.update_settings_if_idle(validate)
-        with self._settings_lock:
-            self._settings = candidate
+        self.coordinator.update_settings_if_idle(commit)
         self.logs.append("info", "Acquisition settings updated")
         return self.settings()
 
@@ -184,31 +190,42 @@ class WebConsole:
         body = _object_with_keys(
             payload,
             {"targetTemperature", "coolerOn"},
-            required={"targetTemperature", "coolerOn"},
+            required=set(),
         )
-        target = _strict_number(
-            body["targetTemperature"],
-            "targetTemperature",
-            -50.0,
-            40.0,
-        )
-        cooler = body["coolerOn"]
-        if not isinstance(cooler, bool):
-            raise ValueError("coolerOn must be a boolean")
-        self.coordinator.set_target_temperature_if_idle(target)
-        self.coordinator.set_cooler_on_if_idle(cooler)
-        with self._settings_lock:
-            self._target_temperature_c = target
-            self._cooler_on = cooler
-        self.logs.append("info", "Cooling settings updated")
+        if len(body) != 1:
+            raise ValueError("Cooling requests must change exactly one field")
+        if "targetTemperature" in body:
+            target = _strict_number(
+                body["targetTemperature"],
+                "targetTemperature",
+                -50.0,
+                40.0,
+            )
+            self.coordinator.set_target_temperature_if_idle(target)
+            with self._settings_lock:
+                self._target_temperature_c = target
+        else:
+            cooler = body["coolerOn"]
+            if not isinstance(cooler, bool):
+                raise ValueError("coolerOn must be a boolean")
+            self.coordinator.set_cooler_on_if_idle(cooler)
+            with self._settings_lock:
+                self._cooler_on = cooler
+        self.logs.append("info", "Cooling setting updated")
+        settings = self.settings()
         return {
-            "targetTemperature": target,
-            "coolerOn": cooler,
+            "targetTemperature": settings["targetTemperature"],
+            "coolerOn": settings["coolerOn"],
         }
 
     def state(self) -> dict[str, object]:
         snapshot = self.coordinator.snapshot()
         generation = self.display_generation()
+        acquisition_settings = self.acquisition_settings()
+        try:
+            preview_active = bool(self.coordinator.preview_active)
+        except Exception:
+            preview_active = False
         try:
             temperature = (
                 float(self.coordinator.temperature_c)
@@ -226,6 +243,19 @@ class WebConsole:
         except Exception:
             cooler_power = None
         state_number = int(snapshot.camera_state)
+        image = None
+        if generation is not None:
+            readout_mode = (
+                "RAW 12-bit"
+                if generation.frame.readout_mode is ReadoutMode.RAW12
+                else "RAW 8-bit"
+            )
+            image = {
+                "width": generation.width,
+                "height": generation.height,
+                "maxADU": 4095 if readout_mode == "RAW 12-bit" else 255,
+                "readoutMode": readout_mode,
+            }
         return {
             "model": "sMAX16AM-U3-CL-GPS",
             "serial": self.serial,
@@ -234,15 +264,12 @@ class WebConsole:
             "cameraState": _STATE_NAMES.get(state_number, "unknown"),
             "imageReady": bool(snapshot.image_ready),
             "percentCompleted": snapshot.percent_completed,
-            "preview": self._preview_requested,
+            "preview": preview_active,
             "generation": (
                 generation.generation_id if generation is not None else None
             ),
-            "image": (
-                {"width": generation.width, "height": generation.height}
-                if generation is not None
-                else None
-            ),
+            "image": image,
+            "settings": acquisition_settings,
             "temperature": temperature,
             "coolerPower": cooler_power,
             "error": (
@@ -264,24 +291,20 @@ class WebConsole:
             self.logs.append("info", "Camera connection requested")
         else:
             self.coordinator.disconnect_async()
-            self._preview_requested = False
             self.logs.append("info", "Camera disconnect requested")
 
     def preview(self, enabled: bool) -> None:
         if enabled:
             self.coordinator.start_preview(lambda _frame: None)
-            self._preview_requested = True
             self.logs.append("info", "Preview started")
         else:
             self.coordinator.stop_preview()
-            self._preview_requested = False
             self.logs.append("info", "Preview stopped")
 
     def expose(self, duration: float) -> None:
-        with self._settings_lock:
-            settings = self._settings
-
         def snapshot(capabilities: Any) -> ExposureSettings:
+            with self._settings_lock:
+                settings = self._settings
             _validate_settings(settings, capabilities)
             return ExposureSettings(
                 roi=settings.roi,
@@ -295,7 +318,6 @@ class WebConsole:
             )
 
         self.coordinator.start_exposure(duration, True, settings=snapshot)
-        self._preview_requested = False
         self.logs.append("info", f"Exposure started ({duration:g} s)")
 
     def abort(self) -> None:
@@ -314,7 +336,7 @@ class SecurityHeadersMiddleware:
         del request, resource, req_succeeded
         response.set_header(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; "
             "script-src 'self'; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         )
@@ -493,7 +515,7 @@ class ViewportResource:
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
         try:
-            generation = _require_generation(self._console)
+            generation = _require_generation(self._console, request)
             max_adu = (
                 4095
                 if generation.frame.readout_mode is ReadoutMode.RAW12
@@ -534,9 +556,10 @@ class StatisticsResource:
         self._console = console
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
-        del request
         try:
-            response.media = analyze_generation(_require_generation(self._console))
+            response.media = analyze_generation(
+                _require_generation(self._console, request)
+            )
             response.status = falcon.HTTP_200
         except BaseException as error:
             _web_error(response, error)
@@ -548,7 +571,7 @@ class PixelResource:
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
         try:
-            generation = _require_generation(self._console)
+            generation = _require_generation(self._console, request)
             x = _query_int(request, "x", None, 0, generation.width - 1)
             y = _query_int(request, "y", None, 0, generation.height - 1)
             response.media = {
@@ -567,9 +590,8 @@ class FitsResource:
         self._console = console
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
-        del request
         try:
-            generation = _require_generation(self._console)
+            generation = _require_generation(self._console, request)
             response.status = falcon.HTTP_200
             response.content_type = "image/fits"
             response.set_header(
@@ -607,16 +629,24 @@ class _SseStream:
         self._subscription: Any | None = None
 
     def __iter__(self):
+        if self._closed.is_set():
+            return
         subscription = self._console.coordinator.events.subscribe()
         self._subscription = subscription
         try:
+            if self._closed.is_set():
+                return
             yield _sse("state", self._console.state())
             while not self._closed.is_set():
                 try:
                     subscription.get(timeout=self._heartbeat_seconds)
                 except queue.Empty:
+                    if self._closed.is_set():
+                        break
                     yield b": heartbeat\n\n"
                     continue
+                if self._closed.is_set():
+                    break
                 yield _sse("state", self._console.state())
         finally:
             subscription.close()
@@ -782,10 +812,25 @@ def _validate_settings(settings: WebSettings, capabilities: Any) -> None:
         raise ValueError("ROI and binning combination is invalid")
 
 
-def _require_generation(console: WebConsole) -> ImageGeneration:
+def _settings_media(settings: WebSettings) -> dict[str, object]:
+    return {
+        "binning": settings.binning,
+        "readoutMode": settings.readout_mode,
+        "gain": settings.gain,
+        "roi": asdict(settings.roi),
+    }
+
+
+def _require_generation(
+    console: WebConsole,
+    request: falcon.Request,
+) -> ImageGeneration:
+    requested = _query_int(request, "generation", None, 1, 2_147_483_647)
     generation = console.display_generation()
     if generation is None:
         raise LookupError("No image generation is available")
+    if generation.generation_id != requested:
+        raise GenerationConflictError("Image generation changed")
     return generation
 
 
@@ -835,7 +880,10 @@ def _sse(event: str, payload: object) -> bytes:
 
 
 def _web_error(response: falcon.Response, error: BaseException) -> None:
-    if isinstance(error, LookupError):
+    if isinstance(error, GenerationConflictError):
+        status = falcon.HTTP_409
+        message = "Image generation changed"
+    elif isinstance(error, LookupError):
         status = falcon.HTTP_404
         message = safe_exception_text(error)
     elif isinstance(error, (ValueError, CameraInvalidValueError)):

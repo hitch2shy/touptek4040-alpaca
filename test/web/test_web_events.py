@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import queue
+import threading
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
+
+from touptek4040.event_broker import EventBroker
 from touptek4040.web_console import WebConsole, _SseStream
 
 
@@ -61,7 +65,10 @@ def test_sse_emits_generation_state_heartbeat_and_releases_disconnect(
     assert broker.active == 0
 
 
-def test_sse_close_is_safe_before_iteration(web_coordinator, web_config):
+def test_sse_close_before_iteration_never_subscribes_or_emits(
+    web_coordinator,
+    web_config,
+):
     broker = TrackingBroker()
     web_coordinator.events = broker
     stream = _SseStream(
@@ -71,13 +78,63 @@ def test_sse_close_is_safe_before_iteration(web_coordinator, web_config):
 
     stream.close()
     iterator = iter(stream)
-    initial = next(iterator)
 
-    assert b'"generation":1' in initial
-    try:
+    with pytest.raises(StopIteration):
         next(iterator)
-    except StopIteration:
-        pass
-    else:
-        raise AssertionError("closed SSE stream must stop after its initial state")
+    assert broker.active == 0
+
+
+def test_sse_close_after_initial_frame_stops_before_next_event(
+    web_coordinator,
+    web_config,
+):
+    broker = TrackingBroker()
+    web_coordinator.events = broker
+    stream = _SseStream(WebConsole(web_coordinator, web_config), 30)
+    iterator = iter(stream)
+
+    assert next(iterator).startswith(b"event: state\n")
+    stream.close()
+
+    with pytest.raises(StopIteration):
+        next(iterator)
+    assert broker.active == 0
+
+
+def test_sse_close_immediately_unblocks_a_waiting_next(
+    web_coordinator,
+    web_config,
+):
+    broker = EventBroker(max_pending=2)
+    web_coordinator.events = broker
+    stream = _SseStream(WebConsole(web_coordinator, web_config), 30)
+    iterator = iter(stream)
+    next(iterator)
+    stopped = threading.Event()
+
+    def wait_for_next():
+        try:
+            next(iterator)
+        except StopIteration:
+            stopped.set()
+
+    waiting = threading.Thread(target=wait_for_next, daemon=True)
+    waiting.start()
+    stream.close()
+    waiting.join(0.5)
+
+    assert stopped.is_set()
+
+
+def test_abandoned_first_frame_can_be_closed_without_a_subscription(
+    web_coordinator,
+    web_config,
+):
+    broker = TrackingBroker()
+    web_coordinator.events = broker
+    stream = _SseStream(WebConsole(web_coordinator, web_config), 30)
+    iterator = iter(stream)
+
+    iterator.close()
+
     assert broker.active == 0

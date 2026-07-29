@@ -55,15 +55,15 @@ export function bindSettings(onApplied, onError) {
       onError(error);
     }
   });
-  async function applyCooling() {
+  async function applyCooling(field) {
     const message = byId("settings-message");
     message.classList.remove("error");
     message.textContent = "Applying cooling…";
     try {
-      const cooling = await mutate("/web/v1/cooling", {
-        targetTemperature: Number(byId("target-temperature").value),
-        coolerOn: byId("cooler-on").checked,
-      });
+      const body = field === "targetTemperature"
+        ? { targetTemperature: Number(byId("target-temperature").value) }
+        : { coolerOn: byId("cooler-on").checked };
+      const cooling = await mutate("/web/v1/cooling", body);
       byId("target-temperature").value = String(cooling.targetTemperature);
       byId("cooler-on").checked = cooling.coolerOn;
       message.textContent = "Cooling synchronized";
@@ -74,6 +74,12 @@ export function bindSettings(onApplied, onError) {
       onError(error);
     }
   }
-  byId("target-temperature").addEventListener("change", applyCooling);
-  byId("cooler-on").addEventListener("change", applyCooling);
+  byId("target-temperature").addEventListener(
+    "change",
+    () => applyCooling("targetTemperature"),
+  );
+  byId("cooler-on").addEventListener(
+    "change",
+    () => applyCooling("coolerOn"),
+  );
 }

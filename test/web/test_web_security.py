@@ -93,6 +93,7 @@ def test_security_headers_forbid_inline_script_eval_framing_and_referrer_leaks(
     assert "'unsafe-inline'" not in csp
     assert "'unsafe-eval'" not in csp
     assert "script-src 'self'" in csp
+    assert "img-src 'self' data: blob:" in csp
     assert "frame-ancestors 'none'" in csp
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["referrer-policy"] == "no-referrer"

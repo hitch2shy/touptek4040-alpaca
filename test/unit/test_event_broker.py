@@ -1,4 +1,5 @@
 import queue
+import threading
 import time
 
 import pytest
@@ -44,6 +45,37 @@ def test_closed_subscription_receives_no_more_events():
 
     with pytest.raises(queue.Empty):
         subscription.get_nowait()
+
+
+def test_close_wakes_a_blocked_subscription_get_immediately():
+    broker = EventBroker(max_pending=1)
+    subscription = broker.subscribe()
+    closed = threading.Event()
+
+    def wait_for_event():
+        with pytest.raises(queue.Empty):
+            subscription.get(timeout=30)
+        closed.set()
+
+    waiting = threading.Thread(target=wait_for_event, daemon=True)
+    waiting.start()
+    subscription.close()
+    waiting.join(0.5)
+
+    assert closed.is_set()
+
+
+def test_closing_one_subscription_does_not_disturb_other_clients():
+    broker = EventBroker(max_pending=2)
+    first = broker.subscribe()
+    second = broker.subscribe()
+
+    first.close()
+    broker.publish("still-live")
+
+    with pytest.raises(queue.Empty):
+        first.get_nowait()
+    assert second.get_nowait() == "still-live"
 
 
 def test_pending_limit_must_be_positive():

@@ -25,6 +25,7 @@ class WebCoordinator:
         self.exposure_calls: list[tuple[float, bool, object]] = []
         self.abort_calls = 0
         self.settings_validations = 0
+        self.preview_active = False
         self.target_temperature_c = -10.0
         self.cooler_on = False
         self.events = SimpleNamespace(subscribe=lambda: None)
@@ -73,9 +74,11 @@ class WebCoordinator:
     def start_preview(self, callback) -> None:
         del callback
         self.preview_calls.append("start")
+        self.preview_active = True
 
     def stop_preview(self) -> None:
         self.preview_calls.append("stop")
+        self.preview_active = False
 
     def start_exposure(self, duration, light, *, settings) -> None:
         self.exposure_calls.append((duration, light, settings(self.capabilities)))

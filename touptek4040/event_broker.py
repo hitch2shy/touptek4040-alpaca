@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 
 EventT = TypeVar("EventT")
+_CLOSED = object()
 
 
 class EventSubscription(Generic[EventT]):
@@ -17,7 +18,7 @@ class EventSubscription(Generic[EventT]):
         self,
         broker: EventBroker[EventT],
         subscription_id: int,
-        pending: queue.Queue[EventT],
+        pending: queue.Queue[object],
     ) -> None:
         self._broker = broker
         self._subscription_id = subscription_id
@@ -26,17 +27,31 @@ class EventSubscription(Generic[EventT]):
         self._close_lock = threading.Lock()
 
     def get(self, block: bool = True, timeout: float | None = None) -> EventT:
-        return self._pending.get(block=block, timeout=timeout)
+        with self._close_lock:
+            closed = self._closed
+        if closed and self._pending.empty():
+            raise queue.Empty
+        value = self._pending.get(block=block, timeout=timeout)
+        if value is _CLOSED:
+            raise queue.Empty
+        return cast(EventT, value)
 
     def get_nowait(self) -> EventT:
-        return self._pending.get_nowait()
+        return self.get(block=False)
 
     def close(self) -> None:
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
+            self._broker._offer_latest(self._pending, _CLOSED)
         self._broker._unsubscribe(self._subscription_id)
+
+    def _offer(self, event: EventT) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._broker._offer_latest(self._pending, event)
 
     def __enter__(self) -> EventSubscription[EventT]:
         return self
@@ -61,24 +76,25 @@ class EventBroker(Generic[EventT]):
         self._max_pending = max_pending
         self._lock = threading.Lock()
         self._next_subscription_id = 0
-        self._subscribers: dict[int, queue.Queue[EventT]] = {}
+        self._subscribers: dict[int, EventSubscription[EventT]] = {}
 
     def subscribe(self) -> EventSubscription[EventT]:
-        pending: queue.Queue[EventT] = queue.Queue(maxsize=self._max_pending)
+        pending: queue.Queue[object] = queue.Queue(maxsize=self._max_pending)
         with self._lock:
             subscription_id = self._next_subscription_id
             self._next_subscription_id += 1
-            self._subscribers[subscription_id] = pending
-        return EventSubscription(self, subscription_id, pending)
+            subscription = EventSubscription(self, subscription_id, pending)
+            self._subscribers[subscription_id] = subscription
+        return subscription
 
     def publish(self, event: EventT) -> None:
         with self._lock:
             subscribers = tuple(self._subscribers.values())
-        for pending in subscribers:
-            self._offer_latest(pending, event)
+        for subscription in subscribers:
+            subscription._offer(event)
 
     @staticmethod
-    def _offer_latest(pending: queue.Queue[EventT], event: EventT) -> None:
+    def _offer_latest(pending: queue.Queue[object], event: object) -> None:
         while True:
             try:
                 pending.put_nowait(event)

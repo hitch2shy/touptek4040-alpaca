@@ -27,10 +27,13 @@ def stream_viewport_png(
     """Render an 8-bit display view without mutating scientific pixels."""
 
     _validate_stretch(black, white, gamma, max_width, max_height)
-    x_step = max(1, math.ceil(generation.width / max_width))
-    y_step = max(1, math.ceil(generation.height / max_height))
-    width = math.ceil(generation.width / x_step)
-    height = math.ceil(generation.height / y_step)
+    step = max(
+        1,
+        math.ceil(generation.width / max_width),
+        math.ceil(generation.height / max_height),
+    )
+    width = math.ceil(generation.width / step)
+    height = math.ceil(generation.height / step)
 
     yield _PNG_SIGNATURE
     yield _chunk(
@@ -40,8 +43,8 @@ def stream_viewport_png(
 
     compressor = zlib.compressobj(level=6)
     inverse_gamma = 1.0 / gamma
-    for y in range(0, generation.height, y_step):
-        source = generation.pixels[y, ::x_step][:width]
+    for y in range(0, generation.height, step):
+        source = generation.pixels[y, ::step][:width]
         values = source.astype(np.float32, copy=True)
         values -= float(black)
         values /= float(white - black)

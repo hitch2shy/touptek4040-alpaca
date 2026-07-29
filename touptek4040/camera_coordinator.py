@@ -425,6 +425,18 @@ class CameraCoordinator:
         with self._condition:
             return self._image_workspace.current_preview()
 
+    @property
+    def preview_active(self) -> bool:
+        with self._condition:
+            thread = self._preview_thread
+            stop = self._preview_stop
+            return (
+                thread is not None
+                and thread.is_alive()
+                and stop is not None
+                and not stop.is_set()
+            )
+
     def formal_image_read(self) -> FormalImageRead:
         """Capture connection, failure, readiness, and generation atomically."""
 

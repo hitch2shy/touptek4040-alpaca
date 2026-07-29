@@ -12,9 +12,16 @@ async function decode(response) {
     } catch {
       // The HTTP status remains the safest fallback.
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
+}
+
+async function decodeBlob(response) {
+  if (!response.ok) return decode(response);
+  return response.blob();
 }
 
 export async function getJson(path, signal) {
@@ -32,6 +39,15 @@ export async function mutate(path, body) {
     credentials: "same-origin",
     headers: CONSOLE_HEADERS,
     body: JSON.stringify(body),
+  }));
+}
+
+export async function getBlob(path, signal) {
+  return decodeBlob(await fetch(path, {
+    method: "GET",
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
   }));
 }
 

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import subprocess
+from pathlib import Path
+
 
 def test_ui_is_the_touptek_image_first_console_with_no_legacy_device_copy(
     web_client,
@@ -33,3 +37,59 @@ def test_static_asset_paths_cannot_escape_the_embedded_web_root(web_client):
 
     assert response.status_code in {400, 404}
     assert "Product Purpose" not in response.text
+
+
+def test_generation_contract_clamps_raw8_stretch_and_pins_every_image_url():
+    module = (
+        Path(__file__).parents[2]
+        / "touptek4040"
+        / "web"
+        / "generation-contract.js"
+    ).as_uri()
+    script = f"""
+      const contract = await import({json.dumps(module)});
+      const output = {{
+        raw8Default: contract.normalizeStretch(255, 0, 4095),
+        raw8Manual: contract.normalizeStretch(255, 200, 4095),
+        raw8Auto: contract.autoStretch(
+          255,
+          {{mean: 200, standardDeviation: 30}},
+        ),
+        viewport: contract.generationUrl(
+          "/web/v1/viewport.png",
+          7,
+          {{white: 255}},
+        ),
+        stats: contract.generationUrl("/web/v1/statistics", 7),
+        pixel: contract.generationUrl(
+          "/web/v1/pixel",
+          7,
+          {{x: 1, y: 2}},
+        ),
+        fits: contract.generationUrl("/web/v1/image.fits", 7),
+        readout: contract.authoritativeReadout({{
+          image: {{readoutMode: "RAW 8-bit"}},
+          settings: {{readoutMode: "RAW 12-bit"}},
+        }}),
+      }};
+      process.stdout.write(JSON.stringify(output));
+    """
+
+    completed = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "raw8Default": {"black": 0, "white": 255},
+        "raw8Manual": {"black": 200, "white": 255},
+        "raw8Auto": {"black": 140, "white": 255},
+        "viewport": "/web/v1/viewport.png?generation=7&white=255",
+        "stats": "/web/v1/statistics?generation=7",
+        "pixel": "/web/v1/pixel?generation=7&x=1&y=2",
+        "fits": "/web/v1/image.fits?generation=7",
+        "readout": "RAW 8-bit",
+    }

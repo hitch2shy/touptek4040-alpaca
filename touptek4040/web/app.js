@@ -1,5 +1,6 @@
 import { eventStream, getJson, mutate } from "./api.js";
 import { bindImageViewer, setGeneration } from "./image-viewer.js";
+import { authoritativeReadout } from "./generation-contract.js";
 import { bindLogs, refreshLogs } from "./log-view.js";
 import { bindSettings, readSettings, writeSettings } from "./settings-sync.js";
 
@@ -34,7 +35,7 @@ function applyState(state) {
   byId("expose-button").disabled = !state.connected || !["idle", "error"].includes(state.cameraState);
   byId("abort-button").disabled = !state.connected || state.cameraState !== "exposing";
   byId("apply-settings").disabled = !state.connected || state.cameraState !== "idle";
-  byId("status-readout").textContent = byId("readout-mode").value;
+  byId("status-readout").textContent = authoritativeReadout(state);
 
   const exposing = state.cameraState === "exposing";
   byId("exposure-progress").hidden = !exposing;
@@ -78,7 +79,6 @@ function bindActions() {
     (settings) => {
       if (settings) {
         writeSettings(settings);
-        byId("status-readout").textContent = settings.readoutMode;
       }
       refreshLogs().catch(() => {});
     },

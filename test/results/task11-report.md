@@ -29,9 +29,10 @@
   `application/json`, and `X-ToupTek-Console: 1`.
 - Opaque, cross-site, missing-header, oversized, malformed, wrong-type,
   out-of-range, and unknown-field requests are rejected before camera action.
-- Acquisition and cooling mutations are independent. Initial settings hydrate
-  the live target temperature and cooler state, so applying geometry cannot
-  overwrite cooling changed by another client.
+- Acquisition and cooling mutations are independent. Each cooling request
+  changes exactly one field, so there is no two-setter partial-commit window.
+  Initial settings hydrate the live target temperature and cooler state, so
+  applying geometry cannot overwrite cooling changed by another client.
 - Static files use an allowlist and cannot traverse outside the embedded Web
   package.
 - Responses set a CSP without inline script/eval, `nosniff`,
@@ -47,9 +48,13 @@
   `EventBroker` queue.
 - Streams send an initial state containing the current image generation, state
   changes, and 15-second heartbeats.
-- Generator finalization and explicit close both unsubscribe idempotently.
-  Focused tests cover state/generation events, heartbeat, slow-queue behavior,
-  close-before-iteration, and disconnect cleanup with zero active subscribers.
+- Subscriptions use a close sentinel, so closing a blocked client wakes it
+  immediately. A stream closed before first iteration never subscribes or
+  emits. Generator finalization and explicit close both unsubscribe
+  idempotently.
+- Focused tests cover state/generation events, heartbeat, slow-queue behavior,
+  close-before-iteration, close-during-block, an abandoned first frame,
+  multi-client isolation, and disconnect cleanup with zero active subscribers.
 
 ## Interface and accessibility
 
@@ -65,6 +70,14 @@
 - Raw-pixel inspection supports pointer input plus Arrow/Shift+Arrow, Home,
   End, Enter, and Space; coordinates and ADU are announced through an
   `aria-live` readout.
+- Every PNG, statistics, pixel, and FITS request is pinned to an explicit
+  immutable generation. A stale generation receives a stable 409, and the
+  frontend refreshes authoritative state before retrying. The FITS link has no
+  activatable URL until a generation exists.
+- Generation metadata publishes the real readout mode and maximum ADU. RAW8
+  automatically constrains manual and automatic display stretch to 0–255;
+  the header readout comes from committed server state rather than unsaved
+  form controls.
 - Mobile retains Link, CameraState, RAW mode, CCD temperature, and serial
   identity. Session controls and Abort are sticky and visible before the
   image, while the image remains the dominant first-workflow viewport.
@@ -82,8 +95,22 @@
   start/stop, exposure, Abort availability, binning/ROI synchronization,
   acquisition settings, independent cooling, display stretch, statistics,
   raw-pixel pointer and keyboard inspection, and log updates.
-- The controlled QA server used only `127.0.0.1`, produced no application
-  console errors, and was stopped after verification.
+- Review-fix dynamic evidence reproduced and captured in the in-app browser:
+  - exposing: `State=Exposing`, 37% progress, disabled start/settings, and
+    enabled Abort while the science frame remained visible;
+  - RAW8: `Generation 2`, authoritative `RAW 8-bit`, image/statistics/histogram
+    bounded to 0–255, white slider maximum/value 255, and FITS pinned to
+    `generation=2`;
+  - link loss: `Link=Offline`, `State=Error`, disabled acquisition controls,
+    retained immutable image, and the visible recovery message
+    “USB link lost; reconnect the camera before retrying.”
+- The browser screenshot API emitted all three dynamic captures into the task
+  transcript. The checked-in desktop/mobile files remain the persistent
+  baseline artifacts because this browser surface does not persist its emitted
+  captures to a requested workspace path.
+- The controlled QA server used only `127.0.0.1`; the final reload rendered the
+  fetched science image successfully, and the server was stopped after
+  verification.
 
 ## Impeccable review and detector
 
@@ -113,10 +140,20 @@ The initial focused run is captured in `test/results/task11-red.txt`:
 Supplemental RED cycles covered missing image dimensions, live cooling
 hydration, and the independent cooling mutation before their implementations.
 
+Fix round 1 added a fresh deterministic RED slice:
+
+- 53 tests collected across Web and `EventBroker`;
+- 20 failed for the reviewed atomicity, linearization, generation, proportional
+  sampling, authoritative-state, and wakeable-SSE defects; 33 passed;
+- an executable frontend contract then failed because the RAW8/generation
+  helper module did not yet exist;
+- browser QA exposed blocked blob image rendering, and a dedicated CSP
+  regression test failed before the narrowly scoped `img-src blob:` fix.
+
 ## Verification
 
-- Focused Web suite: 26 passed.
-- Full automated suite: 765 passed, 4 real-hardware tests skipped by their
+- Focused Web plus `EventBroker` regression suite: 60 passed.
+- Full automated suite: 796 passed, 4 real-hardware tests skipped by their
   explicit `TOUPTEK_HARDWARE_TEST=1` gate.
 - Python compilation: passed.
 - Native ES module syntax checks: passed.

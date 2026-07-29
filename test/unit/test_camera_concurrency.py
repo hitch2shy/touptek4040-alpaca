@@ -216,9 +216,11 @@ def test_formal_exposure_stops_preview_without_overlapping_camera_calls():
     camera.release()
     assert preview_received.wait(1.0)
     camera.wait_for_count(2)
+    assert coordinator.preview_active is True
 
     coordinator.start_exposure(1.0, True)
     assert coordinator.snapshot().camera_state == CameraState.EXPOSING
+    assert coordinator.preview_active is False
     assert camera.abort_count >= 1
     camera.release()
     camera.wait_for_count(3)
@@ -327,8 +329,61 @@ def test_preview_failure_clears_the_last_published_preview():
     camera.release()
     wait_until(lambda: coordinator.snapshot().camera_state is CameraState.ERROR)
 
+    assert coordinator.preview_active is False
     assert coordinator.preview_frame is None
     assert coordinator.preview_generation is None
+
+
+def test_independent_cooling_transactions_share_the_coordinator_barrier():
+    class CoolingBarrierCamera(SequencedCamera):
+        def __init__(self) -> None:
+            super().__init__()
+            self._target_temperature_c = -10.0
+            self._cooler_on = False
+            self.target_entered = threading.Event()
+            self.target_release = threading.Event()
+            self.cooler_entered = threading.Event()
+
+        @property
+        def target_temperature_c(self) -> float:
+            return self._target_temperature_c
+
+        @target_temperature_c.setter
+        def target_temperature_c(self, value: float) -> None:
+            self.target_entered.set()
+            assert self.target_release.wait(1)
+            self._target_temperature_c = value
+
+        @property
+        def cooler_on(self) -> bool:
+            return self._cooler_on
+
+        @cooler_on.setter
+        def cooler_on(self, value: bool) -> None:
+            self.cooler_entered.set()
+            self._cooler_on = value
+
+    camera = CoolingBarrierCamera()
+    coordinator = connected_coordinator(camera)
+    target = threading.Thread(
+        target=lambda: coordinator.set_target_temperature_if_idle(-22.0),
+    )
+    cooler = threading.Thread(
+        target=lambda: coordinator.set_cooler_on_if_idle(True),
+    )
+
+    target.start()
+    assert camera.target_entered.wait(1)
+    cooler.start()
+    assert not camera.cooler_entered.wait(0.05)
+    camera.target_release.set()
+    target.join(1)
+    cooler.join(1)
+
+    assert not target.is_alive()
+    assert not cooler.is_alive()
+    assert coordinator.target_temperature_c == -22.0
+    assert coordinator.cooler_on is True
 
 
 def test_invalid_raw12_preview_does_not_replace_or_mutate_formal_generation():
