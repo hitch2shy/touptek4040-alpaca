@@ -616,6 +616,6 @@ input[type="range"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .loading-skeleton { animation: none; }
-  .progress-fill { transition: none; }
+  .skeleton-block { animation: none; }
+  #progress-fill { transition: none; }
 }

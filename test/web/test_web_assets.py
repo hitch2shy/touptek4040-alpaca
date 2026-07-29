@@ -1,8 +1,24 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
+
+
+class _SelectorInventory(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: set[str] = set()
+        self.classes: set[str] = set()
+
+    def handle_starttag(self, tag, attrs) -> None:
+        del tag
+        attributes = dict(attrs)
+        if "id" in attributes:
+            self.ids.add(attributes["id"])
+        self.classes.update(attributes.get("class", "").split())
 
 
 def test_ui_is_the_touptek_image_first_console_with_no_legacy_device_copy(
@@ -93,3 +109,23 @@ def test_generation_contract_clamps_raw8_stretch_and_pins_every_image_url():
         "fits": "/web/v1/image.fits?generation=7",
         "readout": "RAW 8-bit",
     }
+
+
+def test_reduced_motion_rules_select_the_actual_animated_dom_elements(web_client):
+    html = web_client.simulate_get("/ui/").text
+    css = web_client.simulate_get("/ui/app.css").text
+    inventory = _SelectorInventory()
+    inventory.feed(html)
+    reduced_motion = re.search(
+        r"@media \(prefers-reduced-motion: reduce\)\s*\{(?P<body>.*)\}\s*$",
+        css,
+        re.DOTALL,
+    )
+
+    assert reduced_motion is not None
+    selectors = set(
+        re.findall(r"([.#][a-zA-Z0-9_-]+)\s*\{", reduced_motion["body"])
+    )
+    assert selectors == {".skeleton-block", "#progress-fill"}
+    assert "skeleton-block" in inventory.classes
+    assert "progress-fill" in inventory.ids
