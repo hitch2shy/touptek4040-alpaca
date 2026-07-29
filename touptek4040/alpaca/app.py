@@ -66,7 +66,7 @@ def create_app(coordinator: Any, config: Any) -> falcon.App:
         "/management/v1/configureddevices",
         ManagementResource(configured_devices, allocator),
     )
-    app.add_route("/setup", MainSetupResource())
+    app.add_route("/setup", MainSetupResource(config))
     app.add_route(
         "/setup/v1/{device_type}/{device_number}/setup",
         DeviceSetupResource(),

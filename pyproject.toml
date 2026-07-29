@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "touptek4040"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Alpaca camera service for the ToupTek 4040"
 requires-python = ">=3.13"
 dependencies = [
@@ -15,3 +15,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["touptek4040"]
+
+[tool.setuptools.dynamic]
+version = {attr = "touptek4040.__version__"}

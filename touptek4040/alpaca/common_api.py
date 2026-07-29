@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import __version__
 from ..camera_coordinator import CameraCoordinator
 from .request import get_parameter
 from .responses import (
@@ -15,9 +16,9 @@ from .responses import (
 
 DEVICE_NAME = "ToupTek 4040 Alpaca Camera"
 DEVICE_DESCRIPTION = "ToupTek sMAX16AM-U3-CL-GPS 4096x4096 mono camera"
-DRIVER_VERSION = "0.1.0"
+DRIVER_VERSION = __version__
 DRIVER_INFO = (
-    "ToupTek4040 0.1.0; SDK 20250623; firmware 4.6.7.20240903; "
+    f"ToupTek4040 {__version__}; SDK 20250623; firmware 4.6.7.20240903; "
     "hardware 1.0; FPGA 3.17"
 )
 

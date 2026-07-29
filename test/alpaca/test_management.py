@@ -11,6 +11,11 @@ from touptek4040.alpaca.management import stable_unique_id
 
 _SERIAL_UID = "cbe660a1-348e-5dac-b4ea-5d045559dddb"
 _SIMULATOR_UID = "80454357-54e8-5ca5-8477-289de5d91d90"
+_MANAGEMENT_PATHS = (
+    "/management/apiversions",
+    "/management/v1/description",
+    "/management/v1/configureddevices",
+)
 
 
 def _assert_management_envelope(
@@ -161,3 +166,78 @@ def test_management_ignores_unknown_optional_parameters(client):
     assert response.status_code == 200
     assert response.json["ErrorNumber"] == 0
     assert response.json["ClientTransactionID"] == 0
+
+
+@pytest.mark.parametrize("path", _MANAGEMENT_PATHS)
+@pytest.mark.parametrize(
+    ("query_string", "expected_transaction_id"),
+    [
+        ("", 0),
+        ("ClientID=0&ClientTransactionID=0", 0),
+        (
+            "CLIENTID=4294967295&clienttransactionid=4294967295",
+            0xFFFFFFFF,
+        ),
+        ("ClientID=0007&ClientTransactionID=0008", 8),
+        ("ClientID=9&ClientID=9&ClientTransactionID=10", 10),
+        ("ClientID=9&clientid=9&ClientTransactionID=10", 10),
+    ],
+)
+def test_management_uint32_query_parameters_follow_official_zero_inclusive_range(
+    client,
+    path,
+    query_string,
+    expected_transaction_id,
+):
+    response = client.simulate_get(path, query_string=query_string)
+
+    assert response.status_code == 200
+    assert response.json["ClientTransactionID"] == expected_transaction_id
+    assert response.json["ErrorNumber"] == 0
+
+
+@pytest.mark.parametrize("path", _MANAGEMENT_PATHS)
+@pytest.mark.parametrize("parameter", ["ClientID", "ClientTransactionID"])
+@pytest.mark.parametrize(
+    "bad_value",
+    ["", "-1", "+1", "4294967296", "true", "1.0", "１２"],
+)
+def test_management_rejects_malformed_recognized_query_parameters(
+    client,
+    path,
+    parameter,
+    bad_value,
+):
+    response = client.simulate_get(
+        path,
+        query_string=f"{parameter}={bad_value}",
+    )
+
+    assert response.status_code == 400
+    assert response.content_type == "application/json"
+    assert response.json == {
+        "ClientTransactionID": 0,
+        "ServerTransactionID": response.json["ServerTransactionID"],
+        "ErrorNumber": 0x401,
+        "ErrorMessage": "Invalid management query parameters",
+    }
+    assert response.json["ServerTransactionID"] > 0
+    if bad_value:
+        assert bad_value not in response.text
+
+
+@pytest.mark.parametrize("path", _MANAGEMENT_PATHS)
+@pytest.mark.parametrize("parameter", ["ClientID", "ClientTransactionID"])
+def test_management_rejects_conflicting_duplicate_recognized_parameters(
+    client,
+    path,
+    parameter,
+):
+    response = client.simulate_get(
+        path,
+        query_string=f"{parameter}=1&{parameter.lower()}=2",
+    )
+
+    assert response.status_code == 400
+    assert response.json["ErrorNumber"] == 0x401
+    assert response.json["ErrorMessage"] == "Invalid management query parameters"
