@@ -14,11 +14,12 @@ import run_gui
 from touptek4040.alpaca.management import SIMULATOR_SERIAL
 from touptek4040.camera_contract import ReadoutMode
 from touptek4040.config import AppConfig, CameraConfig, LoggingConfig, ServerConfig, WebConfig
-from touptek4040.errors import CameraInvalidValueError
+from touptek4040.errors import CameraInvalidValueError, CameraTimeoutError
 from touptek4040.gui import (
     GuiCloseController,
     DiagnosticWorkerPool,
     QueueLogHandler,
+    _cleanup_coordinator,
     parse_diagnostic_settings,
     run_diagnostic_gui,
     run_mainloop_with_cleanup,
@@ -205,6 +206,73 @@ def test_shutdown_attempts_all_cleanup_and_retries_only_failed_step() -> None:
     server.shutdown()
     assert events.count("http-close") == 2
     assert events.count("camera-disconnect") == 1
+
+
+def test_disconnect_timeout_then_owner_close_is_terminal_and_error_stable() -> None:
+    timeout = CameraTimeoutError("stable disconnect timeout")
+    coordinator = _FailingCleanupCoordinator(disconnect_error=timeout)
+    server = run_alpaca.RuntimeServer(
+        http=_WaitressStub(),
+        discovery=_DiscoveryStub(),
+        coordinator=coordinator,
+        config=_config("sim"),
+        start_discovery=False,
+        logging_session=None,
+    )
+
+    server.shutdown()
+    server.shutdown()
+
+    assert coordinator.events == ["camera-disconnect", "camera-owner-close"]
+    assert coordinator.current_error is timeout
+    assert server.cleanup_error is timeout
+
+
+def test_owner_close_failure_retries_exact_retained_supervisor_only() -> None:
+    timeout = CameraTimeoutError("stable disconnect timeout")
+    close_error = RuntimeError("exact supervisor still alive")
+    coordinator = _FailingCleanupCoordinator(
+        disconnect_error=timeout,
+        close_errors=[close_error],
+    )
+    server = run_alpaca.RuntimeServer(
+        http=_WaitressStub(),
+        discovery=_DiscoveryStub(),
+        coordinator=coordinator,
+        config=_config("sim"),
+        start_discovery=False,
+        logging_session=None,
+    )
+
+    server.shutdown()
+    server.shutdown()
+
+    assert coordinator.events == [
+        "camera-disconnect",
+        "camera-owner-close",
+        "camera-owner-close",
+    ]
+    assert coordinator.close_targets == [coordinator.proxy, coordinator.proxy]
+    assert coordinator.current_error is timeout
+    assert server.cleanup_error is timeout
+
+
+def test_repeated_successful_runtime_shutdown_is_idempotent() -> None:
+    coordinator = _FailingCleanupCoordinator()
+    server = run_alpaca.RuntimeServer(
+        http=_WaitressStub(),
+        discovery=_DiscoveryStub(),
+        coordinator=coordinator,
+        config=_config("sim"),
+        start_discovery=False,
+        logging_session=None,
+    )
+
+    server.shutdown()
+    server.shutdown()
+
+    assert coordinator.events == ["camera-disconnect", "camera-owner-close"]
+    assert server.cleanup_error is None
 
 
 def test_shutdown_drains_inflight_connected_put_before_disconnect() -> None:
@@ -553,6 +621,62 @@ def test_gui_close_waits_for_final_cleanup_before_destroy(cleanup_raises) -> Non
     assert bool(controller.cleanup_error) is cleanup_raises
 
 
+def test_gui_cleanup_retries_same_supervisor_once_and_completes_exit() -> None:
+    first_error = RuntimeError("first exact close failed")
+    coordinator = _GuiCleanupCoordinator([first_error])
+    root = _PollingRoot()
+    controller = GuiCloseController(
+        root,
+        SimpleNamespace(winfo_children=lambda: []),
+        DiagnosticWorkerPool(),
+        lambda: _cleanup_coordinator(coordinator),
+    )
+
+    controller.request_close()
+    controller.join()
+    controller.destroy_root()
+
+    assert coordinator.events == [
+        "abort",
+        "disconnect",
+        "close",
+        "close",
+    ]
+    assert coordinator.close_targets == [coordinator.proxy, coordinator.proxy]
+    assert controller.cleanup_error is None
+    assert root.destroyed is True
+
+
+def test_gui_cleanup_records_first_error_after_two_bounded_close_failures(
+    caplog,
+) -> None:
+    first_error = RuntimeError("first exact close failed")
+    second_error = RuntimeError("second exact close failed")
+    coordinator = _GuiCleanupCoordinator([first_error, second_error])
+    root = _PollingRoot()
+    controller = GuiCloseController(
+        root,
+        SimpleNamespace(winfo_children=lambda: []),
+        DiagnosticWorkerPool(),
+        lambda: _cleanup_coordinator(coordinator),
+    )
+
+    controller.request_close()
+    controller.join()
+    controller.destroy_root()
+
+    assert coordinator.events == [
+        "abort",
+        "disconnect",
+        "close",
+        "close",
+    ]
+    assert coordinator.close_targets == [coordinator.proxy, coordinator.proxy]
+    assert controller.cleanup_error is first_error
+    assert root.destroyed is True
+    assert "first exact close failed" in caplog.text
+
+
 def test_gui_button_failure_still_joins_cleanup_before_destroy() -> None:
     events: list[str] = []
     root = _PollingRoot(events)
@@ -769,6 +893,63 @@ class _CoordinatorStub:
 
     def close_camera_supervisor(self) -> None:
         self.events.append("camera-owner-close")
+
+
+class _FailingCleanupCoordinator:
+    def __init__(
+        self,
+        *,
+        disconnect_error: BaseException | None = None,
+        close_errors: list[BaseException] | None = None,
+    ) -> None:
+        self.disconnect_error = disconnect_error
+        self.close_errors = list(close_errors or [])
+        self.events: list[str] = []
+        self.proxy = object()
+        self.close_targets: list[object] = []
+        self.current_error: BaseException | None = None
+
+    def set_connected_sync(self, connected: bool) -> None:
+        assert connected is False
+        self.events.append("camera-disconnect")
+        if self.current_error is not None:
+            self.current_error = RuntimeError("original cleanup error overwritten")
+            raise self.current_error
+        if self.disconnect_error is not None:
+            self.current_error = self.disconnect_error
+            raise self.disconnect_error
+
+    def close_camera_supervisor(self) -> None:
+        self.events.append("camera-owner-close")
+        self.close_targets.append(self.proxy)
+        if self.close_errors:
+            raise self.close_errors.pop(0)
+
+
+class _GuiCleanupCoordinator:
+    preview_active = False
+
+    def __init__(self, close_errors: list[BaseException]) -> None:
+        self.close_errors = list(close_errors)
+        self.events: list[str] = []
+        self.proxy = object()
+        self.close_targets: list[object] = []
+
+    def stop_preview(self) -> None:
+        raise AssertionError("preview is inactive")
+
+    def abort_exposure(self) -> None:
+        self.events.append("abort")
+
+    def set_connected_sync(self, connected: bool) -> None:
+        assert connected is False
+        self.events.append("disconnect")
+
+    def close_camera_supervisor(self) -> None:
+        self.events.append("close")
+        self.close_targets.append(self.proxy)
+        if self.close_errors:
+            raise self.close_errors.pop(0)
 
 
 class _MultiSocketStub:

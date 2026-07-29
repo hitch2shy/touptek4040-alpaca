@@ -529,7 +529,6 @@ def _cleanup_coordinator(coordinator: CameraCoordinator) -> None:
         lambda: coordinator.stop_preview() if coordinator.preview_active else None,
         coordinator.abort_exposure,
         lambda: coordinator.set_connected_sync(False),
-        close_supervisor,
     )
     for operation in operations:
         try:
@@ -538,3 +537,17 @@ def _cleanup_coordinator(coordinator: CameraCoordinator) -> None:
             _LOG.exception("Diagnostic camera cleanup step failed")
         except BaseException:
             _LOG.exception("Unexpected diagnostic camera cleanup failure")
+    first_close_error: BaseException | None = None
+    for attempt in range(2):
+        try:
+            close_supervisor()
+            return
+        except BaseException as error:
+            if first_close_error is None:
+                first_close_error = error
+            _LOG.exception(
+                "Diagnostic camera supervisor close attempt %s failed",
+                attempt + 1,
+            )
+    assert first_close_error is not None
+    raise first_close_error

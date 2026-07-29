@@ -50,6 +50,7 @@ class FakeOwnerBackend:
         *,
         restore_log_path: str | None = None,
         state_path: str | None = None,
+        lifecycle_path: str | None = None,
         block_acquire: bool = False,
         fail_snapshot: bool = False,
         fail_disconnects: int = 0,
@@ -73,8 +74,12 @@ class FakeOwnerBackend:
         self._fail_abort = fail_abort
         self._malformed_frame = malformed_frame
         self._state_path = Path(state_path) if state_path is not None else None
+        self._lifecycle_path = (
+            Path(lifecycle_path) if lifecycle_path is not None else None
+        )
         self._state_lock = Lock()
         self._events: list[dict[str, object]] = []
+        self._append_lifecycle("construct", serial=self.serial)
         self._write_state()
 
     @property
@@ -83,10 +88,12 @@ class FakeOwnerBackend:
 
     def connect(self) -> None:
         self.connected = True
+        self._append_lifecycle("connect", serial=self.serial)
         self._record("connect")
 
     def disconnect(self) -> None:
         self.disconnect_calls += 1
+        self._append_lifecycle("disconnect", serial=self.serial)
         if self._fail_disconnects:
             self._fail_disconnects -= 1
             self._record("disconnect", outcome="failed")
@@ -224,6 +231,18 @@ class FakeOwnerBackend:
         )
         os.replace(temporary_path, self._state_path)
 
+    def _append_lifecycle(self, operation: str, **details: object) -> None:
+        if self._lifecycle_path is None:
+            return
+        self._lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "operation": operation,
+            "pid": self.backend_pid,
+            **details,
+        }
+        with self._lifecycle_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
+
 
 def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBackend:
     restore_log_path = kwargs.get("restore_log_path")
@@ -232,13 +251,43 @@ def create_backend(serial: str | None = None, **kwargs: object) -> FakeOwnerBack
     state_path = kwargs.get("state_path")
     if state_path is not None and not isinstance(state_path, str):
         raise TypeError("state_path must be a string")
+    lifecycle_path = kwargs.get("lifecycle_path")
+    if lifecycle_path is not None and not isinstance(lifecycle_path, str):
+        raise TypeError("lifecycle_path must be a string")
     return FakeOwnerBackend(
         serial,
         restore_log_path=restore_log_path,
         state_path=state_path,
+        lifecycle_path=lifecycle_path,
         block_acquire=bool(kwargs.get("block_acquire", False)),
         fail_snapshot=bool(kwargs.get("fail_snapshot", False)),
         fail_disconnects=int(kwargs.get("fail_disconnects", 0)),
         fail_abort=bool(kwargs.get("fail_abort", False)),
         malformed_frame=bool(kwargs.get("malformed_frame", False)),
     )
+
+
+def create_identity_checked_backend(
+    serial: str | None = None,
+    **kwargs: object,
+) -> FakeOwnerBackend:
+    backend = create_backend(serial, **kwargs)
+    reported_serial = kwargs.get("reported_serial", serial)
+    reported_model = kwargs.get("reported_model", "approved-model")
+    if (
+        reported_serial != serial
+        or reported_model != "approved-model"
+    ):
+        backend._append_lifecycle(
+            "identity_rejected",
+            reported_serial=reported_serial,
+            reported_model=reported_model,
+        )
+        backend.disconnect()
+        raise ValueError("real owner requires the approved camera model and serial")
+    backend._append_lifecycle(
+        "identity_verified",
+        reported_serial=reported_serial,
+        reported_model=reported_model,
+    )
+    return backend

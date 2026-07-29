@@ -10,6 +10,7 @@ import sys
 import time
 from threading import Thread
 import subprocess
+from types import ModuleType
 
 import pytest
 
@@ -24,7 +25,13 @@ from touptek4040.owner_protocol import (
 
 
 class OwnerHarness:
-    def __init__(self, temporary_path: Path, backend_arguments: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        temporary_path: Path,
+        backend_arguments: dict[str, object] | None = None,
+        *,
+        backend_factory: str = "create_backend",
+    ) -> None:
         context = multiprocessing.get_context("spawn")
         self._command_parent, command_child = context.Pipe()
         self._control_parent, control_child = context.Pipe()
@@ -39,7 +46,7 @@ class OwnerHarness:
                 OwnerStartupSpec(
                     serial="FAKE-OWNER",
                     backend_module="test.fixtures.fake_owner_backend",
-                    backend_factory="create_backend",
+                    backend_factory=backend_factory,
                     backend_arguments=backend_arguments or {},
                 ),
                 self._generation,
@@ -108,6 +115,135 @@ def test_constructing_the_owner_harness_does_not_import_the_sdk_loader(tmp_path:
     harness = OwnerHarness(tmp_path)
     try:
         assert "touptek4040.toupcam_loader" not in sys.modules
+    finally:
+        harness.close()
+
+
+def test_spawned_owner_defers_backend_construction_until_explicit_connect(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    state_path = tmp_path / "backend-state.json"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "lifecycle_path": str(lifecycle_path),
+            "state_path": str(state_path),
+        },
+    )
+    try:
+        handshake = harness.request("handshake", {})
+        diagnostics = harness.request("diagnostics", {})
+
+        assert handshake["pid"] == harness.process.pid
+        assert diagnostics["backend_pid"] == harness.process.pid
+        assert lifecycle_path.exists() is False
+        assert state_path.exists() is False
+
+        harness.request("connect", {})
+
+        assert _read_lifecycle(lifecycle_path)[:2] == [
+            {
+                "operation": "construct",
+                "pid": harness.process.pid,
+                "serial": "FAKE-OWNER",
+            },
+            {
+                "operation": "connect",
+                "pid": harness.process.pid,
+                "serial": "FAKE-OWNER",
+            },
+        ]
+    finally:
+        harness.close()
+
+
+def test_disconnected_device_command_rejects_without_constructing_backend(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {"lifecycle_path": str(lifecycle_path)},
+    )
+    try:
+        response = harness.raw_request(1, "capabilities", {})
+
+        assert response.error is not None
+        assert "not connected" in response.error.message
+        assert lifecycle_path.exists() is False
+        assert harness.process.is_alive()
+    finally:
+        harness.close()
+
+
+def test_wrong_identity_connect_fails_and_cleans_deferred_candidate(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {
+            "lifecycle_path": str(lifecycle_path),
+            "reported_serial": "WRONG-SERIAL",
+            "reported_model": "wrong-model",
+        },
+        backend_factory="create_identity_checked_backend",
+    )
+    try:
+        response = harness.raw_request(1, "connect", {})
+
+        assert response.error is not None
+        assert "approved camera model and serial" in response.error.message
+        assert _read_lifecycle(lifecycle_path) == [
+            {
+                "operation": "construct",
+                "pid": harness.process.pid,
+                "serial": "FAKE-OWNER",
+            },
+            {
+                "operation": "identity_rejected",
+                "pid": harness.process.pid,
+                "reported_model": "wrong-model",
+                "reported_serial": "WRONG-SERIAL",
+            },
+            {
+                "operation": "disconnect",
+                "pid": harness.process.pid,
+                "serial": "FAKE-OWNER",
+            },
+        ]
+        harness._request_id = 1
+        assert harness.request("diagnostics", {})["connected"] is False
+        assert harness.process.is_alive()
+    finally:
+        harness.close()
+
+
+def test_multiple_connect_disconnect_cycles_construct_fresh_backends(
+    tmp_path: Path,
+) -> None:
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {"lifecycle_path": str(lifecycle_path)},
+    )
+    try:
+        harness.request("connect", {})
+        harness.request("disconnect", {})
+        harness.request("connect", {})
+        harness.request("disconnect", {})
+
+        lifecycle = _read_lifecycle(lifecycle_path)
+        assert [event["operation"] for event in lifecycle] == [
+            "construct",
+            "connect",
+            "disconnect",
+            "construct",
+            "connect",
+            "disconnect",
+        ]
+        assert {event["pid"] for event in lifecycle} == {harness.process.pid}
     finally:
         harness.close()
 
@@ -249,6 +385,56 @@ def test_real_owner_rejects_any_non_approved_identity_before_loading_sdk(serial)
         _create_toupcam_backend(serial)
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_events", "raises"),
+    [
+        (
+            "sMAX16AM-U3-CL-GPS",
+            ["construct", "connect"],
+            False,
+        ),
+        (
+            "wrong-model",
+            ["construct", "connect", "disconnect"],
+            True,
+        ),
+    ],
+)
+def test_production_backend_opens_exact_serial_before_identity_acceptance(
+    monkeypatch,
+    model: str,
+    expected_events: list[str],
+    raises: bool,
+) -> None:
+    events: list[str] = []
+    approved_serial = "TP241025143218C92B01151AEC40CB7"
+
+    class Candidate:
+        def __init__(self, serial: str) -> None:
+            events.append("construct")
+            assert serial == approved_serial
+            self.serial = serial
+            self.identity = type("Identity", (), {"model": model})()
+
+        def connect(self) -> None:
+            events.append("connect")
+
+        def disconnect(self) -> None:
+            events.append("disconnect")
+
+    module = ModuleType("touptek4040.toupcam_camera")
+    module.ToupTekCamera = Candidate
+    monkeypatch.setitem(sys.modules, "touptek4040.toupcam_camera", module)
+
+    if raises:
+        with pytest.raises(ValueError, match="approved camera model and serial"):
+            _create_toupcam_backend(approved_serial)
+    else:
+        assert _create_toupcam_backend(approved_serial).serial == approved_serial
+
+    assert events == expected_events
+
+
 def test_control_shutdown_aborts_a_truly_blocked_spawned_acquisition(tmp_path: Path):
     harness = OwnerHarness(tmp_path, {"block_acquire": True})
     try:
@@ -309,10 +495,13 @@ def test_rejected_control_preserves_correlation_without_backend_invocation(
     message: object,
     expected_operation: str,
 ):
-    state_path = tmp_path / "backend-state.json"
-    harness = OwnerHarness(tmp_path, {"state_path": str(state_path)})
+    lifecycle_path = tmp_path / "backend-lifecycle.jsonl"
+    harness = OwnerHarness(
+        tmp_path,
+        {"lifecycle_path": str(lifecycle_path)},
+    )
     try:
-        before = _read_fake_backend_state(state_path)
+        assert lifecycle_path.exists() is False
         harness._control_parent.send(message)
         assert harness._control_parent.poll(3)
         response = harness._control_parent.recv()
@@ -321,7 +510,7 @@ def test_rejected_control_preserves_correlation_without_backend_invocation(
         assert response["ok"] is False
         assert len(response["error"]) <= 256
         assert not harness._control_parent.poll(0.1)
-        assert _read_fake_backend_state(state_path)["events"] == before["events"]
+        assert lifecycle_path.exists() is False
         assert harness.process.is_alive()
     finally:
         harness.close()
@@ -552,6 +741,17 @@ def _read_fake_backend_state(path: Path) -> dict[str, object]:
         assert isinstance(state, dict)
         return state
     raise AssertionError("fake backend state was not published")
+
+
+def _read_lifecycle(path: Path) -> list[dict[str, object]]:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            return [json.loads(line) for line in lines if line]
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.01)
+    raise AssertionError("fake backend lifecycle was not published")
 
 
 def _heater_write_count(state: dict[str, object], value: int) -> int:

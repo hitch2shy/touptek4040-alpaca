@@ -12,6 +12,7 @@ from threading import Event, Thread
 from typing import Any
 
 from .camera_contract import CameraCapabilities, Frame, ReadoutMode, Roi
+from .errors import CameraNotConnectedError
 from .owner_backend import OwnerBackend
 from .owner_protocol import (
     MAX_EXPOSURE_DURATION_S,
@@ -100,6 +101,7 @@ def _create_toupcam_backend(serial: str | None = None, **_kwargs: object) -> Own
     from .toupcam_camera import ToupTekCamera
 
     camera = ToupTekCamera(serial)
+    camera.connect()
     if camera.identity.model != APPROVED_CAMERA_MODEL or camera.serial != APPROVED_CAMERA_SERIAL:
         camera.disconnect()
         raise ValueError("real owner requires the approved camera model and serial")
@@ -140,7 +142,7 @@ def camera_owner_main(
         saved_heater_level = None
 
     def disconnect_backend() -> None:
-        nonlocal connected, backend_may_own_handle
+        nonlocal backend, connected, backend_may_own_handle
         if backend is None or not backend_may_own_handle:
             return
         restoration_error: BaseException | None = None
@@ -153,8 +155,16 @@ def camera_owner_main(
         finally:
             connected = False
         backend_may_own_handle = False
+        backend = None
         if restoration_error is not None:
             raise restoration_error
+
+    def connect_backend() -> OwnerBackend:
+        nonlocal backend, backend_may_own_handle
+        if backend is None:
+            backend = _instantiate_backend(startup_spec)
+            backend_may_own_handle = True
+        return backend
 
     def control_loop() -> None:
         while not stop_requested.is_set():
@@ -202,8 +212,6 @@ def camera_owner_main(
         if not isinstance(startup_spec, OwnerStartupSpec):
             raise OwnerProtocolError("startup_spec must be an OwnerStartupSpec")
         registry = SharedFrameRegistry(generation, Path(registry_path))
-        backend = _instantiate_backend(startup_spec)
-        backend_may_own_handle = True
         control_thread = Thread(target=control_loop, name="camera-owner-control", daemon=True)
         control_thread.start()
         while not stop_requested.is_set():
@@ -222,7 +230,7 @@ def camera_owner_main(
                     raise OwnerProtocolError("request_id must increase monotonically")
                 last_request_id = request.request_id
                 response = _handle_command(
-                    payload, generation, backend, registry, owned_descriptors,
+                    payload, generation, backend, connect_backend, registry, owned_descriptors,
                     connected, saved_heater_level, disconnect_backend,
                     report_cleanup_error, command_connection.send,
                 )
@@ -291,7 +299,8 @@ def _instantiate_backend(spec: OwnerStartupSpec) -> OwnerBackend:
 def _handle_command(
     payload: object,
     generation: int,
-    backend: OwnerBackend,
+    backend: OwnerBackend | None,
+    connect_backend: Any,
     registry: SharedFrameRegistry,
     owned_descriptors: dict[str, FrameDescriptor],
     connected: bool,
@@ -308,6 +317,7 @@ def _handle_command(
         result, connected, saved_heater_level, shutdown = _dispatch(
             request,
             backend,
+            connect_backend,
             registry,
             owned_descriptors,
             connected,
@@ -325,7 +335,8 @@ def _handle_command(
 
 def _dispatch(
     request: OwnerRequest,
-    backend: OwnerBackend,
+    backend: OwnerBackend | None,
+    connect_backend: Any,
     registry: SharedFrameRegistry,
     owned_descriptors: dict[str, FrameDescriptor],
     connected: bool,
@@ -342,9 +353,14 @@ def _dispatch(
     if operation == "connect":
         _require_keys(arguments, set())
         if not connected:
-            backend.connect()
+            active_backend = connect_backend()
             try:
-                saved_heater_level = backend.heater_level if backend.heater_supported else None
+                active_backend.connect()
+                saved_heater_level = (
+                    active_backend.heater_level
+                    if active_backend.heater_supported
+                    else None
+                )
             except BaseException:
                 try:
                     disconnect_backend()
@@ -357,6 +373,21 @@ def _dispatch(
         _require_keys(arguments, set())
         disconnect_backend()
         return {"connected": False}, False, None, False
+    if operation == "diagnostics":
+        _require_keys(arguments, set())
+        return {"backend_pid": os.getpid(), "connected": connected, "owned_frame_count": len(owned_descriptors)}, connected, saved_heater_level, False
+    if operation == "release_frame":
+        _require_keys(arguments, {"descriptor"})
+        descriptor = _descriptor_from_payload(arguments["descriptor"])
+        registry.release(descriptor)
+        owned_descriptors.pop(descriptor.name, None)
+        return {}, connected, saved_heater_level, False
+    if operation == "shutdown":
+        _require_keys(arguments, set())
+        disconnect_backend()
+        return {"shutdown": True}, False, None, True
+    if not connected or backend is None:
+        raise CameraNotConnectedError("camera is not connected")
     if operation == "capabilities":
         _require_keys(arguments, set())
         return _capabilities_payload(backend.capabilities), connected, saved_heater_level, False
@@ -433,19 +464,6 @@ def _dispatch(
     if operation == "set_heater_level":
         backend.heater_level = _int_argument(arguments, "value")
         return {}, connected, saved_heater_level, False
-    if operation == "diagnostics":
-        _require_keys(arguments, set())
-        return {"backend_pid": os.getpid(), "connected": connected, "owned_frame_count": len(owned_descriptors)}, connected, saved_heater_level, False
-    if operation == "release_frame":
-        _require_keys(arguments, {"descriptor"})
-        descriptor = _descriptor_from_payload(arguments["descriptor"])
-        registry.release(descriptor)
-        owned_descriptors.pop(descriptor.name, None)
-        return {}, connected, saved_heater_level, False
-    if operation == "shutdown":
-        _require_keys(arguments, set())
-        disconnect_backend()
-        return {"shutdown": True}, False, None, True
     raise OwnerProtocolError("unsupported owner operation")
 
 

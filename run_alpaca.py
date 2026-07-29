@@ -235,6 +235,7 @@ class RuntimeServer:
         self._start_discovery = start_discovery
         self._shutdown_lock = Lock()
         self._logging_session = logging_session
+        self.cleanup_error: BaseException | None = None
         self._cleaned = {
             "http": False,
             "discovery": False,
@@ -261,6 +262,7 @@ class RuntimeServer:
             self._cleanup_step(
                 "camera",
                 lambda: self.coordinator.set_connected_sync(False),
+                terminal_on_failure=True,
             )
             self._cleanup_step(
                 "camera_owner",
@@ -274,12 +276,22 @@ class RuntimeServer:
             if self._logging_session is not None:
                 self._cleanup_step("logging", self._logging_session.close)
 
-    def _cleanup_step(self, name: str, action) -> None:
+    def _cleanup_step(
+        self,
+        name: str,
+        action,
+        *,
+        terminal_on_failure: bool = False,
+    ) -> None:
         if self._cleaned[name]:
             return
         try:
             action()
-        except BaseException:
+        except BaseException as error:
+            if self.cleanup_error is None:
+                self.cleanup_error = error
+            if terminal_on_failure:
+                self._cleaned[name] = True
             _LOG.exception("%s cleanup failed during shutdown", name)
         else:
             self._cleaned[name] = True
