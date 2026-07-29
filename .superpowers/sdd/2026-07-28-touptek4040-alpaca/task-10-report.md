@@ -217,3 +217,83 @@ Round-2 fix commit subject:
 
 Round-2 commit reference: `HEAD`; its exact immutable hash is recorded in the
 handoff after commit.
+
+## Review fix round 3/5
+
+The remaining Setup file-identity finding was closed without changing
+Discovery, Management query parsing, or any deferred item.
+
+### Stable configuration identity
+
+Setup now approves an explicit existing regular file by its resolved path,
+device identifier, and inode/file identifier. Windows verification confirms
+that `Path.stat()` and `os.fstat()` report the same nonzero file identifier for
+an opened file and that replacing the same path changes that identifier while
+retaining the device identifier.
+
+Every root Setup GET and POST runs under one resource operation lock. GET
+renders a form only while the current path still matches the approved
+identity. POST validates the identity before parsing, again after parsing and
+before reading, against the actual opened file handle with `fstat`, after
+writing and flushing the temporary file, and immediately adjacent to
+`os.replace`.
+
+The write records the temporary file's device and file identifier before
+replacement. Immediately after replacement it stats the configured target and
+requires that target to have the temporary file's identifier. The resource
+then updates its approved identity while still holding the operation lock.
+This allows consecutive legitimate POSTs and serializes concurrent POSTs
+without treating the server's own replacement as an external substitution.
+
+External same-path delete/recreate transitions at all three requested barriers
+return the stable HTML 403 response, leave the external replacement byte for
+byte unchanged, and remove the server's temporary file:
+
+- between form GET and POST;
+- after POST validation/read and before temporary-file creation;
+- after temporary-file flush and before replacement.
+
+The RED Setup result was `4 failed, 27 passed`: the three external
+substitutions were overwritten by the path-only implementation and concurrent
+POSTs both reached replacement. The GREEN Setup result is `31 passed`.
+
+The standard-library boundary is explicit: an unrelated process can still be
+scheduled in the nanosecond interval between the final identity check and the
+immediately adjacent path-based `os.replace`. The operation lock closes
+in-process races, the adjacent check minimizes the external interval, and the
+post-replacement file-ID check prevents an externally substituted result from
+becoming the newly approved identity. The implementation does not attempt a
+dangerous overwrite when any observable identity transition occurs.
+
+## Round-3 verification
+
+Focused Management, Setup, Discovery, protocol-error, and version set:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test/alpaca/test_management.py test/alpaca/test_setup_pages.py test/alpaca/test_discovery.py test/alpaca/test_protocol_errors.py test/unit/test_version_metadata.py -q
+```
+
+Result: `146 passed`.
+
+Complete test tree:
+
+```powershell
+.\.venv64\Scripts\python.exe -m pytest -c test/pytest.ini test -q
+```
+
+Result: `739 passed, 4 skipped`. The skips remain the existing hardware opt-in
+tests; no hardware access was attempted.
+
+Compilation and whitespace validation both exited `0`:
+
+```powershell
+.\.venv64\Scripts\python.exe -m compileall -q touptek4040 test
+git diff --check
+```
+
+Round-3 fix commit subject:
+
+`fix: preserve setup configuration identity`
+
+Round-3 commit reference: `HEAD`; its exact immutable hash is recorded in the
+handoff after commit.

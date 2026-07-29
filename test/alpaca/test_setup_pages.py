@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import configparser
+import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import falcon.testing
@@ -44,6 +46,23 @@ def _write_config(path: Path) -> bytes:
     ).encode("utf-8")
     path.write_bytes(content)
     return content
+
+
+def _external_config_bytes(label: str) -> bytes:
+    return (
+        "[server]\n"
+        f"host = {label}.example\n"
+        "port = 23456\n"
+        "discovery_port = 32229\n"
+        "\n"
+        "[external]\n"
+        f"owner = {label}\n"
+    ).encode("utf-8")
+
+
+def _delete_and_recreate(path: Path, content: bytes) -> None:
+    path.unlink()
+    path.write_bytes(content)
 
 
 def test_main_setup_page_is_safe_read_only_html(client):
@@ -348,6 +367,203 @@ def test_root_setup_file_disappearing_after_get_is_not_recreated(
     assert "configuration file is unavailable" in post_response.text.casefold()
     assert config_path.exists() is False
     assert list(tmp_path.iterdir()) == []
+
+
+def test_root_setup_rejects_same_path_delete_recreate_after_get(
+    coordinator,
+    tmp_path,
+):
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    initial_identity = (config_path.stat().st_dev, config_path.stat().st_ino)
+    client = _configurable_client(coordinator, config_path)
+    assert "<form" in client.simulate_get("/setup").text.casefold()
+    external = _external_config_bytes("after-get")
+
+    _delete_and_recreate(config_path, external)
+    replacement_stat = config_path.stat()
+    assert (replacement_stat.st_dev, replacement_stat.st_ino) != initial_identity
+    response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 403
+    assert config_path.read_bytes() == external
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_root_setup_rejects_replacement_after_read_before_temp_write(
+    coordinator,
+    tmp_path,
+    monkeypatch,
+):
+    from touptek4040.alpaca import management
+
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    client = _configurable_client(coordinator, config_path)
+    external = _external_config_bytes("before-temp")
+    original_mkstemp = management.tempfile.mkstemp
+    replaced = False
+
+    def replace_then_create_temp(*args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            _delete_and_recreate(config_path, external)
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(management.tempfile, "mkstemp", replace_then_create_temp)
+    response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 403
+    assert config_path.read_bytes() == external
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_root_setup_rejects_replacement_after_temp_write_before_replace(
+    coordinator,
+    tmp_path,
+    monkeypatch,
+):
+    from touptek4040.alpaca import management
+
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    client = _configurable_client(coordinator, config_path)
+    external = _external_config_bytes("before-replace")
+    original_fsync = management.os.fsync
+    replaced = False
+
+    def sync_then_replace(descriptor):
+        nonlocal replaced
+        original_fsync(descriptor)
+        if not replaced:
+            replaced = True
+            _delete_and_recreate(config_path, external)
+
+    monkeypatch.setattr(management.os, "fsync", sync_then_replace)
+    response = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 403
+    assert config_path.read_bytes() == external
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_root_setup_two_successive_posts_refresh_approved_file_identity(
+    coordinator,
+    tmp_path,
+):
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    client = _configurable_client(coordinator, config_path)
+
+    first = client.simulate_post(
+        "/setup",
+        body="host=127.0.0.1&port=12345&discovery_port=32228",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    first_identity = (config_path.stat().st_dev, config_path.stat().st_ino)
+    second = client.simulate_post(
+        "/setup",
+        body="host=localhost&port=12346&discovery_port=32229",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    second_stat = config_path.stat()
+
+    assert first.status_code == second.status_code == 200
+    assert (second_stat.st_dev, second_stat.st_ino) != first_identity
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    assert dict(parser["server"]) == {
+        "host": "localhost",
+        "port": "12346",
+        "discovery_port": "32229",
+    }
+
+
+def test_root_setup_concurrent_posts_are_serialized(
+    coordinator,
+    tmp_path,
+    monkeypatch,
+):
+    from touptek4040.alpaca import management
+
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    client = _configurable_client(coordinator, config_path)
+    original_replace = management.os.replace
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    replace_lock = threading.Lock()
+    replace_count = 0
+    responses = []
+
+    def gated_replace(source, destination):
+        nonlocal replace_count
+        with replace_lock:
+            replace_count += 1
+            call_number = replace_count
+        if call_number == 1:
+            first_entered.set()
+            release_first.wait(timeout=2.0)
+        else:
+            second_entered.set()
+        return original_replace(source, destination)
+
+    def post(port):
+        responses.append(client.simulate_post(
+            "/setup",
+            body=f"host=localhost&port={port}&discovery_port=32229",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        ))
+
+    monkeypatch.setattr(management.os, "replace", gated_replace)
+    first = threading.Thread(target=post, args=(12345,))
+    second = threading.Thread(target=post, args=(12346,))
+    first.start()
+    assert first_entered.wait(timeout=1.0)
+    second.start()
+    concurrent_replace = second_entered.wait(timeout=0.2)
+    release_first.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert concurrent_replace is False
+    assert first.is_alive() is second.is_alive() is False
+    assert [response.status_code for response in responses] == [200, 200]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file identity validation")
+def test_windows_file_identity_changes_after_same_path_replace(tmp_path):
+    config_path = tmp_path / "camera.ini"
+    _write_config(config_path)
+    before = config_path.stat()
+    with config_path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+    replacement = tmp_path / "replacement.tmp"
+    replacement.write_bytes(_external_config_bytes("windows-file-id"))
+
+    os.replace(replacement, config_path)
+    after = config_path.stat()
+
+    assert before.st_dev == after.st_dev
+    assert before.st_ino != 0
+    assert (opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_ino != 0
+    assert before.st_ino != after.st_ino
 
 
 def test_root_setup_replace_failure_keeps_original_and_removes_temporary_file(

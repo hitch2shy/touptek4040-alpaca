@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import configparser
+from dataclasses import dataclass
 from html import escape
 import ipaddress
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
+import threading
 from types import SimpleNamespace
 from typing import Any, Callable
 import uuid
@@ -44,6 +47,13 @@ _MANAGEMENT_QUERY_ERROR = "Invalid management query parameters"
 
 class _ConfigurationTargetUnavailable(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class _ConfigurationIdentity:
+    target: Path
+    device: int
+    inode: int
 
 
 def stable_unique_id(serial: str | None, source: str | None = None) -> str:
@@ -162,17 +172,26 @@ class MainSetupResource:
         self._config_path = _explicit_config_path(
             getattr(config, "config_path", None)
         )
-        self._write_target = _resolve_file_target(self._config_path)
+        self._approved_identity = _resolve_file_identity(self._config_path)
+        self._operation_lock = threading.Lock()
 
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
+        with self._operation_lock:
+            self._respond_to_get(request, response)
+
+    def _respond_to_get(
+        self,
+        request: falcon.Request,
+        response: falcon.Response,
+    ) -> None:
         del request
         server = getattr(self._config, "server", None)
-        target = self._current_write_target()
+        identity = self._current_write_identity()
         _setup_response(
             response,
             falcon.HTTP_200,
             _main_setup_body(
-                target,
+                identity.target if identity is not None else None,
                 getattr(server, "host", ""),
                 getattr(server, "port", ""),
                 getattr(server, "discovery_port", ""),
@@ -180,6 +199,14 @@ class MainSetupResource:
         )
 
     def on_post(self, request: falcon.Request, response: falcon.Response) -> None:
+        with self._operation_lock:
+            self._respond_to_post(request, response)
+
+    def _respond_to_post(
+        self,
+        request: falcon.Request,
+        response: falcon.Response,
+    ) -> None:
         if self._config_path is None:
             _setup_response(
                 response,
@@ -189,8 +216,8 @@ class MainSetupResource:
                 "so server settings are read-only.</p>",
             )
             return
-        target = self._current_write_target()
-        if target is None:
+        identity = self._current_write_identity()
+        if identity is None:
             _configuration_unavailable_response(response)
             return
         try:
@@ -204,7 +231,11 @@ class MainSetupResource:
             )
             return
         try:
-            _write_server_config(self._config_path, target, values)
+            new_identity = _write_server_config(
+                self._config_path,
+                identity,
+                values,
+            )
         except _ConfigurationTargetUnavailable:
             _configuration_unavailable_response(response)
             return
@@ -216,11 +247,12 @@ class MainSetupResource:
                 "<p>The existing configuration was left unchanged.</p>",
             )
             return
+        self._approved_identity = new_identity
         _setup_response(
             response,
             falcon.HTTP_200,
             _main_setup_body(
-                self._config_path,
+                new_identity.target,
                 values["host"],
                 values["port"],
                 values["discovery_port"],
@@ -231,11 +263,11 @@ class MainSetupResource:
             ),
         )
 
-    def _current_write_target(self) -> Path | None:
-        target = _resolve_file_target(self._config_path)
-        if target is None or target != self._write_target:
+    def _current_write_identity(self) -> _ConfigurationIdentity | None:
+        identity = _resolve_file_identity(self._config_path)
+        if identity is None or identity != self._approved_identity:
             return None
-        return target
+        return identity
 
 
 class DeviceSetupResource:
@@ -369,14 +401,14 @@ def _validate_port(port: str) -> None:
 
 def _write_server_config(
     config_path: Path,
-    target: Path,
+    expected: _ConfigurationIdentity,
     values: Mapping[str, str],
-) -> None:
-    if _resolve_file_target(config_path) != target:
-        raise _ConfigurationTargetUnavailable
+) -> _ConfigurationIdentity:
+    _require_config_identity(config_path, expected)
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        with target.open("r", encoding="utf-8") as stream:
+        with expected.target.open("r", encoding="utf-8") as stream:
+            _require_open_file_identity(stream, expected)
             parser.read_file(stream)
     except OSError as error:
         raise _ConfigurationTargetUnavailable from error
@@ -391,9 +423,9 @@ def _write_server_config(
     temporary_path: Path | None = None
     try:
         descriptor, raw_path = tempfile.mkstemp(
-            prefix=f".{target.name}.",
+            prefix=f".{expected.target.name}.",
             suffix=".tmp",
-            dir=target.parent,
+            dir=expected.target.parent,
         )
         temporary_path = Path(raw_path)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
@@ -401,10 +433,21 @@ def _write_server_config(
             parser.write(stream)
             stream.flush()
             os.fsync(stream.fileno())
-        if _resolve_file_target(config_path) != target:
-            raise _ConfigurationTargetUnavailable
-        os.replace(temporary_path, target)
+        replacement_stat = temporary_path.stat()
+        replacement_key = (
+            replacement_stat.st_dev,
+            replacement_stat.st_ino,
+        )
+        # Recheck after the durable temporary file has been produced.
+        _require_config_identity(config_path, expected)
+        # Keep the final identity check immediately adjacent to replacement.
+        _require_config_identity(config_path, expected)
+        os.replace(temporary_path, expected.target)
         temporary_path = None
+        new_identity = _require_regular_file(config_path)
+        if (new_identity.device, new_identity.inode) != replacement_key:
+            raise _ConfigurationTargetUnavailable
+        return new_identity
     except (OSError, _ConfigurationTargetUnavailable):
         raise
     finally:
@@ -426,14 +469,51 @@ def _explicit_config_path(value: object) -> Path | None:
         return None
 
 
-def _resolve_file_target(config_path: Path | None) -> Path | None:
+def _resolve_file_identity(
+    config_path: Path | None,
+) -> _ConfigurationIdentity | None:
     if config_path is None:
         return None
     try:
-        target = config_path.resolve(strict=True)
-        return target if target.is_file() else None
-    except (OSError, RuntimeError):
+        return _require_regular_file(config_path)
+    except (OSError, RuntimeError, _ConfigurationTargetUnavailable):
         return None
+
+
+def _require_regular_file(config_path: Path) -> _ConfigurationIdentity:
+    target = config_path.resolve(strict=True)
+    metadata = target.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_ino == 0:
+        raise _ConfigurationTargetUnavailable
+    return _ConfigurationIdentity(
+        target,
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def _require_config_identity(
+    config_path: Path,
+    expected: _ConfigurationIdentity,
+) -> None:
+    try:
+        current = _require_regular_file(config_path)
+    except (OSError, RuntimeError) as error:
+        raise _ConfigurationTargetUnavailable from error
+    if current != expected:
+        raise _ConfigurationTargetUnavailable
+
+
+def _require_open_file_identity(
+    stream: Any,
+    expected: _ConfigurationIdentity,
+) -> None:
+    metadata = os.fstat(stream.fileno())
+    if (metadata.st_dev, metadata.st_ino) != (
+        expected.device,
+        expected.inode,
+    ):
+        raise _ConfigurationTargetUnavailable
 
 
 def _main_setup_body(
