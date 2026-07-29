@@ -74,6 +74,31 @@ class _OwnerSession:
     next_request_id: int = 0
 
 
+@dataclass(slots=True)
+class _PrivateCandidate:
+    """Resources captured incrementally before a session may be published."""
+
+    generation: int
+    registry: Any
+    raw_session: Any | None = None
+    process: Any | None = None
+    command_connection: Any | None = None
+    control_connection: Any | None = None
+
+
+class _OwnerProcessStartFailure(Exception):
+    """Carry an exact post-start process identity back to the supervisor."""
+
+    def __init__(
+        self,
+        session: OwnerProcessSession,
+        cause: Exception,
+    ) -> None:
+        super().__init__("camera owner process setup failed after start")
+        self.session = session
+        self.cause = cause
+
+
 class OwnerProcessFactory:
     """Create Windows-spawn-safe owner processes without importing the SDK."""
 
@@ -99,21 +124,70 @@ class OwnerProcessFactory:
             ),
             name=f"touptek4040-camera-owner-{generation}",
         )
+        started = False
         try:
             process.start()
-        except BaseException:
-            command_parent.close()
+            started = True
             command_child.close()
-            control_parent.close()
             control_child.close()
+        except BaseException as error:
+            for connection in (
+                command_parent,
+                command_child,
+                control_parent,
+                control_child,
+            ):
+                try:
+                    connection.close()
+                except BaseException:
+                    pass
+            if started:
+                _stop_process_after_factory_failure(process)
+                if isinstance(error, Exception):
+                    raise _OwnerProcessStartFailure(
+                        OwnerProcessSession(
+                            process, command_parent, control_parent
+                        ),
+                        error,
+                    ) from error
             raise
-        command_child.close()
-        control_child.close()
         return OwnerProcessSession(process, command_parent, control_parent)
 
 
+def _stop_process_after_factory_failure(process: Any) -> None:
+    """Best-effort exact-child escalation before propagating setup failure."""
+
+    try:
+        process.terminate()
+    except BaseException:
+        pass
+    try:
+        process.join(_PROCESS_TERMINATION_ALLOWANCE_S)
+    except BaseException:
+        pass
+    try:
+        alive = bool(process.is_alive())
+    except BaseException:
+        alive = True
+    if not alive:
+        return
+    try:
+        process.kill()
+    except BaseException:
+        pass
+    try:
+        process.join(_PROCESS_TERMINATION_ALLOWANCE_S)
+    except BaseException:
+        pass
+
+
 class OwnerSupervisor:
-    """Own one command stream and replace its exact child after transport failure."""
+    """Own one command stream and replace its exact child after transport failure.
+
+    Whenever both lifecycle and state are needed, the lock order is strictly
+    ``_lifecycle_lock`` then ``_state_lock``.  Authorization captures the exact
+    session token under both locks and releases them before any blocking IPC.
+    """
 
     def __init__(
         self,
@@ -147,7 +221,7 @@ class OwnerSupervisor:
         self._state_lock = threading.RLock()
         self._generation = 0
         self._session: _OwnerSession | None = None
-        self._unsafe_session: _OwnerSession | None = None
+        self._unsafe_session: _OwnerSession | _PrivateCandidate | None = None
         self._connected = False
         self._exposing = False
         self._confirmed_heater_level: int | None = None
@@ -228,10 +302,13 @@ class OwnerSupervisor:
 
     def connect(self) -> None:
         with self._command_lock:
-            if self._connected:
-                return
-            session, response = self._request_locked(
-                "connect", {}, self.deadline_for("connect")
+            with self._lifecycle_lock:
+                with self._state_lock:
+                    if self._connected:
+                        return
+                    session = self._current_session_locked()
+            response = self._request_locked(
+                session, "connect", {}, self.deadline_for("connect")
             )
             result = self.validate(
                 session,
@@ -253,10 +330,13 @@ class OwnerSupervisor:
 
     def disconnect(self) -> None:
         with self._command_lock:
-            if not self._connected:
-                return
-            session, response = self._request_locked(
-                "disconnect", {}, self.deadline_for("disconnect")
+            with self._lifecycle_lock:
+                with self._state_lock:
+                    if not self._connected:
+                        return
+                    session = self._current_session_locked()
+            response = self._request_locked(
+                session, "disconnect", {}, self.deadline_for("disconnect")
             )
             result = self.validate(
                 session,
@@ -284,12 +364,17 @@ class OwnerSupervisor:
         require_connected: bool = True,
     ) -> tuple[_OwnerSession, OwnerResponse]:
         with self._command_lock:
-            if require_connected:
-                self._require_connected()
-            return self._request_locked(
-                operation,
-                arguments,
-                self.deadline_for(operation),
+            session = self._capture_authorized_session(
+                require_connected=require_connected
+            )
+            return (
+                session,
+                self._request_locked(
+                    session,
+                    operation,
+                    arguments,
+                    self.deadline_for(operation),
+                ),
             )
 
     def acquire(
@@ -312,12 +397,15 @@ class OwnerSupervisor:
         if not isinstance(readout_mode, ReadoutMode):
             raise CameraInvalidValueError("readout_mode must be a ReadoutMode")
         with self._command_lock:
-            self._require_connected()
+            acquire_session: _OwnerSession | None = None
+
             def claim() -> None:
-                with self._state_lock:
-                    if not self._connected:
-                        raise CameraNotConnectedError("camera is not connected")
-                    self._exposing = True
+                nonlocal acquire_session
+                acquire_session = self._capture_authorized_session(
+                    require_connected=True,
+                    require_idle=True,
+                    mark_exposing=True,
+                )
 
             if control is None:
                 claim()
@@ -326,8 +414,10 @@ class OwnerSupervisor:
                     "exposure was cancelled before owner acquisition started"
                 )
             try:
-                acquire_session, response, acknowledged_duration_s = (
+                assert acquire_session is not None
+                response, acknowledged_duration_s = (
                     self._acquire_request_locked(
+                        acquire_session,
                         {
                             "duration_s": actual_duration_s,
                             "roi": {
@@ -379,11 +469,7 @@ class OwnerSupervisor:
                     self._exposing = False
 
     def abort(self) -> None:
-        with self._state_lock:
-            self._require_connected()
-        session = self._capture_session()
-        if session is None:
-            raise CameraNotConnectedError("camera owner is unavailable")
+        session = self._capture_authorized_session(require_connected=True)
         deadline = time.monotonic() + self.deadline_for("abort")
         try:
             session.control_connection.send({"operation": "abort"})
@@ -430,12 +516,13 @@ class OwnerSupervisor:
             source_session,
             lambda: _single_int_result(response, minimum=0)
         )
-        with self._state_lock:
-            if self._session is not source_session or not self._connected:
-                raise CameraNotConnectedError(
-                    "heater response belongs to a failed owner generation"
-                )
-            self._confirmed_heater_level = value
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._session is not source_session or not self._connected:
+                    raise CameraNotConnectedError(
+                        "heater response belongs to a failed owner generation"
+                    )
+                self._confirmed_heater_level = value
         return value
 
     def set_heater_level(self, value: int) -> None:
@@ -449,48 +536,58 @@ class OwnerSupervisor:
                 raise CameraBusyError(
                     "heater level cannot be changed while an exposure is active"
                 )
-            source_session = self._session
         source_session, response = self.request(
             "set_heater_level", {"value": value}
         )
         self.validate(
             source_session, lambda: _require_result_object(response, set())
         )
-        with self._state_lock:
-            if self._session is not source_session or not self._connected:
-                raise CameraNotConnectedError(
-                    "heater response belongs to a failed owner generation"
-                )
-            self._confirmed_heater_level = value
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._session is not source_session or not self._connected:
+                    raise CameraNotConnectedError(
+                        "heater response belongs to a failed owner generation"
+                    )
+                self._confirmed_heater_level = value
 
     def close(self) -> None:
         with self._command_lock:
             with self._lifecycle_lock:
                 self._closed = True
                 session = self._unsafe_session or self._session
+                was_unsafe = self._unsafe_session is not None
                 self._session = None
                 with self._state_lock:
                     self._connected = False
                     self._exposing = False
                     self._confirmed_heater_level = None
-                if session is None:
-                    return
-                if self._unsafe_session is None:
+            if session is None:
+                return
+            try:
+                if not was_unsafe:
                     try:
+                        assert isinstance(session, _OwnerSession)
                         self._exchange_session(
                             session,
                             "shutdown",
                             {},
                             self._config.disconnect_timeout_s,
                         )
-                    except CameraError:
+                    except Exception:
                         pass
-                if not self._finish_or_terminate_session(session):
-                    self._unsafe_session = session
-                    assert self._last_termination_error is not None
-                    raise self._last_termination_error
-                self._unsafe_session = None
-                self._cleanup_session_safely(session)
+            finally:
+                if isinstance(session, _OwnerSession):
+                    terminated = self._finish_or_terminate_session(session)
+                else:
+                    terminated = self._terminate_candidate(session)
+                with self._lifecycle_lock:
+                    if not terminated:
+                        self._unsafe_session = session
+                        assert self._last_termination_error is not None
+                        raise self._last_termination_error
+                    if self._unsafe_session is session:
+                        self._unsafe_session = None
+                self._cleanup_target_safely(session)
 
     def _start_idle_owner_locked(self, *, attempts: int) -> _OwnerSession:
         last_error: CameraError | None = None
@@ -501,19 +598,26 @@ class OwnerSupervisor:
             registry = self._registry_factory(
                 self._generation, self._registry_path
             )
-            raw_session: OwnerProcessSession | Any | None = None
+            candidate = _PrivateCandidate(self._generation, registry)
             session: _OwnerSession | None = None
             try:
-                raw_session = self._process_factory.start(
+                candidate.raw_session = self._process_factory.start(
                     self._startup_spec,
                     self._generation,
                     self._registry_path,
                 )
+                candidate.process = candidate.raw_session.process
+                candidate.command_connection = (
+                    candidate.raw_session.command_connection
+                )
+                candidate.control_connection = (
+                    candidate.raw_session.control_connection
+                )
                 session = _OwnerSession(
                     self._generation,
-                    raw_session.process,
-                    raw_session.command_connection,
-                    raw_session.control_connection,
+                    candidate.process,
+                    candidate.command_connection,
+                    candidate.control_connection,
                     registry,
                     OwnerResponseTracker(),
                 )
@@ -540,33 +644,46 @@ class OwnerSupervisor:
                     self._exposing = False
                     self._confirmed_heater_level = None
                 return session
-            except CameraError as error:
-                last_error = error
-                if raw_session is None:
+            except Exception as error:
+                source_error: Exception = error
+                if isinstance(error, _OwnerProcessStartFailure):
+                    candidate.raw_session = error.session
+                    candidate.process = error.session.process
+                    candidate.command_connection = (
+                        error.session.command_connection
+                    )
+                    candidate.control_connection = (
+                        error.session.control_connection
+                    )
+                    source_error = error.cause
+                last_error = (
+                    source_error
+                    if isinstance(source_error, CameraError)
+                    else safe_camera_error(
+                        source_error, "start camera owner"
+                    )
+                )
+                if candidate.raw_session is None:
+                    self._cleanup_candidate_safely(candidate)
                     continue
-                if session is None:
-                    continue
-                if not self._terminate_session(session):
-                    self._unsafe_session = session
+                if not self._terminate_candidate(candidate):
+                    self._unsafe_session = candidate
                     assert self._last_termination_error is not None
                     raise self._last_termination_error
-                self._cleanup_session_safely(session)
+                self._cleanup_candidate_safely(candidate)
         assert last_error is not None
         raise last_error
 
     def _request_locked(
         self,
+        failed_session: _OwnerSession,
         operation: str,
         arguments: Mapping[str, object],
         timeout_s: float,
-    ) -> tuple[_OwnerSession, OwnerResponse]:
-        failed_session = self._capture_session()
+    ) -> OwnerResponse:
         try:
-            return (
-                failed_session,
-                self._exchange_session(
-                    failed_session, operation, arguments, timeout_s
-                ),
+            return self._exchange_session(
+                failed_session, operation, arguments, timeout_s
             )
         except CameraTimeoutError as error:
             self._fail_owner(error, failed_session=failed_session)
@@ -576,14 +693,13 @@ class OwnerSupervisor:
 
     def _acquire_request_locked(
         self,
+        failed_session: _OwnerSession,
         arguments: Mapping[str, object],
-    ) -> tuple[_OwnerSession, OwnerResponse, float]:
-        failed_session = self._capture_session()
+    ) -> tuple[OwnerResponse, float]:
         try:
-            response, duration = self._acquire_exchange(
+            return self._acquire_exchange(
                 failed_session, arguments
             )
-            return failed_session, response, duration
         except CameraTimeoutError as error:
             self._fail_owner(error, failed_session=failed_session)
         except CameraOwnerProtocolError as error:
@@ -839,15 +955,57 @@ class OwnerSupervisor:
         raise error
 
     def _terminate_session(self, session: _OwnerSession) -> bool:
-        process = session.process
+        return self._terminate_process(
+            session.process,
+            (session.command_connection, session.control_connection),
+        )
+
+    def _terminate_candidate(self, candidate: _PrivateCandidate) -> bool:
+        self._capture_candidate_resources(candidate)
+        if candidate.process is None:
+            self._last_termination_error = CameraOwnerTerminationError(
+                "private camera owner process identity is unavailable"
+            )
+            return False
+        return self._terminate_process(
+            candidate.process,
+            (
+                candidate.command_connection,
+                candidate.control_connection,
+            ),
+        )
+
+    @staticmethod
+    def _capture_candidate_resources(
+        candidate: _PrivateCandidate,
+    ) -> None:
+        raw = candidate.raw_session
+        if raw is None:
+            return
+        for field_name in (
+            "process",
+            "command_connection",
+            "control_connection",
+        ):
+            if getattr(candidate, field_name) is not None:
+                continue
+            try:
+                setattr(candidate, field_name, getattr(raw, field_name))
+            except BaseException:
+                pass
+
+    def _terminate_process(
+        self,
+        process: Any,
+        connections: tuple[Any | None, Any | None],
+    ) -> bool:
         try:
             self._last_terminated_pid = process.pid
         except BaseException:
             self._last_terminated_pid = None
-        for connection in (
-            session.command_connection,
-            session.control_connection,
-        ):
+        for connection in connections:
+            if connection is None:
+                continue
             try:
                 connection.close()
             except BaseException:
@@ -914,34 +1072,69 @@ class OwnerSupervisor:
         except BaseException:
             return True
 
-    def _cleanup_session(self, session: _OwnerSession) -> None:
-        registry = session.registry
+    def _cleanup_target(
+        self, target: _OwnerSession | _PrivateCandidate
+    ) -> None:
+        registry = target.registry
         cleanup_generation = getattr(registry, "cleanup_generation", None)
         if callable(cleanup_generation):
-            cleanup_generation(session.generation)
+            cleanup_generation(target.generation)
             return
         # Constructing a registry after the exact child has exited invokes the
         # registry's dead-owner cleanup and only unlinks product-owned names.
-        self._registry_factory(session.generation, self._registry_path)
+        self._registry_factory(target.generation, self._registry_path)
 
     def _cleanup_session_safely(self, session: _OwnerSession) -> None:
+        self._cleanup_target_safely(session)
+
+    def _cleanup_candidate_safely(
+        self, candidate: _PrivateCandidate
+    ) -> None:
+        self._cleanup_target_safely(candidate)
+
+    def _cleanup_target_safely(
+        self, target: _OwnerSession | _PrivateCandidate
+    ) -> None:
         try:
-            self._cleanup_session(session)
+            self._cleanup_target(target)
         except BaseException as error:
             self._last_cleanup_error = safe_camera_error(
                 error, "clean failed owner generation"
             )
 
-    def _capture_session(self) -> _OwnerSession:
+    def _capture_authorized_session(
+        self,
+        *,
+        require_connected: bool,
+        require_idle: bool = False,
+        mark_exposing: bool = False,
+    ) -> _OwnerSession:
+        """Authorize state and capture its exact token in one transaction."""
+
         with self._lifecycle_lock:
-            session = self._session
-            if session is None:
-                if self._last_termination_error is not None:
-                    raise self._last_termination_error
-                raise CameraOwnerProtocolError(
-                    "camera owner session is unavailable"
-                )
-            return session
+            with self._state_lock:
+                session = self._current_session_locked()
+                if require_connected and not self._connected:
+                    raise CameraNotConnectedError(
+                        "camera is not connected"
+                    )
+                if require_idle and self._exposing:
+                    raise CameraBusyError(
+                        "camera is already exposing"
+                    )
+                if mark_exposing:
+                    self._exposing = True
+                return session
+
+    def _current_session_locked(self) -> _OwnerSession:
+        session = self._session
+        if session is None:
+            if self._last_termination_error is not None:
+                raise self._last_termination_error
+            raise CameraOwnerProtocolError(
+                "camera owner session is unavailable"
+            )
+        return session
 
     def _require_connected(self) -> None:
         if not self._connected:
@@ -1424,8 +1617,13 @@ def _frame_values_from_payload(payload: object) -> dict[str, object]:
         raise OwnerProtocolError(
             "frame ROI origin and dimensions are invalid"
         )
+    readout_value = payload["readout_mode"]
+    if type(readout_value) is not int:
+        raise OwnerProtocolError(
+            "frame readout mode must be an exact integer"
+        )
     try:
-        readout_mode = ReadoutMode(payload["readout_mode"])
+        readout_mode = ReadoutMode(readout_value)
     except (TypeError, ValueError) as error:
         raise OwnerProtocolError("frame readout mode is invalid") from error
     return {
