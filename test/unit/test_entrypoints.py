@@ -5,6 +5,7 @@ import signal
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from touptek4040.gui import (
     DiagnosticWorkerPool,
     QueueLogHandler,
     parse_diagnostic_settings,
+    run_diagnostic_gui,
     run_mainloop_with_cleanup,
 )
 
@@ -215,18 +217,24 @@ def test_signal_handler_uses_same_shutdown_path(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(signal, "getsignal", lambda number: f"old-{number}")
     monkeypatch.setattr(signal, "signal", lambda number, handler: calls.append((number, handler)))
-    server = type("Server", (), {"shutdown": lambda self: setattr(self, "stopped", True)})()
-    restore = run_alpaca.install_termination_handlers(server)
+    termination = threading.Event()
+    restore = run_alpaca.install_termination_handlers(termination)
     installed = dict(calls)
+    with pytest.raises(run_alpaca.ServiceTermination):
+        installed[signal.SIGTERM](signal.SIGTERM, None)
     installed[signal.SIGTERM](signal.SIGTERM, None)
-    assert server.stopped
+    assert termination.is_set()
     restore()
     assert any(handler == f"old-{number}" for number, handler in calls)
 
 
 def test_discovery_families_follow_http_bind(monkeypatch) -> None:
     seen = []
-    monkeypatch.setattr(run_alpaca, "create_server", lambda *args, **kwargs: _WaitressStub())
+    def server_for_bind(*_args, **kwargs):
+        server = _WaitressStub()
+        server.effective_host = kwargs["host"]
+        return server
+    monkeypatch.setattr(run_alpaca, "create_server", server_for_bind)
     monkeypatch.setattr(
         run_alpaca,
         "DiscoveryResponder",
@@ -300,13 +308,38 @@ def test_worker_pool_close_cleans_up_after_queued_connect() -> None:
         cleanup.append("disconnect")
     assert pool.submit(connect, lambda *_: None)
     assert connected.wait(1)
-    closer = threading.Thread(target=lambda: pool.close(disconnect, timeout=0.05))
+    closer = threading.Thread(target=lambda: pool.close(disconnect).join(1))
     closer.start()
     release.set()
     closer.join(1)
     assert cleanup and all(item == "disconnect" for item in cleanup)
     assert camera_open == [False]
     assert not pool.submit(lambda: None, lambda *_: None)
+
+
+def test_accepted_but_unscheduled_worker_is_cancelled_by_close() -> None:
+    delayed = []
+    action_ran = []
+    cleanup = []
+
+    class DelayedThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+            delayed.append(self)
+
+        def start(self):
+            return None
+
+        def join(self, _timeout=None):
+            return None
+
+    pool = DiagnosticWorkerPool(thread_factory=DelayedThread)
+    assert pool.submit(lambda: action_ran.append(True), lambda *_: None)
+    finalizer = pool.close(lambda: cleanup.append(True))
+    finalizer.join(1)
+    delayed[0].target()
+    assert action_ran == []
+    assert cleanup == [True]
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("Tk failed")])
@@ -316,6 +349,109 @@ def test_mainloop_failure_always_runs_cleanup(error) -> None:
     with pytest.raises(type(error)):
         run_mainloop_with_cleanup(root, lambda: cleaned.append(True))
     assert cleaned == [True]
+
+
+def test_multisocket_listener_metadata_drives_discovery(monkeypatch) -> None:
+    seen = []
+    http = _MultiSocketStub([("127.0.0.1", 23456), ("::1", 23456)])
+    monkeypatch.setattr(run_alpaca, "create_server", lambda *args, **kwargs: http)
+    monkeypatch.setattr(
+        run_alpaca,
+        "DiscoveryResponder",
+        lambda port, _discovery_port, **kwargs: (
+            seen.append((port, kwargs["families"])) or _DiscoveryStub()
+        ),
+    )
+    server = run_alpaca.build_server(_config("sim"))
+    assert server.port == 23456
+    assert seen == [
+        (
+            23456,
+            frozenset({run_alpaca.socket.AF_INET, run_alpaca.socket.AF_INET6}),
+        )
+    ]
+    server.shutdown()
+
+
+def test_multisocket_mismatched_ports_fail_and_cleanup(monkeypatch) -> None:
+    http = _MultiSocketStub([("127.0.0.1", 11111), ("::1", 22222)])
+    monkeypatch.setattr(run_alpaca, "create_server", lambda *args, **kwargs: http)
+    with pytest.raises(ValueError, match="same port"):
+        run_alpaca.build_server(_config("sim"))
+    assert http.closed and http.drained
+
+
+def test_discovery_bootstrap_failure_closes_http(monkeypatch) -> None:
+    http = _MultiSocketStub([("127.0.0.1", 11111)])
+    monkeypatch.setattr(run_alpaca, "create_server", lambda *args, **kwargs: http)
+    monkeypatch.setattr(
+        run_alpaca,
+        "DiscoveryResponder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("discovery failed")),
+    )
+    with pytest.raises(OSError, match="discovery failed"):
+        run_alpaca.build_server(_config("sim"))
+    assert http.closed and http.drained
+
+
+def test_ipv6_only_discovery_run_is_reported_running() -> None:
+    responder = run_alpaca.DiscoveryResponder(
+        11111, families=frozenset({run_alpaca.socket.AF_INET6})
+    )
+    responder._run = SimpleNamespace(
+        stop_event=threading.Event(),
+        threads={
+            run_alpaca.socket.AF_INET6: SimpleNamespace(is_alive=lambda: True)
+        },
+    )
+    assert responder.running is True
+
+
+def test_gui_partial_widget_construction_cleans_all_resources(monkeypatch) -> None:
+    session = SimpleNamespace(closed=False)
+    session.close = lambda: setattr(session, "closed", True)
+    disconnects = []
+    coordinator = SimpleNamespace(
+        preview_active=False,
+        abort_exposure=lambda: None,
+        set_connected_sync=lambda value: disconnects.append(value),
+    )
+    monkeypatch.setattr(run_alpaca, "configure_logging", lambda _config: session)
+    monkeypatch.setattr(
+        run_alpaca,
+        "build_coordinator",
+        lambda config: (coordinator, config),
+    )
+
+    class Root:
+        def title(self, _value): pass
+        def minsize(self, *_value): pass
+
+    class Tk:
+        Tk = Root
+        StringVar = lambda *args, **kwargs: SimpleNamespace(
+            get=lambda: kwargs.get("value", ""),
+            set=lambda _value: None,
+        )
+        BooleanVar = StringVar
+        Text = object
+
+    class Ttk:
+        @staticmethod
+        def Frame(*_args, **_kwargs):
+            raise RuntimeError("widget construction failed")
+
+    messagebox = SimpleNamespace(showerror=lambda *args, **kwargs: None)
+    logger = logging.getLogger("touptek4040")
+    before = tuple(logger.handlers)
+    with pytest.raises(RuntimeError, match="widget construction failed"):
+        run_diagnostic_gui(
+            _config("sim"),
+            _ui_modules=(Tk, messagebox, Ttk),
+        )
+    assert session.closed
+    assert disconnects == [False]
+    assert tuple(logger.handlers) == before
 
 
 def test_gui_cli_delegates_to_diagnostic_application(monkeypatch) -> None:
@@ -387,3 +523,19 @@ class _CoordinatorStub:
     def set_connected_sync(self, connected: bool) -> None:
         assert connected is False
         self.events.append("camera-disconnect")
+
+
+class _MultiSocketStub:
+    def __init__(self, effective_listen) -> None:
+        self.effective_listen = effective_listen
+        self.closed = False
+        self.drained = False
+        self.task_dispatcher = SimpleNamespace(
+            shutdown=lambda: setattr(self, "drained", True)
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+    def run(self) -> None:
+        return None

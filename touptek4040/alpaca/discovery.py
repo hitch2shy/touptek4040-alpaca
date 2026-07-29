@@ -90,11 +90,7 @@ class DiscoveryResponder:
     @property
     def running(self) -> bool:
         with self._lifecycle_lock:
-            run = self._run
-            if run is None or run.stop_event.is_set():
-                return False
-            ipv4_thread = run.threads.get(socket.AF_INET)
-            return ipv4_thread is not None and ipv4_thread.is_alive()
+            return self._run_is_healthy(self._run)
 
     def start(self) -> None:
         """Start once; retain IPv4 even when optional IPv6 is unavailable."""

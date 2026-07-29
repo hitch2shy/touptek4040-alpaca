@@ -6,6 +6,7 @@ import argparse
 import logging
 import signal
 import socket
+import threading
 from logging.handlers import RotatingFileHandler
 from collections.abc import Sequence
 from dataclasses import replace
@@ -118,6 +119,7 @@ def build_server(
     """Build the server only after real hardware identity is resolved."""
 
     logging_session = configure_logging(config)
+    http = None
     try:
         coordinator, resolved = build_coordinator(config)
         app = create_app(coordinator, resolved)
@@ -128,10 +130,11 @@ def build_server(
             threads=8,
             clear_untrusted_proxy_headers=True,
         )
+        effective_port, families = _http_listener_metadata(http)
         discovery = DiscoveryResponder(
-            int(http.effective_port),
+            effective_port,
             resolved.server.discovery_port,
-            families=_discovery_families(resolved.server.host),
+            families=families,
         )
         return RuntimeServer(
             http=http,
@@ -140,8 +143,11 @@ def build_server(
             config=resolved,
             start_discovery=start_discovery,
             logging_session=logging_session,
+            port=effective_port,
         )
     except BaseException:
+        if http is not None:
+            _cleanup_bootstrap_http(http)
         logging_session.close()
         raise
 
@@ -158,12 +164,17 @@ class RuntimeServer:
         config: AppConfig,
         start_discovery: bool,
         logging_session: LoggingSession | None,
+        port: int | None = None,
     ) -> None:
         self.http = http
         self.discovery = discovery
         self.coordinator = coordinator
         self.config = config
-        self.port = int(http.effective_port)
+        self.port = (
+            int(port)
+            if port is not None
+            else _http_listener_metadata(http)[0]
+        )
         self._start_discovery = start_discovery
         self._shutdown_lock = Lock()
         self._logging_session = logging_session
@@ -300,13 +311,49 @@ def _discovery_families(host: str) -> frozenset[int]:
     return families or frozenset({socket.AF_INET})
 
 
-def install_termination_handlers(server: RuntimeServer):
+def _http_listener_metadata(http: Any) -> tuple[int, frozenset[int]]:
+    listeners = getattr(http, "effective_listen", None)
+    if not listeners:
+        listeners = [
+            (
+                getattr(http, "effective_host", "0.0.0.0"),
+                getattr(http, "effective_port"),
+            )
+        ]
+    ports = {int(port) for _host, port in listeners}
+    if len(ports) != 1:
+        raise ValueError("all HTTP listeners must use the same port")
+    families: set[int] = set()
+    for host, _port in listeners:
+        families.update(_discovery_families(str(host)))
+    return ports.pop(), frozenset(families)
+
+
+def _cleanup_bootstrap_http(http: Any) -> None:
+    for action in (
+        getattr(http, "close", lambda: None),
+        getattr(getattr(http, "task_dispatcher", None), "shutdown", lambda: None),
+    ):
+        try:
+            action()
+        except BaseException:
+            _LOG.exception("HTTP bootstrap cleanup failed")
+
+
+class ServiceTermination(Exception):
+    """Unwind the service loop after a supported termination signal."""
+
+
+def install_termination_handlers(termination: threading.Event):
     """Install supported service termination hooks and return a restorer."""
 
     previous: dict[int, Any] = {}
 
     def terminate(_signum, _frame) -> None:
-        server.shutdown()
+        if termination.is_set():
+            return
+        termination.set()
+        raise ServiceTermination
 
     supported = [signal.SIGTERM]
     if hasattr(signal, "SIGBREAK"):
@@ -330,11 +377,13 @@ def install_termination_handlers(server: RuntimeServer):
 
 def main(argv: Sequence[str] | None = None) -> int:
     server = build_server(config_from_args(argv))
-    restore_handlers = install_termination_handlers(server)
+    restore_handlers = lambda: None
+    termination = threading.Event()
     try:
+        restore_handlers = install_termination_handlers(termination)
         server.serve_forever()
         return 0
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ServiceTermination):
         return 0
     finally:
         server.shutdown()

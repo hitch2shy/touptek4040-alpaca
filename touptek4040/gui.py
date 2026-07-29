@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -93,11 +92,12 @@ class QueueLogHandler(logging.Handler):
 class DiagnosticWorkerPool:
     """Track diagnostic actions and make close win over queued camera opens."""
 
-    def __init__(self) -> None:
+    def __init__(self, thread_factory=threading.Thread) -> None:
         self._lock = threading.Lock()
         self._closing = False
         self._workers: set[threading.Thread] = set()
-        self._cleanup = None
+        self._thread_factory = thread_factory
+        self._finalizer: threading.Thread | None = None
 
     @property
     def closing(self) -> bool:
@@ -108,42 +108,51 @@ class DiagnosticWorkerPool:
         with self._lock:
             if self._closing:
                 return False
+            holder = {}
 
             def run() -> None:
+                with self._lock:
+                    worker = holder["worker"]
+                    if self._closing:
+                        self._workers.discard(worker)
+                        return
                 try:
                     callback("ok", action())
                 except BaseException as error:
                     callback("error", error)
                 finally:
-                    cleanup = None
                     with self._lock:
-                        self._workers.discard(threading.current_thread())
-                        if self._closing:
-                            cleanup = self._cleanup
-                    if cleanup is not None:
-                        try:
-                            cleanup()
-                        except BaseException:
-                            _LOG.exception("Late diagnostic worker cleanup failed")
+                        self._workers.discard(holder["worker"])
 
-            worker = threading.Thread(
+            worker = self._thread_factory(
                 target=run,
                 name="diagnostic-action",
                 daemon=True,
             )
+            holder["worker"] = worker
             self._workers.add(worker)
             worker.start()
             return True
 
-    def close(self, cleanup, timeout: float = 0.25) -> None:
+    def close(self, cleanup) -> threading.Thread:
         with self._lock:
+            if self._finalizer is not None:
+                return self._finalizer
             self._closing = True
-            self._cleanup = cleanup
             workers = tuple(self._workers)
-        deadline = time.monotonic() + max(0.0, timeout)
-        for worker in workers:
-            worker.join(max(0.0, deadline - time.monotonic()))
-        cleanup()
+
+            def quiesce() -> None:
+                for worker in workers:
+                    worker.join()
+                cleanup()
+
+            self._finalizer = threading.Thread(
+                target=quiesce,
+                name="diagnostic-final-cleanup",
+                daemon=True,
+            )
+            self._finalizer.start()
+            return self._finalizer
 
 
 def run_mainloop_with_cleanup(root: Any, cleanup) -> None:
@@ -155,15 +164,24 @@ def run_mainloop_with_cleanup(root: Any, cleanup) -> None:
         cleanup()
 
 
-def run_diagnostic_gui(config: AppConfig) -> int:
+def run_diagnostic_gui(
+    config: AppConfig,
+    *,
+    _ui_modules=None,
+) -> int:
     """Open a compact diagnostics window; no camera is touched before Connect."""
 
-    import tkinter as tk
-    from tkinter import messagebox, ttk
+    if _ui_modules is None:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    else:
+        tk, messagebox, ttk = _ui_modules
 
     from run_alpaca import build_coordinator, configure_logging
 
     logging_session = configure_logging(config)
+    package_logger = logging.getLogger("touptek4040")
+    original_handlers = tuple(package_logger.handlers)
     try:
         coordinator, resolved = build_coordinator(config)
     except BaseException as error:
@@ -174,11 +192,39 @@ def run_diagnostic_gui(config: AppConfig) -> int:
         )
         return 2
 
+    cleanup_scheduled = [False]
     try:
-        root = tk.Tk()
-    except BaseException:
+        return _run_diagnostic_window(
+            coordinator,
+            resolved,
+            logging_session,
+            tk,
+            messagebox,
+            ttk,
+            cleanup_scheduled,
+        )
+    finally:
+        for handler in tuple(package_logger.handlers):
+            if handler not in original_handlers and isinstance(
+                handler, QueueLogHandler
+            ):
+                package_logger.removeHandler(handler)
+                handler.close()
+        if not cleanup_scheduled[0]:
+            _cleanup_coordinator(coordinator)
         logging_session.close()
-        raise
+
+
+def _run_diagnostic_window(
+    coordinator: CameraCoordinator,
+    resolved: AppConfig,
+    logging_session,
+    tk,
+    messagebox,
+    ttk,
+    cleanup_scheduled: list[bool],
+) -> int:
+    root = tk.Tk()
     root.title("ToupTek 4040 Diagnostics")
     root.minsize(760, 560)
     events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -374,18 +420,7 @@ def run_diagnostic_gui(config: AppConfig) -> int:
     closed = False
 
     def camera_cleanup() -> None:
-        operations = (
-            lambda: coordinator.stop_preview() if coordinator.preview_active else None,
-            coordinator.abort_exposure,
-            lambda: coordinator.set_connected_sync(False),
-        )
-        for operation in operations:
-            try:
-                operation()
-            except CameraError:
-                _LOG.exception("Diagnostic camera cleanup step failed")
-            except BaseException:
-                _LOG.exception("Unexpected diagnostic camera cleanup failure")
+        _cleanup_coordinator(coordinator)
 
     def close() -> None:
         nonlocal closed
@@ -395,6 +430,7 @@ def run_diagnostic_gui(config: AppConfig) -> int:
         for child in buttons.winfo_children():
             child.configure(state="disabled")
         workers.close(camera_cleanup)
+        cleanup_scheduled[0] = True
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
@@ -403,8 +439,24 @@ def run_diagnostic_gui(config: AppConfig) -> int:
     def final_cleanup() -> None:
         if not closed:
             workers.close(camera_cleanup)
+            cleanup_scheduled[0] = True
         package_logger.removeHandler(queue_handler)
         queue_handler.close()
         logging_session.close()
     run_mainloop_with_cleanup(root, final_cleanup)
     return 0
+
+
+def _cleanup_coordinator(coordinator: CameraCoordinator) -> None:
+    operations = (
+        lambda: coordinator.stop_preview() if coordinator.preview_active else None,
+        coordinator.abort_exposure,
+        lambda: coordinator.set_connected_sync(False),
+    )
+    for operation in operations:
+        try:
+            operation()
+        except CameraError:
+            _LOG.exception("Diagnostic camera cleanup step failed")
+        except BaseException:
+            _LOG.exception("Unexpected diagnostic camera cleanup failure")
