@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from typing import TypeAlias
@@ -282,3 +282,19 @@ def decode_response(payload: object, expected: OwnerRequest) -> OwnerResponse:
     if response.operation != expected.operation:
         raise OwnerProtocolError("response operation does not match request")
     return response
+
+
+@dataclass(slots=True)
+class OwnerResponseTracker:
+    """Transport-owned replay protection for owner generation/request pairs."""
+
+    _seen: set[tuple[int, int]] = field(default_factory=set)
+
+    def decode(self, payload: object, expected: OwnerRequest) -> OwnerResponse:
+        """Decode one response and reject a repeated owner response ID."""
+        response = decode_response(payload, expected)
+        response_key = (response.owner_generation, response.request_id)
+        if response_key in self._seen:
+            raise OwnerProtocolError("duplicate response owner_generation/request_id")
+        self._seen.add(response_key)
+        return response

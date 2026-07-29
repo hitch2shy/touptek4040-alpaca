@@ -16,6 +16,7 @@ from touptek4040.owner_protocol import (
     OwnerError,
     OwnerProtocolError,
     OwnerRequest,
+    OwnerResponseTracker,
     decode_request,
     decode_response,
     encode_request,
@@ -234,3 +235,22 @@ def test_decode_response_builds_a_typed_error_with_json_diagnostics():
         "camera is busy",
         {"active_exposure": True, "seconds": 1.5},
     )
+
+
+def test_explicit_response_tracker_rejects_a_duplicate_generation_and_request_id():
+    """Accepting the same owner generation/request response twice is a transport bug."""
+    expected = OwnerRequest(1, 7, 42, "connect", {})
+    payload = {
+        "protocol_version": 1,
+        "owner_generation": 7,
+        "request_id": 42,
+        "operation": "connect",
+        "result": {"connected": True},
+    }
+    tracker = OwnerResponseTracker()
+
+    first = tracker.decode(payload, expected)
+
+    assert first.result == {"connected": True}
+    with pytest.raises(OwnerProtocolError):
+        tracker.decode(payload, expected)
