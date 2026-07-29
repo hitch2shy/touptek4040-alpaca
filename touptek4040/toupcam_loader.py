@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import platform
@@ -41,6 +42,14 @@ def load_toupcam_module(base_dir: Path) -> ModuleType:
 def load_default_toupcam_module() -> ModuleType:
     """Load from the runtime first, then from an active development worktree."""
     runtime_dir = Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False):
+        validate_runtime_architecture()
+        dll_directory_cookie = None
+        if os.name == "nt":
+            dll_directory_cookie = os.add_dll_directory(str(runtime_dir))
+        module = importlib.import_module("toupcam")
+        module._touptek4040_dll_directory_cookie = dll_directory_cookie
+        return module
     candidates = (runtime_dir, *_enclosing_linked_worktrees(runtime_dir), Path.cwd())
     missing_error: ToupTekSdkNotFoundError | None = None
     for candidate in dict.fromkeys(candidates):

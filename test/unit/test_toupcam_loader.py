@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import importlib
 import platform
+import sys
 import weakref
+from types import ModuleType
 
 import pytest
 
@@ -119,3 +122,31 @@ def test_default_loader_propagates_runtime_wrapper_failure_without_fallback(
 
     with pytest.raises(RuntimeError, match="runtime wrapper failed"):
         load_default_toupcam_module()
+
+
+def test_frozen_loader_imports_bundled_wrapper_and_retains_dll_cookie(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen executable must load bytecode without requiring toupcam.py on disk."""
+    executable = tmp_path / "ToupTek4040GUI.exe"
+    executable.touch()
+    module = ModuleType("toupcam")
+    imported: list[str] = []
+    cookie = object()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(
+        "touptek4040.toupcam_loader.os.add_dll_directory",
+        lambda path: cookie,
+    )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: imported.append(name) or module,
+    )
+
+    loaded = load_default_toupcam_module()
+
+    assert loaded is module
+    assert imported == ["toupcam"]
+    assert loaded._touptek4040_dll_directory_cookie is cookie
