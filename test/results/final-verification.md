@@ -6,12 +6,22 @@ Date: 2026-07-30 (Asia/Shanghai)
 
 - Distribution: `<repo>/dist/ToupTek4040Control`
 - Archive: `<repo>/dist/ToupTek4040Control.zip`
-- Source commit: `faec12fcb2691d5f21958a997b3daecbffbce560`
+- Source commit: `549351f0086add3d7c6992247449cc81130d12b9`
 - Release-input manifest SHA-256:
-  `B9D240D01DAEAB1E9ECB439332CC9D619A0599DB362554A5F90F375922FF45E3`
-- ZIP size: 38,137,118 bytes
+  `5922C4B79329EDCC230A2C55B2ED90BD2CA566339FDF9E2538F83E129C024DD5`
+- Official SDK lock SHA-256:
+  `D29F9569262264D900991B8CEC6C420F2FE95188335333E3E802DF5C3B471DF5`
+- Official SDK aggregate SHA-256:
+  `EB807DA73513B59BF839EFD3891F406AFD41CC616648A5097B588898B5005046`
+- Official `python/toupcam.py`: version `59.28760.20250623`,
+  171,655 bytes, SHA-256
+  `B472D455D4506A3CA642A1DF0B77986FEA42D97F7DEFFE1EA33B6B1BB06F5520`.
+- Official `win/x64/toupcam.dll`: version `59.28760.20250623`,
+  27,495,712 bytes, SHA-256
+  `F81D9705C1C6AF3B5D5C07FEDEC2CF09A8A113DC6D6EFEBD58798E9B12C04460`.
+- ZIP size: 38,818,131 bytes
 - ZIP SHA-256:
-  `BA3B2296A90DB82F81929026D3B3F833420CF83EE82D074D6E8071EFD3D231C6`
+  `1E29E168614443672FB266EA4FA8F76571CFCC1FA47C0E4F279EB5C10CE677AF`
 - Executables: `ToupTek4040Alpaca.exe`, `ToupTek4040GUI.exe`
 - Runtime: one x64 `toupcam.dll`; no x86 DLL, `.lib`, SDK source wrapper,
   legacy INI or test tree.
@@ -23,14 +33,18 @@ Date: 2026-07-30 (Asia/Shanghai)
 ## Exact verification commands and results
 
 1. `powershell -ExecutionPolicy Bypass -File test/scripts/build_release.ps1`
-   - exit 0; built only from the clean Git archive of the recorded source
-     commit; dirty release inputs are rejected before distribution mutation.
-2. `powershell -ExecutionPolicy Bypass -File test/scripts/run_package_smoke.ps1`
-   - 17/17 formal distribution, provenance, icon, simulator, GUI, frozen
-     spawn/shared-memory and HTTP tests;
+   - exit 0; built from the clean Git archive of the recorded source commit
+     plus the two official external SDK files verified against the committed
+     lock before any distribution mutation;
+   - separate one-byte wrapper and DLL mutation tests both rejected the build
+     before changing the existing BUILD-INFO or ZIP.
+2. `python -m pytest test/packaging -q` and
+   `test/scripts/run_test_package_hardware.ps1 ... -VerifyFormalContract`
+   - 21/21 formal distribution, locked SDK provenance, icon, simulator, GUI,
+     frozen spawn/shared-memory and HTTP tests;
    - packaged real-camera smoke passed.
 3. `powershell -ExecutionPolicy Bypass -File test/scripts/run_all.ps1`
-   - 1,427 passed, 36 hardware-gated skips, 0 failed.
+   - 1,431 passed, 36 hardware-gated skips, 0 failed.
 4. `powershell -ExecutionPolicy Bypass -File test/scripts/run_owner_faults.ps1`
    - 25 passed, 2 intentional outer-runner skips;
    - official 14/14 boundary/leak cases PASS.
@@ -56,9 +70,13 @@ Date: 2026-07-30 (Asia/Shanghai)
   passed.
 - Packaged real mode ran in an isolated spawned owner, returned RAW12 pixels,
   Alpaca JSON ImageArray and ImageBytes, Web PNG and FITS, and completed
-  Abort/Disconnect. Package PID 28136 and owner PID 20360 differed; the owner
-  remained supervised after Disconnect and was dead after exact package
-  shutdown. Its shared-frame registry and live-segment lists were empty.
+  Abort/Disconnect. The final formal run used package PID 37480 and owner PID
+  37132. PID 37132 was the current supervisor owner after Disconnect and
+  Reconnect; after exact package shutdown every observed owner PID was dead
+  (`alive=[]`). A preceding diagnostic run observed an Abort/recovery
+  replacement from stale PID 21824 to current PID 37676; the smoke therefore
+  tracks every observed generation instead of treating the initial PID as the
+  permanent owner.
 - Packaged heater: HEAT/HEAT_MAX began 4/4 and the alternate 0 was deliberately
   left active. No manual pre-Disconnect restore occurred. Disconnect restored
   4 automatically, reconnect confirmed 4, then a clean Disconnect completed.
@@ -72,10 +90,18 @@ Date: 2026-07-30 (Asia/Shanghai)
   send and after parent copy all left no registry or OS segment.
 - The frozen executable probe independently spawned a Windows
   `multiprocessing` child, exchanged exactly one shared-memory publication and
-  ACK, then proved the child dead and the segment absent.
-- `git diff faec12fcb2691d5f21958a997b3daecbffbce560..HEAD` over every
+  ACK, read the live registry name, then attempted to reopen that exact name
+  after child exit and proved the child, registry entry and segment absent.
+- The real packaged smoke observed three descriptor/registry segment names
+  during acquisition, probed all three after top-level shutdown and measured
+  empty final registry and live-segment lists. A forged live-mapping regression
+  test proves the reopen probe fails closed when a named segment still exists.
+- `git diff 549351f0086add3d7c6992247449cc81130d12b9..HEAD` over every
   release-input path is empty; the later commit contains tests and normalized
   evidence only.
+- The integration harness allows 180 seconds only for its nested complete
+  owner-fault audit. Product owner startup, command, exposure, Abort and
+  Disconnect timeout contracts were not relaxed.
 
 ## Preserved user service
 
