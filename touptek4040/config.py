@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Mapping
 
 
+NATIVE_OWNER_TIMEOUT_MARGIN_S = 0.25
+NATIVE_TIMEOUT_CEILING_ALLOWANCE_S = 0.001
+MIN_EXPOSURE_OVERHEAD_S = (
+    NATIVE_OWNER_TIMEOUT_MARGIN_S + NATIVE_TIMEOUT_CEILING_ALLOWANCE_S
+)
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     host: str = "0.0.0.0"
@@ -77,6 +84,12 @@ class OwnerConfig:
                 "owner.structural_reopen_settle_s must be a non-negative finite number"
             )
         object.__setattr__(self, "structural_reopen_settle_s", float(value))
+        if self.exposure_overhead_s < MIN_EXPOSURE_OVERHEAD_S:
+            raise ValueError(
+                "owner.exposure_overhead_s must be at least "
+                f"{MIN_EXPOSURE_OVERHEAD_S:g} seconds to keep the native "
+                "camera timeout below the owner deadline"
+            )
 
 
 @dataclass(frozen=True)

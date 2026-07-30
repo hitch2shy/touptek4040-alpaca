@@ -277,6 +277,8 @@ def test_real_structural_reopens_preserve_persistent_native_state(
         "tec_voltage_max",
         "hflip",
         "vflip",
+        "heater_level",
+        "heater_max_level",
     )
     before_state = {name: getattr(before, name) for name in persistent_fields}
     after_state = {name: getattr(after, name) for name in persistent_fields}
@@ -289,6 +291,12 @@ def test_real_structural_reopens_preserve_persistent_native_state(
         before=before_state,
         after=after_state,
         preserved=True,
+        native_options={
+            "TOUPCAM_OPTION_HEAT": hardware_session.sdk.TOUPCAM_OPTION_HEAT,
+            "TOUPCAM_OPTION_HEAT_MAX": (
+                hardware_session.sdk.TOUPCAM_OPTION_HEAT_MAX
+            ),
+        },
         redundant_persistent_setters=redundant_setters,
     )
 

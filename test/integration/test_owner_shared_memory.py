@@ -161,7 +161,7 @@ def run_shared_memory_crash(
     factory = _CrashProcessFactory(crash_point)
     proxy = CameraOwnerProxy(
         owner_config=OwnerConfig(
-            startup_timeout_s=0.6,
+            startup_timeout_s=1.0,
             connect_timeout_s=0.3,
             command_timeout_s=0.3,
             exposure_overhead_s=0.3,

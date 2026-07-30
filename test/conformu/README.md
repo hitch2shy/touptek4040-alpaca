@@ -18,8 +18,15 @@ The script starts a loopback-only Alpaca server at
 `http://127.0.0.1:11113/api/v1/camera/0`, runs the `alpacaprotocol` and
 `conformance` command-line profiles, requests a bounded graceful shutdown, and
 restores the pre-run RAW/bit depth/gain/ROI/binning/trigger/exposure/auto
-exposure/orientation/TEC target/TEC/fan snapshot in a `finally` path. It never
-falls back to simulation.
+exposure/orientation/TEC target/TEC/fan/HEAT/HEAT_MAX snapshot in a `finally`
+path. It never falls back to simulation.
+
+The 34 allowed Protocol issues are the two common-parameter casing probes on
+each of 17 PUT endpoints. Alpaca parameter names are case-insensitive, so the
+driver intentionally accepts those variants. Camera V4 also reports one
+allowed idle `StopExposure` issue: the Camera contract defines an idle call as
+a successful no-op, while `CanStopExposure=False` still rejects an
+in-progress stop because this camera cannot return a valid early-read image.
 
 Logs, machine-readable ConformU results, server diagnostics, and the hardware
 restoration record are written to `test/results/conformu/`.

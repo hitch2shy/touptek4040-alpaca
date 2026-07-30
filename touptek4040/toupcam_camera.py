@@ -38,6 +38,10 @@ from .errors import (
 from .toupcam_loader import load_default_toupcam_module
 
 
+APPROVED_CAMERA_SERIAL = "TP241025143218C92B01151AEC40CB7"
+APPROVED_CAMERA_MODEL = "sMAX16AM-U3-CL-GPS"
+
+
 @dataclass(frozen=True)
 class CaptureSettings:
     """Requested output geometry and exposure settings."""
@@ -119,6 +123,56 @@ def enumerate_cameras(sdk: ModuleType | Any | None = None) -> list[CameraIdentit
     return identities
 
 
+def _probe_approved_camera(
+    sdk: ModuleType | Any,
+    serial: str | None,
+) -> CameraIdentity:
+    """Validate raw metadata before opening only the approved serial selector."""
+
+    if serial != APPROVED_CAMERA_SERIAL:
+        raise CameraInvalidValueError(
+            f"camera serial must be {APPROVED_CAMERA_SERIAL!r}"
+        )
+    devices = list(sdk.Toupcam.EnumV2())
+    if len(devices) != 1:
+        raise CameraNotConnectedError(
+            f"exactly one approved camera must be attached; found {len(devices)}"
+        )
+    device = devices[0]
+    raw_id = getattr(device, "id", None)
+    model = getattr(getattr(device, "model", None), "name", None)
+    display_name = getattr(device, "displayname", None)
+    if (
+        not isinstance(raw_id, str)
+        or not raw_id.strip()
+        or model != APPROVED_CAMERA_MODEL
+        or display_name != APPROVED_CAMERA_MODEL
+    ):
+        raise CameraNotConnectedError(
+            "attached device does not match the approved camera raw metadata"
+        )
+    selector = f"sn:{APPROVED_CAMERA_SERIAL}"
+    try:
+        handle = sdk.Toupcam.Open(selector)
+    except BaseException as error:
+        raise _translate_sdk_error(error, "probe approved camera") from error
+    if handle is None:
+        raise CameraNotConnectedError("approved camera could not be opened")
+    try:
+        identity = _identity_from_handle(device, handle)
+        if (
+            identity.serial != APPROVED_CAMERA_SERIAL
+            or identity.model != APPROVED_CAMERA_MODEL
+            or identity.display_name != APPROVED_CAMERA_MODEL
+        ):
+            raise CameraNotConnectedError(
+                "opened camera identity does not match the approved camera"
+            )
+        return identity
+    finally:
+        handle.Close()
+
+
 class ToupTekCamera:
     """Stable ToupTek selection with one synchronized hardware handle."""
 
@@ -133,6 +187,7 @@ class ToupTekCamera:
         structural_reopen_settle_s: float = 0.5,
         trigger_timeout_multiplier: float = 1.02,
         trigger_timeout_overhead_s: float = 8.0,
+        post_acquire_start_hold_s: float = 0.0,
     ) -> None:
         if (
             isinstance(trigger_recovery_s, bool)
@@ -152,19 +207,32 @@ class ToupTekCamera:
             raise CameraInvalidValueError(
                 "structural_reopen_settle_s must be a finite non-negative number"
             )
-        for name, value in (
-            ("trigger_timeout_multiplier", trigger_timeout_multiplier),
-            ("trigger_timeout_overhead_s", trigger_timeout_overhead_s),
+        for name, value, allow_zero in (
+            ("trigger_timeout_multiplier", trigger_timeout_multiplier, False),
+            ("trigger_timeout_overhead_s", trigger_timeout_overhead_s, True),
         ):
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
                 or not math.isfinite(value)
-                or value <= 0
+                or value < 0
+                or (not allow_zero and value == 0)
             ):
                 raise CameraInvalidValueError(
-                    f"{name} must be a finite positive number"
+                    f"{name} must be a finite "
+                    + ("non-negative" if allow_zero else "positive")
+                    + " number"
                 )
+        if (
+            isinstance(post_acquire_start_hold_s, bool)
+            or not isinstance(post_acquire_start_hold_s, (int, float))
+            or not math.isfinite(post_acquire_start_hold_s)
+            or not 0 <= post_acquire_start_hold_s <= 60
+        ):
+            raise CameraInvalidValueError(
+                "post_acquire_start_hold_s must be a finite number "
+                "from 0 through 60 seconds"
+            )
         self._sdk = sdk if sdk is not None else load_default_toupcam_module()
         self._monotonic = monotonic
         self._sleeper = sleeper
@@ -172,16 +240,9 @@ class ToupTekCamera:
         self._structural_reopen_settle_s = float(structural_reopen_settle_s)
         self._trigger_timeout_multiplier = float(trigger_timeout_multiplier)
         self._trigger_timeout_overhead_s = float(trigger_timeout_overhead_s)
+        self._post_acquire_start_hold_s = float(post_acquire_start_hold_s)
         self._last_trigger_completed_monotonic: float | None = None
-        identities = enumerate_cameras(self._sdk)
-        if serial is None:
-            if len(identities) != 1:
-                raise CameraInvalidValueError("serial is required unless exactly one camera is attached")
-            self.identity = identities[0]
-        else:
-            self.identity = next((item for item in identities if item.serial == serial), None)
-            if self.identity is None:
-                raise CameraNotConnectedError(f"camera with serial {serial!r} is not attached")
+        self.identity = _probe_approved_camera(self._sdk, serial)
         self.serial = self.identity.serial
         self._handle: Any | None = None
         self._state_lock = RLock()
@@ -345,6 +406,8 @@ class ToupTekCamera:
                         "exposure was cancelled before native acquisition started"
                     )
                 generation = claim_state["generation"]
+                if self._post_acquire_start_hold_s > 0:
+                    self._sleeper(self._post_acquire_start_hold_s)
                 operation_errors: list[CameraError] = []
                 try:
                     with self._condition:

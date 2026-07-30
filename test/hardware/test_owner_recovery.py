@@ -16,7 +16,7 @@ from touptek4040.camera_contract import ReadoutMode, Roi
 from touptek4040.camera_owner import OwnerStartupSpec
 from touptek4040.camera_proxy import CameraOwnerProxy
 from touptek4040.config import OwnerConfig
-from touptek4040.errors import CameraError
+from touptek4040.errors import CameraTimeoutError
 from touptek4040.shared_frames import SharedFrameRegistry
 from touptek4040.toupcam_loader import load_toupcam_module
 
@@ -41,7 +41,7 @@ def test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect
     tmp_path,
     hardware_evidence,
 ) -> None:
-    """Kill only the active owner and restore the exact pre-test snapshot."""
+    """Let the configured deadline kill one post-start held acquisition."""
 
     sdk = load_toupcam_module(Path(__file__).resolve().parents[2])
     identity = open_verified_target(sdk, hardware_evidence)
@@ -57,12 +57,15 @@ def test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect
             startup_timeout_s=10.0,
             connect_timeout_s=20.0,
             command_timeout_s=5.0,
-            exposure_overhead_s=2.0,
+            exposure_overhead_s=0.3,
             exposure_multiplier=1.02,
             abort_timeout_s=2.0,
             disconnect_timeout_s=10.0,
         ),
-        startup_spec=OwnerStartupSpec(serial=EXPECTED_SERIAL),
+        startup_spec=OwnerStartupSpec(
+            serial=EXPECTED_SERIAL,
+            backend_arguments={"post_acquire_start_hold_s": 2.0},
+        ),
     )
     killed_pid = None
     original_generation = proxy.owner_generation
@@ -78,20 +81,24 @@ def test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect
                 ReadoutMode.RAW12,
             )
             deadline = time.monotonic() + 2.0
-            while not proxy.exposing and time.monotonic() < deadline:
+            while (
+                proxy._supervisor.last_acquire_start_ack is None
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.002)
+            ack = proxy._supervisor.last_acquire_start_ack
+            assert ack is not None
+            assert ack[0] == original_generation
+            assert ack[2] == pytest.approx(1.0)
+            assert proxy._supervisor.acquire_start_ack_count == 1
             assert proxy.exposing is True
 
-            session = proxy._supervisor._session
-            assert session is not None and session.process.pid == killed_pid
-            session.process.terminate()
-            session.process.join(5.0)
-            assert session.process.is_alive() is False
-            with pytest.raises(CameraError):
-                pending.result(timeout=8.0)
+            with pytest.raises(CameraTimeoutError):
+                pending.result(timeout=5.0)
 
         assert proxy.connected is False
         assert proxy.owner_generation != original_generation
+        assert proxy.last_terminated_pid == killed_pid
         replacement_session, diagnostics = proxy._supervisor.request(
             "diagnostics", {}, require_connected=False
         )
@@ -115,6 +122,8 @@ def test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect
             terminated_pid_alive=not SharedFrameRegistry._pid_is_dead(killed_pid),
             original_generation=original_generation,
             replacement_generation=proxy.owner_generation,
+            native_start_acknowledged=True,
+            acquire_operation_count=proxy._supervisor.acquire_start_ack_count,
             exposure_retried=False,
             frame_published=False,
             explicit_reconnect_required=True,

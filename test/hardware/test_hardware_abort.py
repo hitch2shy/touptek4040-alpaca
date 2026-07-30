@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from test.hardware.conftest import abort_readiness_timeout_s
 from touptek4040.camera_contract import ReadoutMode, Roi
 from touptek4040.errors import CameraOperationCancelledError
 
@@ -22,7 +23,8 @@ def test_abort_discards_the_pending_real_frame(
             1,
             ReadoutMode.RAW12,
         )
-        deadline = time.monotonic() + 2.0
+        timeout_s = abort_readiness_timeout_s(real_camera)
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             with real_camera._state_lock:
                 if real_camera._acquiring and real_camera._camera_started:
@@ -34,7 +36,7 @@ def test_abort_discards_the_pending_real_frame(
 
         real_camera.abort()
         with pytest.raises(CameraOperationCancelledError):
-            pending.result(timeout=3.0)
+            pending.result(timeout=timeout_s)
 
     hardware_evidence.record(
         "abort",

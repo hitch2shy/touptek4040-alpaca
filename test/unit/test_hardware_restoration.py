@@ -184,7 +184,6 @@ def test_hardware_runner_propagates_summary_failure() -> None:
 def test_abort_readiness_timeout_includes_configured_reopen_and_native_budget() -> None:
     camera = SimpleNamespace(
         _structural_reopen_settle_s=0.5,
-        _trigger_timeout_overhead_s=8.0,
     )
 
-    assert abort_readiness_timeout_s(camera) == 8.5
+    assert abort_readiness_timeout_s(camera) == 5.5

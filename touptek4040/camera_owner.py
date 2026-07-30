@@ -105,6 +105,7 @@ def _create_toupcam_backend(
     trigger_timeout_multiplier: float = 1.02,
     trigger_timeout_overhead_s: float = 8.0,
     structural_reopen_settle_s: float = 0.5,
+    post_acquire_start_hold_s: float = 0.0,
     **_kwargs: object,
 ) -> OwnerBackend:
     """Import the SDK adapter only after this spawned process has started."""
@@ -117,6 +118,7 @@ def _create_toupcam_backend(
         trigger_timeout_multiplier=trigger_timeout_multiplier,
         trigger_timeout_overhead_s=trigger_timeout_overhead_s,
         structural_reopen_settle_s=structural_reopen_settle_s,
+        post_acquire_start_hold_s=post_acquire_start_hold_s,
     )
     camera.connect()
     return camera

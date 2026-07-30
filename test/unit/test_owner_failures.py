@@ -323,7 +323,7 @@ def test_concurrent_abort_and_acquire_failure_replace_one_generation_only(
                 startup_timeout_s=0.05,
                 connect_timeout_s=0.05,
                 command_timeout_s=0.5,
-                exposure_overhead_s=0.2,
+                exposure_overhead_s=0.251,
                 exposure_multiplier=1.0,
                 abort_timeout_s=0.05,
                 disconnect_timeout_s=0.05,

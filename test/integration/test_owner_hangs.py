@@ -256,10 +256,10 @@ class _FaultProcessFactory:
 
 def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
     config = OwnerConfig(
-        startup_timeout_s=0.6,
+        startup_timeout_s=1.0,
         connect_timeout_s=0.12,
         command_timeout_s=0.12,
-        exposure_overhead_s=0.12,
+        exposure_overhead_s=0.251,
         exposure_multiplier=1.0,
         abort_timeout_s=0.12,
         disconnect_timeout_s=0.12,

@@ -212,6 +212,45 @@ def test_trigger_timeout_includes_sdk_exposure_margin(camera: ToupTekCamera) -> 
     assert trigger_call == ("TriggerSyncV4", 8255, 0, -1)
 
 
+def test_bounded_post_start_hold_runs_after_native_claim_before_trigger() -> None:
+    sdk = FakeSdk()
+    sleeps: list[float] = []
+    camera = ToupTekCamera(
+        "TP241025143218C92B01151AEC40CB7",
+        sdk=sdk,
+        sleeper=sleeps.append,
+        post_acquire_start_hold_s=0.75,
+    )
+    camera.connect()
+
+    class RecordingControl:
+        def commit_start(self, claim):
+            claim()
+            assert camera._acquiring is True
+            assert not any(call[0] == "TriggerSyncV4" for call in sdk.calls)
+            return True
+
+    camera.acquire(
+        0.01,
+        Roi(0, 0, 16, 16),
+        1,
+        ReadoutMode.RAW12,
+        RecordingControl(),
+    )
+
+    assert sleeps == [0.75]
+
+
+@pytest.mark.parametrize("value", [True, -1, 60.001, float("inf")])
+def test_post_start_hold_rejects_unbounded_values(value: object) -> None:
+    with pytest.raises(CameraInvalidValueError, match="post_acquire_start_hold_s"):
+        ToupTekCamera(
+            "TP241025143218C92B01151AEC40CB7",
+            sdk=FakeSdk(),
+            post_acquire_start_hold_s=value,  # type: ignore[arg-type]
+        )
+
+
 def test_trigger_timeout_accepts_late_valid_frame_below_owner_deadline(
     camera: ToupTekCamera,
 ) -> None:

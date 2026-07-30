@@ -7,4 +7,4 @@ collecting ... collected 1 item
 
 test\hardware\test_owner_recovery.py::test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect PASSED [100%]
 
-============================== 1 passed in 6.00s ==============================
+============================== 1 passed in 8.07s ==============================

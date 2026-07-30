@@ -27,7 +27,7 @@ class FakeModel:
 
 @dataclass
 class FakeDevice:
-    displayname: str = "Camera at USB path 1-2"
+    displayname: str = "sMAX16AM-U3-CL-GPS"
     id: str = "usb:1-2"
     model: FakeModel = field(default_factory=FakeModel)
 
@@ -76,20 +76,34 @@ class FakeHandle:
 
 
 class FakeToupcam:
-    def __init__(self, pixel_size_error: str | None = None) -> None:
+    def __init__(
+        self,
+        pixel_size_error: str | None = None,
+        devices: list[FakeDevice] | None = None,
+    ) -> None:
         self.handle = FakeHandle(pixel_size_error)
+        self.devices = devices if devices is not None else [FakeDevice()]
+        self.open_calls: list[str] = []
 
     def EnumV2(self) -> list[FakeDevice]:
-        return [FakeDevice()]
+        return self.devices
 
     def Open(self, device_id: str) -> FakeHandle:
-        assert device_id == "usb:1-2"
+        self.open_calls.append(device_id)
+        assert device_id in {
+            "usb:1-2",
+            "sn:TP241025143218C92B01151AEC40CB7",
+        }
         return self.handle
 
 
 class FakeSdk:
-    def __init__(self, pixel_size_error: str | None = None) -> None:
-        self.Toupcam = FakeToupcam(pixel_size_error)
+    def __init__(
+        self,
+        pixel_size_error: str | None = None,
+        devices: list[FakeDevice] | None = None,
+    ) -> None:
+        self.Toupcam = FakeToupcam(pixel_size_error, devices)
 
 
 def test_identity_uses_serial_not_usb_path() -> None:
@@ -115,6 +129,32 @@ def test_camera_discovers_static_capabilities_and_closes_probe() -> None:
     assert camera.capabilities.pixel_size_x == 9.0
     assert camera.capabilities.pixel_size_y == 9.0
     assert fake_sdk.Toupcam.handle.closed
+    assert fake_sdk.Toupcam.open_calls == [
+        "sn:TP241025143218C92B01151AEC40CB7"
+    ]
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        [FakeDevice(), FakeDevice(id="usb:other")],
+        [FakeDevice(displayname="WRONG")],
+        [FakeDevice(model=FakeModel(name="WRONG"))],
+        [FakeDevice(id="")],
+    ],
+)
+def test_production_constructor_rejects_raw_gate_before_any_open(
+    devices: list[FakeDevice],
+) -> None:
+    fake_sdk = FakeSdk(devices=devices)
+
+    with pytest.raises(Exception):
+        ToupTekCamera(
+            "TP241025143218C92B01151AEC40CB7",
+            sdk=fake_sdk,
+        )
+
+    assert fake_sdk.Toupcam.open_calls == []
 
 
 def test_identity_uses_model_pixel_size_when_sdk_wrapper_rejects_ctypes_value() -> None:

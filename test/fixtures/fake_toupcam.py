@@ -58,7 +58,7 @@ class FakeModel:
 
 @dataclass
 class FakeDevice:
-    displayname: str = "Camera at USB path 1-2"
+    displayname: str = "sMAX16AM-U3-CL-GPS"
     id: str = "usb:1-2"
     model: FakeModel = field(default_factory=FakeModel)
 

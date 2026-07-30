@@ -85,6 +85,11 @@ owner.structural_reopen_settle_s
   的 USB 稳定等待时间，单位为秒，默认 0.5。必须是大于或等于 0 的有限
   数值；真实相机建议保留默认值。
 
+owner.exposure_overhead_s
+  owner 曝光截止时间的固定余量，默认 10 秒，最小 0.251 秒。原生 SDK
+  使用相同曝光倍率，并减去 0.251 秒；其中 0.250 秒是固定 owner
+  响应/终止余量，0.001 秒用于覆盖 SDK 毫秒超时的向上取整。
+
 web.enabled
   true 启用网页控制台。
 

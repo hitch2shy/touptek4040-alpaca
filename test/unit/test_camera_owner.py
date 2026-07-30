@@ -539,6 +539,7 @@ def test_production_backend_registers_opened_exact_serial_before_identity_accept
                 "trigger_timeout_multiplier": 1.02,
                 "trigger_timeout_overhead_s": 8.0,
                 "structural_reopen_settle_s": 0.5,
+                "post_acquire_start_hold_s": 0.0,
             }
             super().__init__(serial)
             self.identity = type("Identity", (), {"model": model})()

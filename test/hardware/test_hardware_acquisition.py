@@ -66,6 +66,7 @@ def test_real_trigger_can_be_aborted_without_publishing_a_frame(
     real_camera: ToupTekCamera,
 ) -> None:
     with ThreadPoolExecutor(max_workers=1) as pool:
+        timeout_s = abort_readiness_timeout_s(real_camera)
         pending = pool.submit(
             real_camera.acquire,
             1.0,
@@ -73,7 +74,7 @@ def test_real_trigger_can_be_aborted_without_publishing_a_frame(
             1,
             ReadoutMode.RAW12,
         )
-        deadline = time.monotonic() + abort_readiness_timeout_s(real_camera)
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             with real_camera._state_lock:
                 if real_camera._acquiring and real_camera._camera_started:
@@ -83,4 +84,4 @@ def test_real_trigger_can_be_aborted_without_publishing_a_frame(
             pytest.fail("camera did not enter its triggerable running state")
         real_camera.abort()
         with pytest.raises(CameraOperationCancelledError):
-            pending.result(1)
+            pending.result(timeout_s)

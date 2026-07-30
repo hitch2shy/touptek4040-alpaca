@@ -23,7 +23,7 @@ from .camera_contract import (
     Roi,
 )
 from .camera_owner import OwnerStartupSpec, camera_owner_main
-from .config import OwnerConfig
+from .config import MIN_EXPOSURE_OVERHEAD_S, OwnerConfig
 from .errors import (
     CameraBusyError,
     CameraError,
@@ -52,6 +52,38 @@ from .shared_frames import SharedFrameError, SharedFrameRegistry
 
 
 _PROCESS_TERMINATION_ALLOWANCE_S = 0.25
+
+
+def _configured_startup_spec(
+    startup_spec: OwnerStartupSpec | None,
+    serial: str | None,
+    config: OwnerConfig,
+) -> OwnerStartupSpec:
+    spec = startup_spec or OwnerStartupSpec(serial=serial)
+    if (
+        spec.backend_module != "touptek4040.camera_owner"
+        or spec.backend_factory != "_create_toupcam_backend"
+    ):
+        return spec
+    arguments = dict(spec.backend_arguments)
+    arguments.update(
+        {
+            "trigger_timeout_multiplier": config.exposure_multiplier,
+            "trigger_timeout_overhead_s": (
+                config.exposure_overhead_s - MIN_EXPOSURE_OVERHEAD_S
+            ),
+            "structural_reopen_settle_s": config.structural_reopen_settle_s,
+        }
+    )
+    return OwnerStartupSpec(
+        serial=spec.serial,
+        backend_module=spec.backend_module,
+        backend_factory=spec.backend_factory,
+        backend_arguments=arguments,
+        backend_validator=spec.backend_validator,
+    )
+
+
 @dataclass(slots=True)
 class OwnerProcessSession:
     """The exact process and private endpoints belonging to one generation."""
@@ -230,6 +262,8 @@ class OwnerSupervisor:
         self._last_exit_code: int | None = None
         self._last_cleanup_error: CameraError | None = None
         self._last_termination_error: CameraOwnerTerminationError | None = None
+        self._last_acquire_start_ack: tuple[int, int, float] | None = None
+        self._acquire_start_ack_count = 0
         with self._lifecycle_lock:
             self._session = self._start_idle_owner_locked(attempts=2)
 
@@ -267,6 +301,16 @@ class OwnerSupervisor:
     @property
     def last_termination_error(self) -> CameraOwnerTerminationError | None:
         return self._last_termination_error
+
+    @property
+    def last_acquire_start_ack(self) -> tuple[int, int, float] | None:
+        with self._state_lock:
+            return self._last_acquire_start_ack
+
+    @property
+    def acquire_start_ack_count(self) -> int:
+        with self._state_lock:
+            return self._acquire_start_ack_count
 
     def deadline_for(
         self,
@@ -740,6 +784,13 @@ class OwnerSupervisor:
                     "camera owner returned an invalid acquire start "
                     f"acknowledgement: {error}"
                 ) from error
+            with self._state_lock:
+                self._last_acquire_start_ack = (
+                    session.generation,
+                    request.request_id,
+                    acknowledgement.actual_duration_s,
+                )
+                self._acquire_start_ack_count += 1
             final_payload = self._receive_until(
                 session,
                 time.monotonic()
@@ -1171,16 +1222,7 @@ class CameraOwnerProxy:
             self._supervisor = supervisor
             return
         config = owner_config or OwnerConfig()
-        spec = startup_spec or OwnerStartupSpec(
-            serial=serial,
-            backend_arguments={
-                "trigger_timeout_multiplier": config.exposure_multiplier,
-                # Leave a deterministic 20% owner-response / termination
-                # margin while preserving the configured exposure formula.
-                "trigger_timeout_overhead_s": config.exposure_overhead_s * 0.8,
-                "structural_reopen_settle_s": config.structural_reopen_settle_s,
-            },
-        )
+        spec = _configured_startup_spec(startup_spec, serial, config)
         base = (
             Path(runtime_directory)
             if runtime_directory is not None

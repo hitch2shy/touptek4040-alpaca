@@ -24,6 +24,19 @@ REQUIRED_ROOT = {
     "BUILD-INFO.txt",
     "_runtime",
 }
+MUTABLE_RUNTIME_ROOTS = {"logs"}
+
+
+def _immutable_public_files(root: Path) -> set[str]:
+    files: set[str] = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0].casefold() in MUTABLE_RUNTIME_ROOTS:
+            continue
+        files.add(relative.as_posix())
+    return files
 
 
 def test_distribution_contains_public_contract() -> None:
@@ -71,11 +84,7 @@ def test_build_identity_is_structured_and_labels_temporary_dirty_build() -> None
 
 def test_zip_matches_the_public_distribution_tree() -> None:
     assert ZIP_PATH.is_file()
-    expected = {
-        path.relative_to(DIST_DIR).as_posix()
-        for path in DIST_DIR.rglob("*")
-        if path.is_file()
-    }
+    expected = _immutable_public_files(DIST_DIR)
     with zipfile.ZipFile(ZIP_PATH) as archive:
         actual = {
             Path(name).relative_to("ToupTek4040-Test").as_posix()
@@ -83,3 +92,13 @@ def test_zip_matches_the_public_distribution_tree() -> None:
             if not name.endswith("/")
         }
     assert actual == expected
+
+
+def test_runtime_logs_are_not_part_of_the_immutable_package_contract(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "runtime.log").write_text("", encoding="utf-8")
+    (tmp_path / "asset.txt").write_text("asset", encoding="utf-8")
+
+    assert _immutable_public_files(tmp_path) == {"asset.txt"}

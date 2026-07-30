@@ -25,14 +25,17 @@ EXPECTED_MODEL = "sMAX16AM-U3-CL-GPS"
 EXPECTED_SERIAL = "TP241025143218C92B01151AEC40CB7"
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "results" / "hardware"
 _EXPECTED_IDLE_HRESULTS = {0x8000FFFF}
+_NATIVE_OPEN_CONFIG_START_ALLOWANCE_S = 2.0
+_ABORT_CONTROL_COMPLETION_ALLOWANCE_S = 3.0
 
 
 def abort_readiness_timeout_s(camera: ToupTekCamera | Any) -> float:
-    """Bound readiness by the configured reopen delay plus native I/O budget."""
+    """Bound reopen, native setup/start, and Abort control completion."""
 
     return (
         float(camera._structural_reopen_settle_s)
-        + float(camera._trigger_timeout_overhead_s)
+        + _NATIVE_OPEN_CONFIG_START_ALLOWANCE_S
+        + _ABORT_CONTROL_COMPLETION_ALLOWANCE_S
     )
 
 

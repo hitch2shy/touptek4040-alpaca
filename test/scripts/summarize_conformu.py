@@ -355,12 +355,18 @@ def _write_markdown(summary: dict[str, Any], results: Path) -> None:
         f"- Protocol final counts: `{summary['protocol']}`",
         "- Allowed Protocol issue groups: "
         f"`{summary['allowed_protocol_issue_groups']}`",
+        "- The 34 Protocol issues are exactly two common-parameter casing "
+        "probes on each of 17 PUT endpoints; Alpaca parameter names are "
+        "case-insensitive, so accepting them is required.",
         f"- Camera V4 counts: `{summary['camera_v4']}`",
         f"- Allowed Camera V4 issue groups: `{summary['allowed_issue_groups']}`",
         "- ImageArrayVariant is a COM-only property; an Alpaca camera must report "
         "PropertyNotImplemented.",
         "- PercentCompleted is required to report InvalidOperation while the camera "
         "state is inappropriate (idle in this run).",
+        "- Idle StopExposure is a successful no-op under the Camera contract; "
+        "CanStopExposure=False applies when an exposure is active because this "
+        "camera cannot return a valid early-read image.",
         "- References: https://ascom-standards.org/api/ and "
         "https://ascom-standards.org/newdocs/camera.html",
         f"- Unexpected errors: `{summary['unexpected_errors']}`",
