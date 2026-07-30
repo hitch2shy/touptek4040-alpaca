@@ -1,6 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$DistDir
+    [string]$DistDir,
+    [string]$ResultsDir = "test\results\temporary-package",
+    [string]$Designation = "TEMPORARY TEST BUILD",
+    [switch]$VerifyFormalContract,
+    [switch]$SkipRecovery
 )
 
 $ErrorActionPreference = "Stop"
@@ -152,10 +156,12 @@ foreach ($required in @($executable, $python)) {
     }
 }
 
-$resultsDirectory = [System.IO.Path]::Combine(
-    $repositoryRoot,
-    "test\results\temporary-package"
+$resultsDirectory = [System.IO.Path]::GetFullPath(
+    [System.IO.Path]::Combine($repositoryRoot, $ResultsDir)
 )
+if (-not $resultsDirectory.StartsWith($repositoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Results must remain inside the repository: $resultsDirectory"
+}
 [System.IO.Directory]::CreateDirectory($resultsDirectory) | Out-Null
 $logDirectory = [System.IO.Path]::Combine($resultsDirectory, "hardware-logs")
 [System.IO.Directory]::CreateDirectory($logDirectory) | Out-Null
@@ -165,7 +171,7 @@ $resultPath = [System.IO.Path]::Combine($resultsDirectory, "hardware.json")
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 
 $record = [ordered]@{
-    designation = "TEMPORARY TEST BUILD"
+    designation = $Designation
     model = "sMAX16AM-U3-CL-GPS"
     serial = "TP241025143218C92B01151AEC40CB7"
     process_id = $null
@@ -173,6 +179,12 @@ $record = [ordered]@{
     connected = $false
     exposure_requested = $false
     image = $null
+    image_bytes = $false
+    image_json = $false
+    png = $false
+    fits = $false
+    abort = $false
+    heater = $null
     disconnected = $false
     exact_process_stopped = $false
     recovery_before = $null
@@ -182,11 +194,13 @@ $record = [ordered]@{
 $server = $null
 
 try {
-    $record.recovery_before = Invoke-BoundedRecovery `
-        -Label "before" `
-        -Python $python `
-        -Repository $repositoryRoot `
-        -Results $resultsDirectory
+    if (-not $SkipRecovery) {
+        $record.recovery_before = Invoke-BoundedRecovery `
+            -Label "before" `
+            -Python $python `
+            -Repository $repositoryRoot `
+            -Results $resultsDirectory
+    }
 
     $port = Get-FreeTcpPort
     $discoveryPort = Get-FreeTcpPort
@@ -270,6 +284,77 @@ try {
         generation = [int]$state.generation
     }
 
+    if ($VerifyFormalContract) {
+        $generation = [int]$state.generation
+        $png = Invoke-WebRequest -UseBasicParsing -Uri (
+            "$baseUrl/web/v1/viewport.png?generation=$generation"
+        ) -TimeoutSec 10
+        $fits = Invoke-WebRequest -UseBasicParsing -Uri (
+            "$baseUrl/web/v1/image.fits?generation=$generation"
+        ) -TimeoutSec 10
+        if (-not ($png.Headers["Content-Type"] -like "image/png*")) {
+            throw "Packaged PNG response had unexpected content type."
+        }
+        if (-not ($fits.Headers["Content-Type"] -like "image/fits*")) {
+            throw "Packaged FITS response had unexpected content type."
+        }
+        $record.png = $true
+        $record.fits = $true
+
+        $imageUrl = "$baseUrl/api/v1/camera/0/imagearray?ClientID=1&ClientTransactionID=1"
+        $jsonImage = Invoke-RestMethod -Uri $imageUrl -Method Get -TimeoutSec 10
+        if ($jsonImage.ErrorNumber -ne 0 -or $null -eq $jsonImage.Value) {
+            throw "Packaged JSON ImageArray failed."
+        }
+        $record.image_json = $true
+        $binaryImage = Invoke-WebRequest -UseBasicParsing -Uri $imageUrl `
+            -Headers @{ Accept = "application/imagebytes" } -TimeoutSec 10
+        if (-not ($binaryImage.Headers["Content-Type"] -like "application/imagebytes*")) {
+            throw "Packaged ImageBytes response had unexpected content type."
+        }
+        $record.image_bytes = $true
+
+        $heaterState = Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state"
+        if (-not $heaterState.heaterSupported) {
+            throw "Approved camera did not report Web heater support."
+        }
+        $initialHeat = [int]$heaterState.heaterLevel
+        $maximumHeat = [int]$heaterState.heaterMaxLevel
+        $alternateHeat = if ($initialHeat -eq 0) { 1 } else { 0 }
+        if ($alternateHeat -gt $maximumHeat) { throw "No valid alternate heater level." }
+        Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/heater" -Body @{
+            heaterLevel = $alternateHeat
+        } | Out-Null
+        $alternateState = Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state"
+        if ([int]$alternateState.heaterLevel -ne $alternateHeat) {
+            throw "Packaged Web heater alternate level was not confirmed."
+        }
+        Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/heater" -Body @{
+            heaterLevel = $initialHeat
+        } | Out-Null
+        $restoredHeat = [int](Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state").heaterLevel
+        if ($restoredHeat -ne $initialHeat) {
+            throw "Packaged Web heater did not restore its exact initial level."
+        }
+        $record.heater = [ordered]@{
+            initial = $initialHeat
+            maximum = $maximumHeat
+            alternate = $alternateHeat
+            restored = $restoredHeat
+        }
+
+        $abortBody = "Duration=1&Light=true&ClientID=1&ClientTransactionID=2"
+        Invoke-RestMethod -Uri "$baseUrl/api/v1/camera/0/startexposure" `
+            -Method Put -ContentType "application/x-www-form-urlencoded" `
+            -Body $abortBody -TimeoutSec 10 | Out-Null
+        $abortBody = "ClientID=1&ClientTransactionID=3"
+        $abortResult = Invoke-RestMethod -Uri "$baseUrl/api/v1/camera/0/abortexposure" `
+            -Method Put -ContentType "application/x-www-form-urlencoded" `
+            -Body $abortBody -TimeoutSec 10
+        if ($abortResult.ErrorNumber -ne 0) { throw "Packaged AbortExposure failed." }
+        $record.abort = $true
+    }
+
     Invoke-WebJson `
         -BaseUrl $baseUrl `
         -Path "/web/v1/connection" `
@@ -293,15 +378,17 @@ finally {
     $record.exact_process_stopped = (
         $null -eq $server -or $server.HasExited
     )
-    try {
-        $record.recovery_after = Invoke-BoundedRecovery `
-            -Label "after" `
-            -Python $python `
-            -Repository $repositoryRoot `
-            -Results $resultsDirectory
-    }
-    catch {
-        $record.errors += $_.Exception.Message
+    if (-not $SkipRecovery) {
+        try {
+            $record.recovery_after = Invoke-BoundedRecovery `
+                -Label "after" `
+                -Python $python `
+                -Repository $repositoryRoot `
+                -Results $resultsDirectory
+        }
+        catch {
+            $record.errors += $_.Exception.Message
+        }
     }
     [System.IO.File]::WriteAllText(
         $resultPath,
@@ -315,10 +402,18 @@ if (
     -not $record.connected -or
     -not $record.exposure_requested -or
     $null -eq $record.image -or
+    ($VerifyFormalContract -and (
+        -not $record.image_bytes -or -not $record.image_json -or
+        -not $record.png -or -not $record.fits -or -not $record.abort -or
+        $null -eq $record.heater -or
+        $record.heater.restored -ne $record.heater.initial
+    )) -or
     -not $record.disconnected -or
     -not $record.exact_process_stopped -or
-    -not $record.recovery_after.restored -or
-    -not $record.recovery_after.closed
+    (-not $SkipRecovery -and (
+        -not $record.recovery_after.restored -or
+        -not $record.recovery_after.closed
+    ))
 ) {
     throw "Packaged hardware verification failed. See $resultPath"
 }

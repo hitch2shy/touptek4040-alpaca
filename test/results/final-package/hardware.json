@@ -1,0 +1,34 @@
+{
+    "designation":  "FORMAL RELEASE",
+    "model":  "sMAX16AM-U3-CL-GPS",
+    "serial":  "TP241025143218C92B01151AEC40CB7",
+    "process_id":  15060,
+    "port":  52724,
+    "connected":  true,
+    "exposure_requested":  true,
+    "image":  {
+                  "width":  16,
+                  "height":  16,
+                  "readout_mode":  "RAW 12-bit",
+                  "max_adu":  4095,
+                  "generation":  1
+              },
+    "image_bytes":  true,
+    "image_json":  true,
+    "png":  true,
+    "fits":  true,
+    "abort":  true,
+    "heater":  {
+                   "initial":  4,
+                   "maximum":  4,
+                   "alternate":  0,
+                   "restored":  4
+               },
+    "disconnected":  true,
+    "exact_process_stopped":  true,
+    "recovery_before":  null,
+    "recovery_after":  null,
+    "errors":  [
+
+               ]
+}
