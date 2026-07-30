@@ -187,12 +187,10 @@ def test_packaged_discovery_port_is_probed_with_udp(
     assert calls == [(socket.AF_INET, socket.SOCK_DGRAM)]
 
 
-def test_packaged_discovery_port_skips_udp_port_that_is_tcp_free() -> None:
+def test_packaged_discovery_port_skips_occupied_udp_port() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied_udp:
         occupied_udp.bind(("", 0))
         occupied_port = int(occupied_udp.getsockname()[1])
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_probe:
-            tcp_probe.bind(("127.0.0.1", occupied_port))
         selected = _free_udp_port()
         assert selected != occupied_port
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as verification:

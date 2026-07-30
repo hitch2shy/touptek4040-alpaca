@@ -3,13 +3,13 @@
     "protocol": {
       "command": "alpacaprotocol",
       "port": 11113,
-      "started_utc": "2026-07-30T07:07:06.8043308Z",
+      "started_utc": "2026-07-30T08:39:50.6971090Z",
       "exit_code": 34
     },
     "camera-v4": {
       "command": "conformance",
       "port": 11114,
-      "started_utc": "2026-07-30T07:07:25.1248595Z",
+      "started_utc": "2026-07-30T08:40:11.6329928Z",
       "exit_code": 18
     }
   }

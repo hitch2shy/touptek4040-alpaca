@@ -139,7 +139,8 @@ raise SystemExit(0 if record["passed"] else 1)
     Remove-Item -LiteralPath @(
         (Join-Path $results "run-metadata.json"),
         (Join-Path $results "summary.json"),
-        (Join-Path $results "summary.md")
+        (Join-Path $results "summary.md"),
+        (Join-Path $results "server-logs\touptek4040.log")
     ) -Force -ErrorAction SilentlyContinue
     Invoke-ConformProfile "protocol" "alpacaprotocol" $Port
     Invoke-ConformProfile "camera-v4" "conformance" ($Port + 1)

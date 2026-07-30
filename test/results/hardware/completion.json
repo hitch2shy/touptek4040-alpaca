@@ -1,23 +1,23 @@
 {
-  "schema_version": 2,
-  "run_id": "24132f453ea15c2391a8567bdb8ed7bb",
-  "completed_utc": "2026-07-30T07:06:37.8513632Z",
-  "passed": true,
-  "stages": [
-    "preflight",
-    "first-stage",
-    "matrix",
-    "owner-recovery"
-  ],
-  "artifacts": {
-    "cases.jsonl": "55c1d7122ec70078db0ef65f1df1e21878cdf24a059505e5f1a50aa86602d4f0",
-    "preflight.json": "0e80fb173610d66ef70db86e09b64eea07df32ab123372a826410f6ddad62bf0",
-    "pytest-first-stage.txt": "574c64d2aa009a8c045867908e4440e8b56ffeaf9266be1471b41dcef3826cb3",
-    "pytest-hardware.txt": "ac7db45bf5a524ccc96ce63052be2eb2711426fe36e526cc5aa7733379cce9eb",
-    "pytest-owner-recovery.txt": "827b05e321eb64a370b02f1a14dc088f3113a47dd482b2073c7880a3dd76b4c0",
-    "first-stage-completion.json": "e6902be6d7ad143213e59997aeb0f044c39e68ad427ef5dd81fbcb6b4b6be031",
-    "matrix-completion.json": "f7d1ce1de3f1ed91506ea4fcfc3eb7f591060e90b6bfaec1c6a0ac8f87241550",
-    "owner-recovery-completion.json": "2a3003f50e576aa36a8a16b31db75c710363647106b17ffdc4b6b7014b60d3c0",
-    "run-metadata.json": "f3add30569848292f6892ab96929e6034f60c6221bd4095079214c730f5ff723"
-  }
+    "schema_version":  2,
+    "run_id":  "23e8af4d26fc2ba8507a5e989a6437f1",
+    "completed_utc":  "2026-07-30T08:32:55.5803989Z",
+    "passed":  true,
+    "stages":  [
+                   "preflight",
+                   "first-stage",
+                   "matrix",
+                   "owner-recovery"
+               ],
+    "artifacts":  {
+                      "cases.jsonl":  "03d68717a17c8410a4881b7b0764d94c706e746c842bf8270d1e20d11801333a",
+                      "preflight.json":  "6baf3dfe848ecba4d6ef53fcbb172bb5e096ecad27788774964ea97f3c76541b",
+                      "pytest-first-stage.txt":  "dd9522566c74ef7cd6a3be0330f629dac56a18326b018790013f3fc874c4e827",
+                      "pytest-hardware.txt":  "80d86baa4dd2e4ce53aa3aab0802db537c5b7c9572376daef8507d4e81d320e4",
+                      "pytest-owner-recovery.txt":  "d6e88f94d20ecc0b11c41d1a3f48eb8ccb8884ad2c36bd7012589aa083cb5e42",
+                      "first-stage-completion.json":  "9f831c241105a7e51289ba28575de35b81c8fedeacef8c59d2178e2aaf5bdacc",
+                      "matrix-completion.json":  "6efee11f2efb4c871190969bad101afc4b70ddf01e0ce03ba752dd5d76d06d3c",
+                      "owner-recovery-completion.json":  "d9567640b0568b604ec6a7fd25c1ec96776f510e4945c203f9440149fbaf4bca",
+                      "run-metadata.json":  "c3a1d9bd46feeed18e16ebaf6c456ac41529d215bf6d8954769c30070e2cd9b9"
+                  }
 }

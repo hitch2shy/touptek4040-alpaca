@@ -2,8 +2,8 @@
     "designation":  "FORMAL RELEASE",
     "model":  "sMAX16AM-U3-CL-GPS",
     "serial":  "TP241025143218C92B01151AEC40CB7",
-    "process_id":  15060,
-    "port":  52724,
+    "process_id":  28136,
+    "port":  65462,
     "connected":  true,
     "exposure_requested":  true,
     "image":  {
@@ -22,8 +22,26 @@
                    "initial":  4,
                    "maximum":  4,
                    "alternate":  0,
+                   "alternate_left_active":  true,
+                   "manual_restore_before_disconnect":  false,
+                   "restored_by_disconnect":  true,
+                   "reconnect_confirmed_initial":  true,
                    "restored":  4
                },
+    "owner":  {
+                  "child_pid":  20360,
+                  "child_alive_while_connected":  true,
+                  "child_alive_after_disconnect":  true,
+                  "child_dead_after_package_shutdown":  true
+              },
+    "shared_memory":  {
+                          "registry_names":  [
+
+                                             ],
+                          "live_segment_names":  [
+
+                                                 ]
+                      },
     "disconnected":  true,
     "exact_process_stopped":  true,
     "recovery_before":  null,

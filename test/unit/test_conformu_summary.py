@@ -157,6 +157,7 @@ def test_runner_replaces_profile_artifacts_and_records_raw_exit_codes():
 
     assert "$profileArtifacts" in script
     assert 'Remove-Item -LiteralPath $profileArtifacts' in script
+    assert 'Join-Path $results "server-logs\\touptek4040.log"' in script
     assert 'started_utc = $startedUtc.ToString("o")' in script
     assert "exit_code = [int]$LASTEXITCODE" in script
     assert 'Join-Path $results "run-metadata.json"' in script

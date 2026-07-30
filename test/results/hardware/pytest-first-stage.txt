@@ -8,4 +8,4 @@ collecting ... collected 2 items
 test\hardware\test_hardware_identity.py::test_connected_camera_has_approved_identity PASSED [ 50%]
 test\hardware\test_hardware_acquisition.py::test_first_stage_raw12_16x16_exposure PASSED [100%]
 
-============================== 2 passed in 2.73s ==============================
+============================== 2 passed in 2.70s ==============================
