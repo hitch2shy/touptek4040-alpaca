@@ -55,7 +55,7 @@ def test_direct_owner_config_accepts_zero_structural_reopen_settle():
     assert OwnerConfig(structural_reopen_settle_s=0).structural_reopen_settle_s == 0.0
 
 
-@pytest.mark.parametrize("value", [0.0001, 0.25, 0.250999])
+@pytest.mark.parametrize("value", [0.0001, 0.25, 0.251, 0.251999])
 def test_owner_config_rejects_overhead_without_fixed_native_margin(value):
     with pytest.raises(ValueError, match="exposure_overhead_s"):
         OwnerConfig(exposure_overhead_s=value)
@@ -68,6 +68,29 @@ def test_owner_config_accepts_exact_minimum_exposure_overhead():
         ).exposure_overhead_s
         == MIN_EXPOSURE_OVERHEAD_S
     )
+
+
+def test_owner_config_accepts_last_multiplier_fitting_sdk_uint32_timeout():
+    config = OwnerConfig(
+        exposure_overhead_s=10.0,
+        exposure_multiplier=1193.0437630555557,
+    )
+
+    assert config.exposure_multiplier == 1193.0437630555557
+
+
+def test_owner_config_rejects_first_multiplier_exceeding_sdk_uint32_timeout():
+    with pytest.raises(ValueError, match="exposure_multiplier"):
+        OwnerConfig(
+            exposure_overhead_s=10.0,
+            exposure_multiplier=1193.043763055556,
+        )
+
+
+@pytest.mark.parametrize("value", [1e14, 1e300])
+def test_owner_config_rejects_extreme_multiplier_without_timeout_margin(value):
+    with pytest.raises(ValueError, match="exposure_multiplier"):
+        OwnerConfig(exposure_multiplier=value)
 
 
 def test_production_defaults_use_real_toupcam():

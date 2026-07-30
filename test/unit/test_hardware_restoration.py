@@ -164,7 +164,8 @@ def test_hardware_runner_creates_a_zero_byte_jsonl_without_utf8_bom() -> None:
         / "run_hardware.ps1"
     ).read_text(encoding="utf-8")
 
-    assert 'Remove-Item -LiteralPath $cases' in script
+    assert '(Join-Path $results "cases.jsonl")' in script
+    assert 'Remove-Item -LiteralPath $generatedArtifacts' in script
     assert "New-Item -ItemType File -Path $cases" in script
     assert "Set-Content -LiteralPath $cases" not in script
 

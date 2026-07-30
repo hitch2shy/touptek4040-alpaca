@@ -259,7 +259,7 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
         startup_timeout_s=1.0,
         connect_timeout_s=0.12,
         command_timeout_s=0.12,
-        exposure_overhead_s=0.251,
+        exposure_overhead_s=0.252,
         exposure_multiplier=1.0,
         abort_timeout_s=0.12,
         disconnect_timeout_s=0.12,
@@ -526,7 +526,19 @@ def test_official_runner_preserves_unknown_diagnostics_and_refreshes_known_files
             env=environment,
         )
 
-        assert completed.returncode == 0, completed.stderr
+        recorded_cases = (
+            (result_directory / "cases.jsonl").read_text(
+                encoding="utf-8"
+            )
+            if (result_directory / "cases.jsonl").exists()
+            else "<missing>"
+        )
+        assert completed.returncode == 0, (
+            f"inner owner audit exited {completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}\n"
+            f"recorded cases:\n{recorded_cases}"
+        )
         assert unknown_file.read_text(encoding="utf-8") == "preserve me"
         assert nested_file.read_text(encoding="utf-8") == "nested diagnostic"
         for name in ("cases.jsonl", "summary.json", "summary.md"):

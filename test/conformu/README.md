@@ -22,11 +22,13 @@ exposure/orientation/TEC target/TEC/fan/HEAT/HEAT_MAX snapshot in a `finally`
 path. It never falls back to simulation.
 
 The 34 allowed Protocol issues are the two common-parameter casing probes on
-each of 17 PUT endpoints. Alpaca parameter names are case-insensitive, so the
-driver intentionally accepts those variants. Camera V4 also reports one
-allowed idle `StopExposure` issue: the Camera contract defines an idle call as
-a successful no-op, while `CanStopExposure=False` still rejects an
-in-progress stop because this camera cannot return a valid early-read image.
+each of 17 PUT endpoints. This service rejects incorrectly cased PUT form
+parameter names with HTTP 400 as required by Alpaca API v12 section 2.2.3;
+ConformU 2.0.0.16486 expects the older HTTP 200 behavior and therefore reports
+those compliant rejections as issues. Camera V4 also reports one allowed idle
+`StopExposure` issue: the Camera contract defines an idle call as a successful
+no-op, while `CanStopExposure=False` still rejects an in-progress stop because
+this camera cannot return a valid early-read image.
 
 Logs, machine-readable ConformU results, server diagnostics, and the hardware
 restoration record are written to `test/results/conformu/`.

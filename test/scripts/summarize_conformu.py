@@ -356,8 +356,10 @@ def _write_markdown(summary: dict[str, Any], results: Path) -> None:
         "- Allowed Protocol issue groups: "
         f"`{summary['allowed_protocol_issue_groups']}`",
         "- The 34 Protocol issues are exactly two common-parameter casing "
-        "probes on each of 17 PUT endpoints; Alpaca parameter names are "
-        "case-insensitive, so accepting them is required.",
+        "probes on each of 17 PUT endpoints. This service returns HTTP 400 "
+        "for incorrectly cased PUT form parameter names as required by "
+        "Alpaca API v12 section 2.2.3; ConformU 2.0.0.16486 expects the "
+        "older HTTP 200 behavior.",
         f"- Camera V4 counts: `{summary['camera_v4']}`",
         f"- Allowed Camera V4 issue groups: `{summary['allowed_issue_groups']}`",
         "- ImageArrayVariant is a COM-only property; an Alpaca camera must report "

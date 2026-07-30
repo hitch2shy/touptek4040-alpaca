@@ -26,6 +26,12 @@ def _free_tcp_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _free_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.bind(("", 0))
+        return int(listener.getsockname()[1])
+
+
 @dataclass
 class PackageServer:
     process: subprocess.Popen[bytes]
@@ -97,8 +103,9 @@ def package_server(tmp_path_factory: pytest.TempPathFactory):
     executable = DIST_DIR / "ToupTek4040Alpaca.exe"
     assert executable.is_file(), f"build the temporary package first: {executable}"
     port = _free_tcp_port()
-    discovery_port = _free_tcp_port()
+    discovery_port = _free_udp_port()
     log_directory = tmp_path_factory.mktemp("packaged-logs")
+    started_at = time.monotonic()
     process = subprocess.Popen(
         [
             str(executable),
@@ -114,6 +121,8 @@ def package_server(tmp_path_factory: pytest.TempPathFactory):
             str(log_directory),
         ],
         cwd=DIST_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         | subprocess.CREATE_NO_WINDOW,
     )
@@ -129,9 +138,14 @@ def package_server(tmp_path_factory: pytest.TempPathFactory):
             time.sleep(0.1)
     else:
         _stop_exact_process(process)
+        stdout, stderr = process.communicate(timeout=5)
         raise AssertionError(
-            f"packaged Alpaca server did not start; exit={process.returncode}, "
-            f"last_error={last_error!r}"
+            f"packaged Alpaca server did not start; pid={process.pid}, "
+            f"http_port={port}, discovery_port={discovery_port}, "
+            f"elapsed_s={time.monotonic() - started_at:.3f}, "
+            f"exit={process.returncode}, last_error={last_error!r}, "
+            f"stdout={stdout.decode(errors='replace')!r}, "
+            f"stderr={stderr.decode(errors='replace')!r}"
         )
     try:
         yield server
@@ -143,6 +157,46 @@ def package_server(tmp_path_factory: pytest.TempPathFactory):
             pass
         _stop_exact_process(process)
         assert process.poll() is not None
+
+
+def test_packaged_discovery_port_is_probed_with_udp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def bind(self, address: tuple[str, int]) -> None:
+            assert address == ("", 0)
+
+        def getsockname(self) -> tuple[str, int]:
+            return "0.0.0.0", 54321
+
+    def open_probe(family: int, socket_type: int) -> Probe:
+        calls.append((family, socket_type))
+        return Probe()
+
+    monkeypatch.setattr(socket, "socket", open_probe)
+
+    assert _free_udp_port() == 54321
+    assert calls == [(socket.AF_INET, socket.SOCK_DGRAM)]
+
+
+def test_packaged_discovery_port_skips_udp_port_that_is_tcp_free() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied_udp:
+        occupied_udp.bind(("", 0))
+        occupied_port = int(occupied_udp.getsockname()[1])
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_probe:
+            tcp_probe.bind(("127.0.0.1", occupied_port))
+        selected = _free_udp_port()
+        assert selected != occupied_port
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as verification:
+            verification.bind(("", selected))
 
 
 def test_packaged_alpaca_simulator_serves_management_and_ui(

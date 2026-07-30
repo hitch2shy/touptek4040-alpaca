@@ -3,7 +3,8 @@
 - Command: `powershell -ExecutionPolicy Bypass -File test/scripts/run_hardware.ps1`
 - Environment: `TOUPTEK_HARDWARE_TEST=1` (script process only)
 - Approved camera: `sMAX16AM-U3-CL-GPS` / `TP241025143218C92B01151AEC40CB7`
-- Pytest: `============================= 45 passed in 50.26s =============================`
+- Hardware run ID: `e09480dd016bea4e928fabc0a5348f76`
+- Pytest: `============================= 45 passed in 49.77s =============================`
 - RAW/bin combinations recorded: 16/16
 - Native hardware-bin matrix rule: `((4096 // bin) // 2) * 2` on both axes
 - ASCOM full-frame bin 3 fallback: exact `1365 x 1365` verified in RAW12 and RAW8

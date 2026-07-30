@@ -1,16 +1,16 @@
 {
-    "profiles":  {
-                     "protocol":  {
-                                      "command":  "alpacaprotocol",
-                                      "port":  11113,
-                                      "started_utc":  "2026-07-30T04:44:05.0377493Z",
-                                      "exit_code":  34
-                                  },
-                     "camera-v4":  {
-                                       "command":  "conformance",
-                                       "port":  11114,
-                                       "started_utc":  "2026-07-30T04:44:31.3746070Z",
-                                       "exit_code":  18
-                                   }
-                 }
+  "profiles": {
+    "protocol": {
+      "command": "alpacaprotocol",
+      "port": 11113,
+      "started_utc": "2026-07-30T05:44:35.7101377Z",
+      "exit_code": 34
+    },
+    "camera-v4": {
+      "command": "conformance",
+      "port": 11114,
+      "started_utc": "2026-07-30T05:44:53.5676004Z",
+      "exit_code": 18
+    }
+  }
 }

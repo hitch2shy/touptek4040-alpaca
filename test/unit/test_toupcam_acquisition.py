@@ -251,6 +251,18 @@ def test_post_start_hold_rejects_unbounded_values(value: object) -> None:
         )
 
 
+@pytest.mark.parametrize("value", [1e14, 1e300])
+def test_trigger_timeout_rejects_multiplier_that_overflows_sdk_uint32(
+    value: float,
+) -> None:
+    with pytest.raises(CameraInvalidValueError, match="trigger timeout"):
+        ToupTekCamera(
+            "TP241025143218C92B01151AEC40CB7",
+            sdk=FakeSdk(),
+            trigger_timeout_multiplier=value,
+        )
+
+
 def test_trigger_timeout_accepts_late_valid_frame_below_owner_deadline(
     camera: ToupTekCamera,
 ) -> None:

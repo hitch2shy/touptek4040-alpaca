@@ -272,7 +272,7 @@ def make_proxy(
         startup_timeout_s=0.05,
         connect_timeout_s=0.05,
         command_timeout_s=0.05,
-        exposure_overhead_s=0.251,
+        exposure_overhead_s=0.252,
         exposure_multiplier=1.0,
         abort_timeout_s=0.05,
         disconnect_timeout_s=0.05,
@@ -317,6 +317,8 @@ def test_proxy_forwards_camera_contract_and_reconstructs_a_frozen_frame(tmp_path
     assert ack is not None
     assert (ack[0], ack[2]) == (1, 0.01)
     assert proxy._supervisor.acquire_start_ack_count == 1
+    assert proxy._supervisor.acquire_request_count == 1
+    assert proxy._supervisor.frame_descriptor_count == 1
 
 
 def test_default_real_owner_native_timeout_stays_below_owner_deadline(
@@ -343,7 +345,7 @@ def test_default_real_owner_native_timeout_stays_below_owner_deadline(
         arguments = factory.startup_specs[0].backend_arguments
         assert arguments == {
             "trigger_timeout_multiplier": 1.02,
-            "trigger_timeout_overhead_s": 9.749,
+            "trigger_timeout_overhead_s": 9.748,
             "structural_reopen_settle_s": 0.5,
         }
         for duration_s in (0.000012, 0.001, 2.0, 3600.0):
@@ -367,7 +369,7 @@ def test_custom_real_startup_spec_receives_derived_native_timeouts(
 ) -> None:
     factory = ScriptedFactory()
     config = OwnerConfig(
-        exposure_overhead_s=0.251,
+        exposure_overhead_s=0.252,
         exposure_multiplier=1.5,
         structural_reopen_settle_s=0.75,
     )
@@ -450,7 +452,7 @@ def test_operation_deadlines_are_selected_by_operation(tmp_path: Path):
             startup_timeout_s=0.011,
             connect_timeout_s=0.022,
             command_timeout_s=0.033,
-            exposure_overhead_s=0.251,
+            exposure_overhead_s=0.252,
             exposure_multiplier=1.5,
             abort_timeout_s=0.055,
             disconnect_timeout_s=0.066,
@@ -464,7 +466,7 @@ def test_operation_deadlines_are_selected_by_operation(tmp_path: Path):
     assert proxy._supervisor.deadline_for("disconnect") == 0.066
     assert proxy._supervisor.deadline_for(
         "acquire", actual_duration_s=0.25
-    ) == pytest.approx(0.626)
+    ) == pytest.approx(0.627)
 
 
 def test_acquire_uses_owner_acknowledged_duration_for_remaining_deadline(
@@ -479,7 +481,7 @@ def test_acquire_uses_owner_acknowledged_duration_for_remaining_deadline(
             startup_timeout_s=0.05,
             connect_timeout_s=0.05,
             command_timeout_s=0.033,
-            exposure_overhead_s=0.251,
+            exposure_overhead_s=0.252,
             exposure_multiplier=1.5,
             abort_timeout_s=0.05,
             disconnect_timeout_s=0.05,

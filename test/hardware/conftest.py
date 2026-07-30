@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 from threading import RLock
 import time
 from types import ModuleType
@@ -134,6 +135,12 @@ class HardwareEvidence:
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self._path = results_dir / "cases.jsonl"
+        self._run_id = os.environ.get("TOUPTEK_HARDWARE_RUN_ID")
+        if self._run_id is not None and re.fullmatch(
+            r"[0-9a-f]{32}",
+            self._run_id,
+        ) is None:
+            raise RuntimeError("TOUPTEK_HARDWARE_RUN_ID is invalid")
         # SDK handle finalizers can run while an outer evidence payload is
         # being JSON encoded.  Their instrumented Close call records another
         # event on the same thread, so this lock must permit that re-entry.
@@ -145,6 +152,7 @@ class HardwareEvidence:
         event = {
             "recorded_utc": datetime.now(timezone.utc).isoformat(),
             "case": case,
+            **({"run_id": self._run_id} if self._run_id is not None else {}),
             **fields,
         }
         with self._lock:

@@ -10,12 +10,75 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .owner_protocol import MAX_EXPOSURE_DURATION_S
+
 
 NATIVE_OWNER_TIMEOUT_MARGIN_S = 0.25
 NATIVE_TIMEOUT_CEILING_ALLOWANCE_S = 0.001
+NATIVE_TIMEOUT_FLOAT_ALLOWANCE_S = 0.001
 MIN_EXPOSURE_OVERHEAD_S = (
-    NATIVE_OWNER_TIMEOUT_MARGIN_S + NATIVE_TIMEOUT_CEILING_ALLOWANCE_S
+    NATIVE_OWNER_TIMEOUT_MARGIN_S
+    + NATIVE_TIMEOUT_CEILING_ALLOWANCE_S
+    + NATIVE_TIMEOUT_FLOAT_ALLOWANCE_S
 )
+TOUPCAM_MAX_TRIGGER_TIMEOUT_MS = (1 << 32) - 1
+
+
+def native_trigger_timeout_ms(
+    duration_s: float,
+    multiplier: float,
+    owner_overhead_s: float,
+) -> int:
+    """Return the exact unsigned-millisecond SDK timeout derivation."""
+
+    native_overhead_s = owner_overhead_s - MIN_EXPOSURE_OVERHEAD_S
+    timeout_s = duration_s * multiplier + native_overhead_s
+    scaled = timeout_s * 1000.0
+    if not math.isfinite(scaled) or scaled <= 0:
+        raise ValueError("native trigger timeout must be finite and positive")
+    return math.ceil(scaled)
+
+
+def _validate_exposure_deadline_pair(
+    multiplier: float,
+    owner_overhead_s: float,
+) -> None:
+    """Prove the maximum supported exposure fits the SDK and fixed margin."""
+
+    try:
+        native_ms = native_trigger_timeout_ms(
+            MAX_EXPOSURE_DURATION_S,
+            multiplier,
+            owner_overhead_s,
+        )
+        owner_timeout_s = (
+            MAX_EXPOSURE_DURATION_S * multiplier + owner_overhead_s
+        )
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            "owner.exposure_multiplier cannot preserve the native timeout margin"
+        ) from error
+    if (
+        not math.isfinite(owner_timeout_s)
+        or native_ms > TOUPCAM_MAX_TRIGGER_TIMEOUT_MS
+    ):
+        raise ValueError(
+            "owner.exposure_multiplier exceeds the Toupcam unsigned "
+            "millisecond timeout range"
+        )
+    native_timeout_s = native_ms / 1000.0
+    representation_allowance_s = 4 * max(
+        math.ulp(owner_timeout_s),
+        math.ulp(native_timeout_s),
+    )
+    if (
+        owner_timeout_s - native_timeout_s
+        < NATIVE_OWNER_TIMEOUT_MARGIN_S + representation_allowance_s
+    ):
+        raise ValueError(
+            "owner exposure timeout arithmetic cannot preserve the fixed "
+            "native timeout margin"
+        )
 
 
 @dataclass(frozen=True)
@@ -90,6 +153,10 @@ class OwnerConfig:
                 f"{MIN_EXPOSURE_OVERHEAD_S:g} seconds to keep the native "
                 "camera timeout below the owner deadline"
             )
+        _validate_exposure_deadline_pair(
+            self.exposure_multiplier,
+            self.exposure_overhead_s,
+        )
 
 
 @dataclass(frozen=True)

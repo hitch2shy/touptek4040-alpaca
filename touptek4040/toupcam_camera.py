@@ -35,6 +35,8 @@ from .errors import (
     safe_camera_error,
     safe_exception_text,
 )
+from .config import TOUPCAM_MAX_TRIGGER_TIMEOUT_MS
+from .owner_protocol import MAX_EXPOSURE_DURATION_S
 from .toupcam_loader import load_default_toupcam_module
 
 
@@ -232,6 +234,23 @@ class ToupTekCamera:
             raise CameraInvalidValueError(
                 "post_acquire_start_hold_s must be a finite number "
                 "from 0 through 60 seconds"
+            )
+        try:
+            maximum_trigger_timeout_ms = math.ceil(
+                (
+                    MAX_EXPOSURE_DURATION_S
+                    * float(trigger_timeout_multiplier)
+                    + float(trigger_timeout_overhead_s)
+                )
+                * 1000
+            )
+        except (OverflowError, ValueError) as error:
+            raise CameraInvalidValueError(
+                "trigger timeout exceeds the SDK unsigned millisecond range"
+            ) from error
+        if maximum_trigger_timeout_ms > TOUPCAM_MAX_TRIGGER_TIMEOUT_MS:
+            raise CameraInvalidValueError(
+                "trigger timeout exceeds the SDK unsigned millisecond range"
             )
         self._sdk = sdk if sdk is not None else load_default_toupcam_module()
         self._monotonic = monotonic

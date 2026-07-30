@@ -323,7 +323,7 @@ def test_concurrent_abort_and_acquire_failure_replace_one_generation_only(
                 startup_timeout_s=0.05,
                 connect_timeout_s=0.05,
                 command_timeout_s=0.5,
-                exposure_overhead_s=0.251,
+                exposure_overhead_s=0.252,
                 exposure_multiplier=1.0,
                 abort_timeout_s=0.05,
                 disconnect_timeout_s=0.05,
@@ -1098,26 +1098,4 @@ def test_capability_numeric_overflow_fails_generation(tmp_path: Path):
     with pytest.raises(CameraOwnerProtocolError):
         _ = proxy.capabilities
 
-    assert proxy.owner_generation == generation + 1
-
-
-def test_acknowledged_duration_deadline_overflow_fails_generation(
-    tmp_path: Path,
-):
-    factory = ScriptedFactory()
-    factory.actual_duration_s = 3600.0
-    proxy = make_proxy(
-        tmp_path,
-        factory,
-        owner_config=OwnerConfig(exposure_multiplier=1e308),
-    )
-    proxy.connect()
-    generation = proxy.owner_generation
-
-    with pytest.raises(CameraOwnerProtocolError):
-        proxy.acquire(
-            0.001, Roi(0, 0, 2, 2), 1, ReadoutMode.RAW12
-        )
-
-    assert factory.calls["acquire"] == 1
     assert proxy.owner_generation == generation + 1

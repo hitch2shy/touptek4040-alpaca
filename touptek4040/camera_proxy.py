@@ -23,7 +23,12 @@ from .camera_contract import (
     Roi,
 )
 from .camera_owner import OwnerStartupSpec, camera_owner_main
-from .config import MIN_EXPOSURE_OVERHEAD_S, OwnerConfig
+from .config import (
+    MIN_EXPOSURE_OVERHEAD_S,
+    NATIVE_OWNER_TIMEOUT_MARGIN_S,
+    OwnerConfig,
+    native_trigger_timeout_ms,
+)
 from .errors import (
     CameraBusyError,
     CameraError,
@@ -264,6 +269,8 @@ class OwnerSupervisor:
         self._last_termination_error: CameraOwnerTerminationError | None = None
         self._last_acquire_start_ack: tuple[int, int, float] | None = None
         self._acquire_start_ack_count = 0
+        self._acquire_request_count = 0
+        self._frame_descriptor_count = 0
         with self._lifecycle_lock:
             self._session = self._start_idle_owner_locked(attempts=2)
 
@@ -311,6 +318,16 @@ class OwnerSupervisor:
     def acquire_start_ack_count(self) -> int:
         with self._state_lock:
             return self._acquire_start_ack_count
+
+    @property
+    def acquire_request_count(self) -> int:
+        with self._state_lock:
+            return self._acquire_request_count
+
+    @property
+    def frame_descriptor_count(self) -> int:
+        with self._state_lock:
+            return self._frame_descriptor_count
 
     def deadline_for(
         self,
@@ -769,6 +786,8 @@ class OwnerSupervisor:
             time.monotonic() + self._config.command_timeout_s
         )
         try:
+            with self._state_lock:
+                self._acquire_request_count += 1
             session.command_connection.send(encode_request(request))
             start_payload = self._receive_until(
                 session,
@@ -791,13 +810,32 @@ class OwnerSupervisor:
                     acknowledgement.actual_duration_s,
                 )
                 self._acquire_start_ack_count += 1
+            owner_timeout_s = self.deadline_for(
+                "acquire",
+                actual_duration_s=acknowledgement.actual_duration_s,
+            )
+            native_timeout_s = native_trigger_timeout_ms(
+                acknowledgement.actual_duration_s,
+                self._config.exposure_multiplier,
+                self._config.exposure_overhead_s,
+            ) / 1000.0
+            started_at = time.monotonic()
+            completion_deadline = math.nextafter(
+                started_at + owner_timeout_s,
+                math.inf,
+            )
+            if (
+                not math.isfinite(completion_deadline)
+                or completion_deadline - started_at - native_timeout_s
+                < NATIVE_OWNER_TIMEOUT_MARGIN_S
+            ):
+                raise CameraOwnerProtocolError(
+                    "represented owner deadline cannot preserve the native "
+                    "timeout margin"
+                )
             final_payload = self._receive_until(
                 session,
-                time.monotonic()
-                + self.deadline_for(
-                    "acquire",
-                    actual_duration_s=acknowledgement.actual_duration_s,
-                ),
+                completion_deadline,
                 "acquire completion",
             )
         except CameraError:
@@ -952,6 +990,8 @@ class OwnerSupervisor:
                 f"owner frame response is invalid: {error}",
                 failed_session=failed_session,
             )
+        with self._state_lock:
+            self._frame_descriptor_count += 1
         return descriptor, frame_values
 
     def _protocol_failure(

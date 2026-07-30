@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -14,10 +16,77 @@ _EXPECTED_MODES = {
     for binning in range(1, 9)
 }
 _STAGE_LOGS = {
-    "first stage": ("pytest-first-stage.txt", 2),
-    "matrix": ("pytest-hardware.txt", 45),
-    "owner recovery": ("pytest-owner-recovery.txt", 1),
+    "first stage": (
+        "pytest-first-stage.txt",
+        "first-stage-completion.json",
+        "first-stage",
+        2,
+    ),
+    "matrix": (
+        "pytest-hardware.txt",
+        "matrix-completion.json",
+        "matrix",
+        45,
+    ),
+    "owner recovery": (
+        "pytest-owner-recovery.txt",
+        "owner-recovery-completion.json",
+        "owner-recovery",
+        1,
+    ),
 }
+_RUN_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _json_document(
+    path: Path,
+    label: str,
+    errors: list[str],
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        errors.append(f"{label} is missing")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        errors.append(f"{label} is invalid JSON")
+        return None
+    if not isinstance(value, dict):
+        errors.append(f"{label} is not an object")
+        return None
+    return value
+
+
+def _utc_timestamp(
+    value: object,
+    label: str,
+    errors: list[str],
+) -> datetime | None:
+    if not isinstance(value, str):
+        errors.append(f"{label} is missing a UTC timestamp")
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        errors.append(f"{label} is not an ISO timestamp")
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        errors.append(f"{label} is not timezone-aware")
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _require_fresh_file(
+    path: Path,
+    label: str,
+    started: datetime | None,
+    errors: list[str],
+) -> None:
+    if not path.is_file():
+        errors.append(f"{label} is missing")
+        return
+    if started is not None and path.stat().st_mtime < started.timestamp():
+        errors.append(f"{label} predates this hardware run")
 
 
 def _read_log(path: Path) -> str:
@@ -66,14 +135,72 @@ def _single_case(
 
 def validate_results(results: Path) -> tuple[str, list[str]]:
     errors: list[str] = []
+    metadata_path = results / "run-metadata.json"
+    metadata = _json_document(metadata_path, "run metadata", errors)
+    run_id: str | None = None
+    started: datetime | None = None
+    if metadata is not None:
+        candidate = metadata.get("run_id")
+        if (
+            metadata.get("schema_version") != 1
+            or not isinstance(candidate, str)
+            or _RUN_ID.fullmatch(candidate) is None
+        ):
+            errors.append("run metadata has an invalid schema or run_id")
+        else:
+            run_id = candidate
+        started = _utc_timestamp(
+            metadata.get("started_utc"),
+            "run metadata started_utc",
+            errors,
+        )
+    _require_fresh_file(metadata_path, "run metadata", started, errors)
+
+    preflight_path = results / "preflight.json"
+    preflight = _json_document(preflight_path, "preflight evidence", errors)
+    _require_fresh_file(preflight_path, "preflight evidence", started, errors)
+    if preflight is not None:
+        if preflight.get("run_id") != run_id or preflight.get("passed") is not True:
+            errors.append("preflight evidence is not bound to the current run")
+        recorded = _utc_timestamp(
+            preflight.get("recorded_utc"),
+            "preflight recorded_utc",
+            errors,
+        )
+        if started is not None and recorded is not None and recorded < started:
+            errors.append("preflight evidence predates this hardware run")
+
     events = _events(results / "cases.jsonl", errors)
+    _require_fresh_file(
+        results / "cases.jsonl",
+        "cases evidence",
+        started,
+        errors,
+    )
+    for index, event in enumerate(events, start=1):
+        if event.get("run_id") != run_id:
+            errors.append(f"cases event {index} has a mixed or missing run_id")
+        recorded = _utc_timestamp(
+            event.get("recorded_utc"),
+            f"cases event {index} recorded_utc",
+            errors,
+        )
+        if started is not None and recorded is not None and recorded < started:
+            errors.append(f"cases event {index} predates this hardware run")
+
     stage_status: dict[str, str] = {}
-    for label, (filename, expected_count) in _STAGE_LOGS.items():
+    for label, (
+        filename,
+        completion_filename,
+        stage_name,
+        expected_count,
+    ) in _STAGE_LOGS.items():
         path = results / filename
         if not path.is_file():
             errors.append(f"{label} log is missing")
             stage_status[label] = "missing"
             continue
+        _require_fresh_file(path, f"{label} log", started, errors)
         log = _read_log(path)
         match = re.search(rf"\b{expected_count} passed\b", log)
         if match is None or re.search(r"\b[1-9]\d* failed\b", log):
@@ -87,6 +214,55 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
             "status unavailable",
         )
         stage_status[label] = status
+        completion_path = results / completion_filename
+        completion = _json_document(
+            completion_path,
+            f"{label} completion",
+            errors,
+        )
+        _require_fresh_file(
+            completion_path,
+            f"{label} completion",
+            started,
+            errors,
+        )
+        if completion is not None:
+            completed = _utc_timestamp(
+                completion.get("completed_utc"),
+                f"{label} completed_utc",
+                errors,
+            )
+            expected_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            if (
+                completion.get("run_id") != run_id
+                or completion.get("stage") != stage_name
+                or completion.get("passed_count") != expected_count
+                or completion.get("log_sha256") != expected_hash
+            ):
+                errors.append(
+                    f"{label} completion is not bound to its current log and run"
+                )
+            if started is not None and completed is not None and completed < started:
+                errors.append(f"{label} completion predates this hardware run")
+
+    final_path = results / "completion.json"
+    final = _json_document(final_path, "final completion", errors)
+    _require_fresh_file(final_path, "final completion", started, errors)
+    if final is not None:
+        completed = _utc_timestamp(
+            final.get("completed_utc"),
+            "final completion completed_utc",
+            errors,
+        )
+        if (
+            final.get("run_id") != run_id
+            or final.get("passed") is not True
+            or final.get("stages")
+            != ["preflight", "first-stage", "matrix", "owner-recovery"]
+        ):
+            errors.append("final completion is not exact for the current run")
+        if started is not None and completed is not None and completed < started:
+            errors.append("final completion predates this hardware run")
 
     first_stage = [event for event in events if event.get("case") == "first-stage"]
     if not first_stage or not any(
@@ -159,16 +335,47 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
 
     owner = _single_case(events, "owner-termination", errors)
     if owner is not None:
-        required_owner = {
-            "native_start_acknowledged": True,
-            "acquire_operation_count": 1,
-            "exposure_retried": False,
-            "frame_published": False,
-            "explicit_reconnect_required": True,
-            "shared_frame_registry_empty": True,
-            "terminated_pid_alive": False,
-        }
-        if any(owner.get(key) != value for key, value in required_owner.items()):
+        count_names = (
+            "acquire_request_count",
+            "start_ack_count",
+            "frame_descriptor_count",
+            "frame_result_count",
+            "registry_record_count",
+            "owner_owned_frame_count",
+            "observed_publication_count",
+        )
+        counts = {name: owner.get(name) for name in count_names}
+        valid_counts = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in counts.values()
+        )
+        if valid_counts:
+            observed_publications = max(
+                counts["frame_descriptor_count"],
+                counts["frame_result_count"],
+                counts["registry_record_count"],
+                counts["owner_owned_frame_count"],
+            )
+            derived_retry = counts["acquire_request_count"] > 1
+            derived_published = observed_publications > 0
+        else:
+            observed_publications = -1
+            derived_retry = True
+            derived_published = True
+        if (
+            not valid_counts
+            or counts["acquire_request_count"] != 1
+            or counts["start_ack_count"] != 1
+            or counts["observed_publication_count"] != observed_publications
+            or observed_publications != 0
+            or owner.get("native_start_acknowledged")
+            is not (counts["start_ack_count"] == 1)
+            or owner.get("exposure_retried") is not derived_retry
+            or owner.get("frame_published") is not derived_published
+            or owner.get("explicit_reconnect_required") is not True
+            or owner.get("shared_frame_registry_empty") is not True
+            or owner.get("terminated_pid_alive") is not False
+        ):
             errors.append("owner recovery evidence does not prove exact isolation")
 
     matrix_status = stage_status.get("matrix", "status unavailable")
@@ -179,6 +386,7 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
         "- Environment: `TOUPTEK_HARDWARE_TEST=1` (script process only)",
         "- Approved camera: `sMAX16AM-U3-CL-GPS` / "
         "`TP241025143218C92B01151AEC40CB7`",
+        f"- Hardware run ID: `{run_id or 'invalid'}`",
         f"- Pytest: `{matrix_status}`",
         f"- RAW/bin combinations recorded: {len(modes)}/16",
         "- Native hardware-bin matrix rule: `((4096 // bin) // 2) * 2` on both axes",
