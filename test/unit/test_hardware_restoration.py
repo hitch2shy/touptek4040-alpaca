@@ -180,6 +180,11 @@ def test_hardware_runner_propagates_summary_failure() -> None:
     assert "$summaryExitCode = $LASTEXITCODE" in script
     assert "if ($summaryExitCode -ne 0)" in script
     assert "Hardware evidence summary failed" in script
+    normalizer = "test/scripts/normalize_text_artifacts.py"
+    assert normalizer in script
+    assert script.index(normalizer) < script.index(
+        'Write-StageCompletion "first-stage"'
+    )
 
 
 def test_abort_readiness_timeout_includes_configured_reopen_and_native_budget() -> None:

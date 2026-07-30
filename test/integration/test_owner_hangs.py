@@ -20,7 +20,11 @@ import pytest
 from test.fixtures.fake_owner_backend import FakeOwnerBackend
 from touptek4040.camera_contract import Frame, ReadoutMode, Roi
 from touptek4040.camera_owner import OwnerStartupSpec, camera_owner_main
-from touptek4040.camera_proxy import CameraOwnerProxy, OwnerProcessSession
+from touptek4040.camera_proxy import (
+    _PROCESS_TERMINATION_ALLOWANCE_S,
+    CameraOwnerProxy,
+    OwnerProcessSession,
+)
 from touptek4040.config import OwnerConfig
 from touptek4040.errors import CameraError
 
@@ -43,12 +47,49 @@ REQUIRED_CRASH_POINTS = {
     "after_descriptor_send",
     "after_proxy_copy_before_release_ack",
 }
+_FAULT_PROCESS_START_SCHEDULING_ALLOWANCE_S = OwnerConfig.startup_timeout_s
 
 
 _FAULT_EVENTS: Any = None
 _FAULT_CLAIMED: Any = None
 _SELECTED_BOUNDARY = ""
 _CURRENT_REQUEST = threading.local()
+
+
+def _operation_timeout_s(boundary: str, config: OwnerConfig) -> float:
+    if boundary == "startup":
+        return config.startup_timeout_s
+    if boundary == "connect":
+        return config.connect_timeout_s
+    if boundary in {"trigger", "frame_publication"}:
+        return (
+            0.001 * config.exposure_multiplier
+            + config.exposure_overhead_s
+        )
+    if boundary == "abort":
+        return config.abort_timeout_s
+    if boundary == "disconnect":
+        return config.disconnect_timeout_s
+    return config.command_timeout_s
+
+
+def _hard_bound_components(
+    boundary: str,
+    config: OwnerConfig,
+) -> dict[str, float]:
+    # A failed request does not return until the supervisor has allowed both
+    # terminate and kill joins, then spawned and handshaken the disconnected
+    # replacement. startup_timeout_s is the configured process scheduling and
+    # replacement-handshake allowance, not an empirical timing pad.
+    return {
+        "operation_timeout_s": _operation_timeout_s(boundary, config),
+        "terminate_kill_grace_s": 2 * _PROCESS_TERMINATION_ALLOWANCE_S,
+        "scheduling_process_start_allowance_s": config.startup_timeout_s,
+    }
+
+
+def _hard_bound_s(boundary: str, config: OwnerConfig) -> float:
+    return sum(_hard_bound_components(boundary, config).values())
 
 
 class _ObservedConnection:
@@ -256,7 +297,7 @@ class _FaultProcessFactory:
 
 def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
     config = OwnerConfig(
-        startup_timeout_s=1.0,
+        startup_timeout_s=_FAULT_PROCESS_START_SCHEDULING_ALLOWANCE_S,
         connect_timeout_s=0.12,
         command_timeout_s=0.12,
         exposure_overhead_s=0.252,
@@ -323,7 +364,8 @@ def run_hung_boundary(boundary: str, tmp_path: Path) -> dict[str, object]:
         invocation_counts.setdefault(str(proxy.owner_generation), 0)
         result = {
             "elapsed_s": elapsed,
-            "hard_bound_s": 2.1 if boundary == "startup" else 0.9,
+            **_hard_bound_components(boundary, config),
+            "hard_bound_s": _hard_bound_s(boundary, config),
             "hung_pid": hung_pid,
             "hung_generation": hung_generation,
             "terminated_pid": proxy.last_terminated_pid,
@@ -360,6 +402,22 @@ def _invocation_counts_by_generation(
     return counts
 
 
+def test_owner_fault_hard_bound_is_derived_from_runtime_allowances() -> None:
+    config = OwnerConfig(
+        startup_timeout_s=_FAULT_PROCESS_START_SCHEDULING_ALLOWANCE_S,
+        connect_timeout_s=0.12,
+        command_timeout_s=0.12,
+        exposure_overhead_s=0.252,
+        exposure_multiplier=1.0,
+        abort_timeout_s=0.12,
+        disconnect_timeout_s=0.12,
+    )
+
+    assert _hard_bound_s("get", config) == pytest.approx(10.62)
+    assert _hard_bound_s("trigger", config) == pytest.approx(10.753)
+    assert _hard_bound_s("startup", config) == pytest.approx(20.5)
+
+
 def test_invocation_counts_preserve_each_owner_generation() -> None:
     events = [
         {"boundary": "trigger", "pid": 10, "generation": 4, "request_id": 2},
@@ -380,6 +438,7 @@ def test_invocation_counts_preserve_each_owner_generation() -> None:
         ("duplicate", 2, 3),
         ("extra", 1, 1),
         ("replacement_generation", 0, 1),
+        ("hard_bound_components", 0, 1),
     ],
 )
 def test_fault_runner_rejects_corrupt_case_evidence(
@@ -395,8 +454,10 @@ def test_fault_runner_rejects_corrupt_case_evidence(
         records[1] = dict(records[0])
     elif mutation == "extra":
         records.append(dict(records[0], name="unexpected"))
-    else:
+    elif mutation == "replacement_generation":
         records[0]["invocations_by_generation"]["2"] = 1
+    else:
+        records[0]["hard_bound_s"] = 2.0
     cases_path = tmp_path / "cases.jsonl"
     cases_path.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
@@ -438,6 +499,9 @@ def test_fault_runner_rejects_corrupt_case_evidence(
     assert (
         summary["counters"]["generationInvocationViolations"]
         == (1 if mutation == "replacement_generation" else 0)
+    )
+    assert summary["counters"]["elapsedBoundViolations"] == (
+        1 if mutation == "hard_bound_components" else 0
     )
     assert (
         sum(case["status"] == "FAIL" for case in summary["cases"])
@@ -797,6 +861,9 @@ def _valid_runner_records() -> list[dict[str, object]]:
                 "kind": "hard-boundary",
                 "name": name,
                 "elapsed_s": 0.1,
+                "operation_timeout_s": 0.1,
+                "terminate_kill_grace_s": 0.2,
+                "scheduling_process_start_allowance_s": 0.7,
                 "hard_bound_s": 1.0,
                 "hung_pid_alive": False,
                 "hung_generation": 1,

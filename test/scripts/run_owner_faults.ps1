@@ -440,7 +440,38 @@ foreach ($case in $cases) {
             $caseViolations.Add("unexpected owner generation invocation evidence")
             $counters.generationInvocationViolations++
         }
-        if ([double]$case.elapsed_s -gt [double]$case.hard_bound_s) {
+        $operationTimeout = [double]$case.operation_timeout_s
+        $terminateKillGrace = [double]$case.terminate_kill_grace_s
+        $processStartAllowance = [double](
+            $case.scheduling_process_start_allowance_s
+        )
+        $hardBound = [double]$case.hard_bound_s
+        $derivedHardBound = (
+            $operationTimeout +
+            $terminateKillGrace +
+            $processStartAllowance
+        )
+        $boundComponentsValid = (
+            -not [double]::IsNaN($operationTimeout) -and
+            -not [double]::IsInfinity($operationTimeout) -and
+            -not [double]::IsNaN($terminateKillGrace) -and
+            -not [double]::IsInfinity($terminateKillGrace) -and
+            -not [double]::IsNaN($processStartAllowance) -and
+            -not [double]::IsInfinity($processStartAllowance) -and
+            -not [double]::IsNaN($hardBound) -and
+            -not [double]::IsInfinity($hardBound) -and
+            $operationTimeout -gt 0 -and
+            $terminateKillGrace -gt 0 -and
+            $processStartAllowance -gt 0 -and
+            [Math]::Abs($hardBound - $derivedHardBound) -le 1e-9
+        )
+        if (-not $boundComponentsValid) {
+            $caseViolations.Add(
+                "hard bound is not the sum of its runtime allowances"
+            )
+            $counters.elapsedBoundViolations++
+        }
+        elseif ([double]$case.elapsed_s -gt $hardBound) {
             $caseViolations.Add("elapsed bound exceeded")
             $counters.elapsedBoundViolations++
         }

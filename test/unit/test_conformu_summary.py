@@ -165,6 +165,11 @@ def test_runner_replaces_profile_artifacts_and_records_raw_exit_codes():
     assert "Set-Content -LiteralPath (Join-Path $results \"run-metadata.json\")" not in script
     assert "$protocolExit -ne 0" not in script
     assert "$summaryExit -ne 0" in script
+    normalizer = "test/scripts/normalize_text_artifacts.py"
+    assert normalizer in script
+    assert script.index(normalizer) < script.index(
+        "test/scripts/summarize_conformu.py"
+    )
 
 
 def test_protocol_singular_error_count_is_authoritative(tmp_path):

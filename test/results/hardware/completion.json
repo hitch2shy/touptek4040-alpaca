@@ -1,11 +1,23 @@
 {
-  "run_id": "e09480dd016bea4e928fabc0a5348f76",
-  "completed_utc": "2026-07-30T05:43:52.7387718Z",
+  "schema_version": 2,
+  "run_id": "24132f453ea15c2391a8567bdb8ed7bb",
+  "completed_utc": "2026-07-30T07:06:37.8513632Z",
   "passed": true,
   "stages": [
     "preflight",
     "first-stage",
     "matrix",
     "owner-recovery"
-  ]
+  ],
+  "artifacts": {
+    "cases.jsonl": "55c1d7122ec70078db0ef65f1df1e21878cdf24a059505e5f1a50aa86602d4f0",
+    "preflight.json": "0e80fb173610d66ef70db86e09b64eea07df32ab123372a826410f6ddad62bf0",
+    "pytest-first-stage.txt": "574c64d2aa009a8c045867908e4440e8b56ffeaf9266be1471b41dcef3826cb3",
+    "pytest-hardware.txt": "ac7db45bf5a524ccc96ce63052be2eb2711426fe36e526cc5aa7733379cce9eb",
+    "pytest-owner-recovery.txt": "827b05e321eb64a370b02f1a14dc088f3113a47dd482b2073c7880a3dd76b4c0",
+    "first-stage-completion.json": "e6902be6d7ad143213e59997aeb0f044c39e68ad427ef5dd81fbcb6b4b6be031",
+    "matrix-completion.json": "f7d1ce1de3f1ed91506ea4fcfc3eb7f591060e90b6bfaec1c6a0ac8f87241550",
+    "owner-recovery-completion.json": "2a3003f50e576aa36a8a16b31db75c710363647106b17ffdc4b6b7014b60d3c0",
+    "run-metadata.json": "f3add30569848292f6892ab96929e6034f60c6221bd4095079214c730f5ff723"
+  }
 }

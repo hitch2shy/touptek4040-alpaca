@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -36,6 +37,20 @@ _STAGE_LOGS = {
     ),
 }
 _RUN_ID = re.compile(r"[0-9a-f]{32}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MANIFEST_ARTIFACTS = frozenset(
+    {
+        "cases.jsonl",
+        "preflight.json",
+        "pytest-first-stage.txt",
+        "pytest-hardware.txt",
+        "pytest-owner-recovery.txt",
+        "first-stage-completion.json",
+        "matrix-completion.json",
+        "owner-recovery-completion.json",
+        "run-metadata.json",
+    }
+)
 
 
 def _json_document(
@@ -133,8 +148,13 @@ def _single_case(
     return matches[0]
 
 
-def validate_results(results: Path) -> tuple[str, list[str]]:
+def validate_results(
+    results: Path,
+    expected_run_id: str,
+) -> tuple[str, list[str]]:
     errors: list[str] = []
+    if _RUN_ID.fullmatch(expected_run_id) is None:
+        errors.append("externally supplied expected run_id is invalid")
     metadata_path = results / "run-metadata.json"
     metadata = _json_document(metadata_path, "run metadata", errors)
     run_id: str | None = None
@@ -149,6 +169,10 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
             errors.append("run metadata has an invalid schema or run_id")
         else:
             run_id = candidate
+            if run_id != expected_run_id:
+                errors.append(
+                    "run metadata does not match the externally expected run_id"
+                )
         started = _utc_timestamp(
             metadata.get("started_utc"),
             "run metadata started_utc",
@@ -255,12 +279,36 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
             errors,
         )
         if (
-            final.get("run_id") != run_id
+            final.get("schema_version") != 2
+            or final.get("run_id") != run_id
+            or final.get("run_id") != expected_run_id
             or final.get("passed") is not True
             or final.get("stages")
             != ["preflight", "first-stage", "matrix", "owner-recovery"]
         ):
             errors.append("final completion is not exact for the current run")
+        artifacts = final.get("artifacts")
+        if not isinstance(artifacts, dict) or set(artifacts) != _MANIFEST_ARTIFACTS:
+            errors.append("final completion artifact manifest is not exact")
+        else:
+            for filename in sorted(_MANIFEST_ARTIFACTS):
+                recorded_hash = artifacts.get(filename)
+                artifact_path = results / filename
+                if (
+                    not isinstance(recorded_hash, str)
+                    or _SHA256.fullmatch(recorded_hash) is None
+                ):
+                    errors.append(
+                        f"final completion hash for {filename} is invalid"
+                    )
+                elif (
+                    not artifact_path.is_file()
+                    or hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+                    != recorded_hash
+                ):
+                    errors.append(
+                        f"final completion hash for {filename} does not match"
+                    )
         if started is not None and completed is not None and completed < started:
             errors.append("final completion predates this hardware run")
 
@@ -374,6 +422,9 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
             or owner.get("frame_published") is not derived_published
             or owner.get("explicit_reconnect_required") is not True
             or owner.get("shared_frame_registry_empty") is not True
+            or not isinstance(owner.get("terminated_pid"), int)
+            or isinstance(owner.get("terminated_pid"), bool)
+            or owner.get("terminated_pid") <= 0
             or owner.get("terminated_pid_alive") is not False
         ):
             errors.append("owner recovery evidence does not prove exact isolation")
@@ -410,8 +461,14 @@ def validate_results(results: Path) -> tuple[str, list[str]]:
     return "\n".join(summary), errors
 
 
-def main() -> int:
-    summary, errors = validate_results(RESULTS)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-run-id", required=True)
+    arguments = parser.parse_args(argv)
+    summary, errors = validate_results(
+        RESULTS,
+        arguments.expected_run_id,
+    )
     (RESULTS / "summary.md").write_text(summary, encoding="utf-8")
     if errors:
         for error in errors:

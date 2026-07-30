@@ -11,7 +11,44 @@ from test.scripts.summarize_hardware import validate_results
 
 
 _RUN_ID = "0123456789abcdef0123456789abcdef"
+_OTHER_RUN_ID = "fedcba9876543210fedcba9876543210"
 _STARTED = datetime.now(timezone.utc) - timedelta(seconds=5)
+_MANIFEST_ARTIFACTS = {
+    "cases.jsonl",
+    "preflight.json",
+    "pytest-first-stage.txt",
+    "pytest-hardware.txt",
+    "pytest-owner-recovery.txt",
+    "first-stage-completion.json",
+    "matrix-completion.json",
+    "owner-recovery-completion.json",
+    "run-metadata.json",
+}
+
+
+def _seal_manifest(tmp_path, *, run_id: str = _RUN_ID) -> None:
+    artifacts = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in sorted(_MANIFEST_ARTIFACTS)
+    }
+    (tmp_path / "completion.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "completed_utc": (_STARTED + timedelta(seconds=2)).isoformat(),
+                "passed": True,
+                "stages": [
+                    "preflight",
+                    "first-stage",
+                    "matrix",
+                    "owner-recovery",
+                ],
+                "artifacts": artifacts,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _valid_results(tmp_path):
@@ -50,6 +87,7 @@ def _valid_results(tmp_path):
         },
         {
             "case": "owner-termination",
+            "terminated_pid": 12345,
             "native_start_acknowledged": True,
             "acquire_request_count": 1,
             "start_ack_count": 1,
@@ -132,29 +170,14 @@ def _valid_results(tmp_path):
             ),
             encoding="utf-8",
         )
-    (tmp_path / "completion.json").write_text(
-        json.dumps(
-            {
-                "run_id": _RUN_ID,
-                "completed_utc": recorded,
-                "passed": True,
-                "stages": [
-                    "preflight",
-                    "first-stage",
-                    "matrix",
-                    "owner-recovery",
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _seal_manifest(tmp_path)
     return events
 
 
 def test_hardware_summary_accepts_only_complete_evidence(tmp_path) -> None:
     _valid_results(tmp_path)
 
-    summary, errors = validate_results(tmp_path)
+    summary, errors = validate_results(tmp_path, _RUN_ID)
 
     assert errors == []
     assert "RAW/bin combinations recorded: 16/16" in summary
@@ -174,6 +197,11 @@ def test_hardware_summary_accepts_only_complete_evidence(tmp_path) -> None:
         "mixed-run-id",
         "old-artifact-mtime",
         "missing-completion",
+        "missing-manifest-hash",
+        "extra-manifest-hash",
+        "hashed-artifact-change",
+        "wrong-expected-run-id",
+        "zero-terminated-pid",
     ],
 )
 def test_hardware_summary_rejects_false_pass_mutations(
@@ -235,13 +263,34 @@ def test_hardware_summary_rejects_false_pass_mutations(
     elif mutation == "old-artifact-mtime":
         old = _STARTED.timestamp() - 1
         os.utime(tmp_path / "pytest-hardware.txt", (old, old))
-    else:
+    elif mutation == "missing-completion":
         (tmp_path / "completion.json").unlink()
+    elif mutation in {"missing-manifest-hash", "extra-manifest-hash"}:
+        completion_path = tmp_path / "completion.json"
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        if mutation == "missing-manifest-hash":
+            completion["artifacts"].pop("cases.jsonl")
+        else:
+            completion["artifacts"]["summary.md"] = "0" * 64
+        completion_path.write_text(json.dumps(completion), encoding="utf-8")
+    elif mutation == "hashed-artifact-change":
+        with (tmp_path / "preflight.json").open("a", encoding="utf-8") as stream:
+            stream.write(" ")
+    elif mutation == "zero-terminated-pid":
+        owner = next(
+            event for event in events if event.get("case") == "owner-termination"
+        )
+        owner["terminated_pid"] = 0
     (tmp_path / "cases.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in events),
         encoding="utf-8",
     )
+    if mutation == "zero-terminated-pid":
+        _seal_manifest(tmp_path)
 
-    _summary, errors = validate_results(tmp_path)
+    expected_run_id = (
+        _OTHER_RUN_ID if mutation == "wrong-expected-run-id" else _RUN_ID
+    )
+    _summary, errors = validate_results(tmp_path, expected_run_id)
 
     assert errors

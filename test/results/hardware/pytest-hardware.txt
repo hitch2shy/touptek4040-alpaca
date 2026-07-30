@@ -51,5 +51,4 @@ test\hardware\test_hardware_matrix.py::test_real_dark_bias_zero_duration_clamps_
 test\hardware\test_hardware_matrix.py::test_real_coordinator_preview_publishes_and_stops PASSED [ 97%]
 test\hardware\test_hardware_orientation.py::test_real_asymmetric_frame_preserves_yx_storage_and_ascom_x_first_order PASSED [100%]
 
-============================= 45 passed in 49.77s =============================
-
+============================= 45 passed in 49.79s =============================

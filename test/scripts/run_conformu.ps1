@@ -150,6 +150,18 @@ raise SystemExit(0 if record["passed"] else 1)
         $metadataJson + [Environment]::NewLine,
         (New-Object System.Text.UTF8Encoding($false))
     )
+    $textArtifacts = @(
+        Get-ChildItem -LiteralPath $results -Recurse -File |
+            Where-Object {
+                $_.Extension -in @(".json", ".jsonl", ".log", ".md", ".txt")
+            } |
+            Select-Object -ExpandProperty FullName
+    )
+    & $Python test/scripts/normalize_text_artifacts.py `
+        --replace $repo "<repo>" -- $textArtifacts
+    if ($LASTEXITCODE -ne 0) {
+        throw "ConformU text evidence normalization failed"
+    }
     & $Python test/scripts/summarize_conformu.py
     $summaryExit = $LASTEXITCODE
 }

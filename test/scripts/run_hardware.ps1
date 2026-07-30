@@ -149,22 +149,18 @@ raise SystemExit(0 if record["passed"] else 1)
             Tee-Object -FilePath $ownerRecoveryLog
         $exitCode = $LASTEXITCODE
     }
-    $normalizedLog = (Get-Content -LiteralPath $log -Raw).Replace(
-        $repo,
-        "<repo>"
+    $normalizationInputs = @(
+        $runMetadata,
+        $preflight,
+        $cases,
+        $firstStageLog,
+        $log,
+        $ownerRecoveryLog
     )
-    Set-Content -LiteralPath $log -Value $normalizedLog -Encoding utf8
-    $normalizedFirstStageLog = (Get-Content -LiteralPath $firstStageLog -Raw).Replace(
-        $repo,
-        "<repo>"
-    )
-    Set-Content -LiteralPath $firstStageLog -Value $normalizedFirstStageLog -Encoding utf8
-    if (Test-Path -LiteralPath $ownerRecoveryLog) {
-        $normalizedOwnerRecoveryLog = (
-            Get-Content -LiteralPath $ownerRecoveryLog -Raw
-        ).Replace($repo, "<repo>")
-        Set-Content -LiteralPath $ownerRecoveryLog `
-            -Value $normalizedOwnerRecoveryLog -Encoding utf8
+    & $Python test/scripts/normalize_text_artifacts.py `
+        --replace $repo "<repo>" -- $normalizationInputs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Hardware text evidence normalization failed"
     }
     if ($exitCode -ne 0) {
         throw "Hardware matrix failed with exit code $exitCode"
@@ -172,13 +168,41 @@ raise SystemExit(0 if record["passed"] else 1)
     Write-StageCompletion "first-stage" 2 $firstStageLog $firstStageCompletion
     Write-StageCompletion "matrix" 45 $log $matrixCompletion
     Write-StageCompletion "owner-recovery" 1 $ownerRecoveryLog $ownerRecoveryCompletion
+    & $Python test/scripts/normalize_text_artifacts.py -- `
+        $firstStageCompletion `
+        $matrixCompletion `
+        $ownerRecoveryCompletion
+    if ($LASTEXITCODE -ne 0) {
+        throw "Hardware stage completion normalization failed"
+    }
+    $manifestArtifacts = @(
+        "cases.jsonl",
+        "preflight.json",
+        "pytest-first-stage.txt",
+        "pytest-hardware.txt",
+        "pytest-owner-recovery.txt",
+        "first-stage-completion.json",
+        "matrix-completion.json",
+        "owner-recovery-completion.json",
+        "run-metadata.json"
+    )
+    $artifactHashes = [ordered]@{}
+    foreach ($artifactName in $manifestArtifacts) {
+        $artifactHashes[$artifactName] = (
+            Get-FileHash `
+                -LiteralPath (Join-Path $results $artifactName) `
+                -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+    }
     Write-Utf8Json $completion ([ordered]@{
+        schema_version = 2
         run_id = $runId
         completed_utc = [DateTime]::UtcNow.ToString("o")
         passed = $true
         stages = @("preflight", "first-stage", "matrix", "owner-recovery")
+        artifacts = $artifactHashes
     })
-    & $Python test/scripts/summarize_hardware.py
+    & $Python test/scripts/summarize_hardware.py --expected-run-id $runId
     $summaryExitCode = $LASTEXITCODE
     if ($summaryExitCode -ne 0) {
         throw "Hardware evidence summary failed with exit code $summaryExitCode"
