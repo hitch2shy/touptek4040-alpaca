@@ -168,9 +168,11 @@ class ScriptedFactory:
         self.sessions: list[SimpleNamespace] = []
         self.next_pid = 4100
         self.actual_duration_s: float | None = None
+        self.startup_specs: list[OwnerStartupSpec] = []
 
     def start(self, startup_spec, generation: int, registry_path: Path):
-        del startup_spec, registry_path
+        del registry_path
+        self.startup_specs.append(startup_spec)
         process = FakeProcess(self.next_pid)
         self.next_pid += 1
         session = SimpleNamespace(
@@ -310,6 +312,48 @@ def test_proxy_forwards_camera_contract_and_reconstructs_a_frozen_frame(tmp_path
     assert frame.pixels.flags.writeable is False
     assert frame.duration_s == 0.01
     assert factory.calls["release_frame"] == 1
+
+
+def test_default_real_owner_native_timeout_stays_below_owner_deadline(
+    tmp_path: Path,
+) -> None:
+    factory = ScriptedFactory()
+    config = OwnerConfig(
+        startup_timeout_s=1.0,
+        connect_timeout_s=1.0,
+        command_timeout_s=1.0,
+        exposure_overhead_s=10.0,
+        exposure_multiplier=1.02,
+        structural_reopen_settle_s=0.5,
+        abort_timeout_s=1.0,
+        disconnect_timeout_s=1.0,
+    )
+    proxy = CameraOwnerProxy(
+        serial="TP241025143218C92B01151AEC40CB7",
+        owner_config=config,
+        runtime_directory=tmp_path,
+        process_factory=factory,
+    )
+    try:
+        arguments = factory.startup_specs[0].backend_arguments
+        assert arguments == {
+            "trigger_timeout_multiplier": 1.02,
+            "trigger_timeout_overhead_s": 8.0,
+            "structural_reopen_settle_s": 0.5,
+        }
+        duration_s = 2.0
+        native_deadline = (
+            duration_s * arguments["trigger_timeout_multiplier"]
+            + arguments["trigger_timeout_overhead_s"]
+        )
+        owner_deadline = proxy._supervisor.deadline_for(
+            "acquire", actual_duration_s=duration_s
+        )
+        assert native_deadline == pytest.approx(10.04)
+        assert owner_deadline == pytest.approx(12.04)
+        assert native_deadline < owner_deadline
+    finally:
+        proxy.close()
 
 
 def test_heater_proxy_confirms_only_successful_reads_and_writes(tmp_path: Path):

@@ -1171,7 +1171,16 @@ class CameraOwnerProxy:
             self._supervisor = supervisor
             return
         config = owner_config or OwnerConfig()
-        spec = startup_spec or OwnerStartupSpec(serial=serial)
+        spec = startup_spec or OwnerStartupSpec(
+            serial=serial,
+            backend_arguments={
+                "trigger_timeout_multiplier": config.exposure_multiplier,
+                # Leave a deterministic 20% owner-response / termination
+                # margin while preserving the configured exposure formula.
+                "trigger_timeout_overhead_s": config.exposure_overhead_s * 0.8,
+                "structural_reopen_settle_s": config.structural_reopen_settle_s,
+            },
+        )
         base = (
             Path(runtime_directory)
             if runtime_directory is not None

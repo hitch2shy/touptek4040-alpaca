@@ -130,6 +130,9 @@ class ToupTekCamera:
         monotonic: Any = time.monotonic,
         sleeper: Any = time.sleep,
         trigger_recovery_s: float = 0.015,
+        structural_reopen_settle_s: float = 0.5,
+        trigger_timeout_multiplier: float = 1.02,
+        trigger_timeout_overhead_s: float = 8.0,
     ) -> None:
         if (
             isinstance(trigger_recovery_s, bool)
@@ -140,10 +143,35 @@ class ToupTekCamera:
             raise CameraInvalidValueError(
                 "trigger_recovery_s must be a finite non-negative number"
             )
+        if (
+            isinstance(structural_reopen_settle_s, bool)
+            or not isinstance(structural_reopen_settle_s, (int, float))
+            or not math.isfinite(structural_reopen_settle_s)
+            or structural_reopen_settle_s < 0
+        ):
+            raise CameraInvalidValueError(
+                "structural_reopen_settle_s must be a finite non-negative number"
+            )
+        for name, value in (
+            ("trigger_timeout_multiplier", trigger_timeout_multiplier),
+            ("trigger_timeout_overhead_s", trigger_timeout_overhead_s),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise CameraInvalidValueError(
+                    f"{name} must be a finite positive number"
+                )
         self._sdk = sdk if sdk is not None else load_default_toupcam_module()
         self._monotonic = monotonic
         self._sleeper = sleeper
         self._trigger_recovery_s = float(trigger_recovery_s)
+        self._structural_reopen_settle_s = float(structural_reopen_settle_s)
+        self._trigger_timeout_multiplier = float(trigger_timeout_multiplier)
+        self._trigger_timeout_overhead_s = float(trigger_timeout_overhead_s)
         self._last_trigger_completed_monotonic: float | None = None
         identities = enumerate_cameras(self._sdk)
         if serial is None:
@@ -286,7 +314,13 @@ class ToupTekCamera:
                     handle = self._require_connected_locked()
                 buffer = _allocate_buffer(applied)
                 frame_info = self._sdk.ToupcamFrameInfoV4()
-                timeout_ms = math.ceil(applied.duration_s * 1000 * 1.02 + 4000)
+                timeout_ms = math.ceil(
+                    (
+                        applied.duration_s * self._trigger_timeout_multiplier
+                        + self._trigger_timeout_overhead_s
+                    )
+                    * 1000
+                )
                 claim_state: dict[str, int] = {}
                 self._pace_reused_trigger()
 
@@ -763,6 +797,8 @@ class ToupTekCamera:
                 if self._handle is handle:
                     self._handle = None
                 self._configured_structure = None
+            if self._structural_reopen_settle_s > 0:
+                self._sleeper(self._structural_reopen_settle_s)
             try:
                 handle = self._sdk.Toupcam.Open(f"sn:{self.serial}")
             except BaseException as error:

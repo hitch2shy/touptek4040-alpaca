@@ -532,9 +532,14 @@ def test_production_backend_registers_opened_exact_serial_before_identity_accept
     approved_serial = "TP241025143218C92B01151AEC40CB7"
 
     class Candidate(FakeOwnerBackend):
-        def __init__(self, serial: str) -> None:
+        def __init__(self, serial: str, **timeout_arguments: object) -> None:
             events.append("construct")
             assert serial == approved_serial
+            assert timeout_arguments == {
+                "trigger_timeout_multiplier": 1.02,
+                "trigger_timeout_overhead_s": 8.0,
+                "structural_reopen_settle_s": 0.5,
+            }
             super().__init__(serial)
             self.identity = type("Identity", (), {"model": model})()
 

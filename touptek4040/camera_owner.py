@@ -99,13 +99,25 @@ class OwnerStartupSpec:
         object.__setattr__(self, "backend_arguments", dict(self.backend_arguments))
 
 
-def _create_toupcam_backend(serial: str | None = None, **_kwargs: object) -> OwnerBackend:
+def _create_toupcam_backend(
+    serial: str | None = None,
+    *,
+    trigger_timeout_multiplier: float = 1.02,
+    trigger_timeout_overhead_s: float = 8.0,
+    structural_reopen_settle_s: float = 0.5,
+    **_kwargs: object,
+) -> OwnerBackend:
     """Import the SDK adapter only after this spawned process has started."""
     if serial != APPROVED_CAMERA_SERIAL:
         raise ValueError("real owner requires the approved camera serial")
     from .toupcam_camera import ToupTekCamera
 
-    camera = ToupTekCamera(serial)
+    camera = ToupTekCamera(
+        serial,
+        trigger_timeout_multiplier=trigger_timeout_multiplier,
+        trigger_timeout_overhead_s=trigger_timeout_overhead_s,
+        structural_reopen_settle_s=structural_reopen_settle_s,
+    )
     camera.connect()
     return camera
 

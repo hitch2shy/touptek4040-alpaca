@@ -1,0 +1,12 @@
+{
+  "closed": true,
+  "conformu": "2.0.0.16486",
+  "enum_count": 1,
+  "model": "sMAX16AM-U3-CL-GPS",
+  "mutated": false,
+  "opened_model": "sMAX16AM-U3-CL-GPS",
+  "opened_serial": "TP241025143218C92B01151AEC40CB7",
+  "passed": true,
+  "recorded_utc": "2026-07-30T03:26:48.541395+00:00",
+  "serial": "TP241025143218C92B01151AEC40CB7"
+}

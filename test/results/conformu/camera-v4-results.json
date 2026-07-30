@@ -1,12 +1,16 @@
 {
   "ErrorCount": 0,
-  "IssueCount": 17,
+  "IssueCount": 18,
   "ConfigurationAlertCount": 0,
   "Errors": [],
   "Issues": [
     {
       "Key": "PercentCompleted Read",
       "Value": "Unexpected error: PercentCompleted is unavailable outside an exposure"
+    },
+    {
+      "Key": "StopExposure",
+      "Value": "CanStopExposure is false but no error is returned when StopExposure is called"
     },
     {
       "Key": "ImageArrayVariant",

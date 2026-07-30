@@ -29,6 +29,7 @@ def test_direct_owner_config_rejects_nonfinite_nonpositive_or_nonnumeric_values(
         "command_timeout_s": 5.0,
         "exposure_overhead_s": 10.0,
         "exposure_multiplier": 1.02,
+        "structural_reopen_settle_s": 0.5,
         "abort_timeout_s": 2.0,
         "disconnect_timeout_s": 10.0,
     }
@@ -36,6 +37,18 @@ def test_direct_owner_config_rejects_nonfinite_nonpositive_or_nonnumeric_values(
 
     with pytest.raises(ValueError):
         OwnerConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "value", [True, -1, float("nan"), float("inf"), "0.5", None]
+)
+def test_direct_owner_config_rejects_invalid_structural_reopen_settle(value):
+    with pytest.raises(ValueError):
+        OwnerConfig(structural_reopen_settle_s=value)
+
+
+def test_direct_owner_config_accepts_zero_structural_reopen_settle():
+    assert OwnerConfig(structural_reopen_settle_s=0).structural_reopen_settle_s == 0.0
 
 
 def test_production_defaults_use_real_toupcam():

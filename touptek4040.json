@@ -16,6 +16,7 @@
     "command_timeout_s": 5.0,
     "exposure_overhead_s": 10.0,
     "exposure_multiplier": 1.02,
+    "structural_reopen_settle_s": 0.5,
     "abort_timeout_s": 2.0,
     "disconnect_timeout_s": 10.0
   },

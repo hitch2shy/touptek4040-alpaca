@@ -31,6 +31,7 @@ def _json_config(**sections: object) -> dict[str, object]:
             "command_timeout_s": 5.0,
             "exposure_overhead_s": 10.0,
             "exposure_multiplier": 1.02,
+            "structural_reopen_settle_s": 0.5,
             "abort_timeout_s": 2.0,
             "disconnect_timeout_s": 10.0,
         },
@@ -53,6 +54,7 @@ def test_json_is_primary_and_owner_timeouts_are_loaded(tmp_path: Path):
     config = load_config(path, {})
 
     assert config.owner.connect_timeout_s == 20.0
+    assert config.owner.structural_reopen_settle_s == 0.5
     assert config.camera.serial == EXPECTED_SERIAL
     assert config.logging.directory == (tmp_path / "logs").resolve()
 
@@ -158,6 +160,19 @@ def test_json_config_rejects_nonpositive_owner_timeouts(
     path = tmp_path / "invalid.json"
     document = _json_config()
     document["owner"][timeout_key] = invalid_value  # type: ignore[index]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        load_config(path, {})
+
+
+@pytest.mark.parametrize("invalid_value", [-1.0, True, "0.5", None])
+def test_json_config_rejects_invalid_structural_reopen_settle(
+    tmp_path: Path, invalid_value: object
+):
+    path = tmp_path / "invalid.json"
+    document = _json_config()
+    document["owner"]["structural_reopen_settle_s"] = invalid_value  # type: ignore[index]
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(ValueError):

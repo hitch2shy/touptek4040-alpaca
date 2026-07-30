@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import Event
 from datetime import timezone
+import math
 import time
 
 import numpy as np
@@ -208,7 +209,22 @@ def test_trigger_timeout_includes_sdk_exposure_margin(camera: ToupTekCamera) -> 
     trigger_call = next(
         call for call in camera._sdk.calls if call[0] == "TriggerSyncV4"
     )
-    assert trigger_call == ("TriggerSyncV4", 4255, 0, -1)
+    assert trigger_call == ("TriggerSyncV4", 8255, 0, -1)
+
+
+def test_trigger_timeout_accepts_late_valid_frame_below_owner_deadline(
+    camera: ToupTekCamera,
+) -> None:
+    camera.acquire(2.0, Roi(0, 0, 32, 32), 1, ReadoutMode.RAW12)
+
+    trigger_call = next(
+        call for call in camera._sdk.calls if call[0] == "TriggerSyncV4"
+    )
+    native_timeout_ms = trigger_call[1]
+    observed_conform_completion_ms = 6500
+    default_owner_deadline_ms = math.ceil((2.0 * 1.02 + 10.0) * 1000)
+    assert 6040 < observed_conform_completion_ms < native_timeout_ms
+    assert native_timeout_ms < default_owner_deadline_ms
 
 
 def test_identical_exposures_reuse_one_started_pull_stream(camera: ToupTekCamera) -> None:
@@ -263,6 +279,93 @@ def test_structural_change_stops_reconfigures_and_restarts(camera: ToupTekCamera
         for index, call in enumerate(camera._sdk.calls)
         if call == ("put_Option", camera._sdk.TOUPCAM_OPTION_BITDEPTH, 0)
     )
+
+
+def test_structural_reopen_settles_after_close_before_open_only() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    sleeps: list[float] = []
+
+    def sleeper(seconds: float) -> None:
+        sleeps.append(seconds)
+        sdk.calls.append(("sleep", seconds))
+
+    camera = ToupTekCamera(
+        "TP241025143218C92B01151AEC40CB7",
+        sdk=sdk,
+        sleeper=sleeper,
+        structural_reopen_settle_s=0.5,
+    )
+    camera.connect()
+    assert sleeps == []
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    sdk.calls.clear()
+
+    camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    close_index = sdk.calls.index(("Close",))
+    settle_index = sdk.calls.index(("sleep", 0.5))
+    open_index = sdk.calls.index(("Open", f"sn:{camera.serial}"))
+    assert close_index < settle_index < open_index
+    assert sleeps == [0.5]
+
+
+def test_zero_structural_reopen_settle_skips_sleep() -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    sleeps: list[float] = []
+    camera = ToupTekCamera(
+        "TP241025143218C92B01151AEC40CB7",
+        sdk=sdk,
+        sleeper=sleeps.append,
+        structural_reopen_settle_s=0,
+    )
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, -1, float("nan"), float("inf"), "0.5", None],
+)
+def test_structural_reopen_settle_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(CameraInvalidValueError, match="structural_reopen_settle_s"):
+        ToupTekCamera(
+            "TP241025143218C92B01151AEC40CB7",
+            sdk=FakeSdk(),
+            structural_reopen_settle_s=value,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("failure", ["snapshot", "stop", "close"])
+def test_structural_reopen_failure_before_settle_does_not_sleep_or_open(
+    failure: str,
+) -> None:
+    sdk = FakeSdk(fresh_handles=True)
+    sleeps: list[float] = []
+    camera = ToupTekCamera(
+        "TP241025143218C92B01151AEC40CB7",
+        sdk=sdk,
+        sleeper=sleeps.append,
+        structural_reopen_settle_s=0.5,
+    )
+    camera.connect()
+    camera.acquire(0.01, Roi(0, 0, 32, 24), 1, ReadoutMode.RAW12)
+    handle = camera._handle
+    if failure == "snapshot":
+        handle.get_option_errors[OPTION_FAN] = FakeHResultError(E_FAIL)
+    elif failure == "stop":
+        handle.stop_error = FakeHResultError(E_FAIL)
+    else:
+        handle.close_error = FakeHResultError(E_FAIL)
+    sdk.calls.clear()
+
+    with pytest.raises(CameraError):
+        camera.acquire(0.02, Roi(2, 4, 32, 24), 2, ReadoutMode.RAW8)
+
+    assert sleeps == []
+    assert not any(call[0] == "Open" for call in sdk.calls)
 
 
 def test_structural_reopen_replays_persistent_state_on_a_fresh_handle() -> None:

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 import time
 from types import ModuleType
 from typing import Any, Iterable
@@ -16,7 +16,7 @@ from touptek4040.camera_contract import Roi
 from touptek4040.toupcam_camera import (
     CameraIdentity,
     ToupTekCamera,
-    enumerate_cameras,
+    _identity_from_handle,
 )
 from touptek4040.toupcam_loader import load_toupcam_module
 
@@ -27,6 +27,15 @@ RESULTS_DIR = Path(__file__).resolve().parents[1] / "results" / "hardware"
 _EXPECTED_IDLE_HRESULTS = {0x8000FFFF}
 
 
+def abort_readiness_timeout_s(camera: ToupTekCamera | Any) -> float:
+    """Bound readiness by the configured reopen delay plus native I/O budget."""
+
+    return (
+        float(camera._structural_reopen_settle_s)
+        + float(camera._trigger_timeout_overhead_s)
+    )
+
+
 def full_frame_roi(binning: int) -> Roi:
     """Largest even output square that maps within the 4096-pixel sensor."""
     if isinstance(binning, bool) or not isinstance(binning, int) or not 1 <= binning <= 8:
@@ -35,20 +44,62 @@ def full_frame_roi(binning: int) -> Roi:
     return Roi(0, 0, side, side)
 
 
-def require_unique_target(identities: Iterable[CameraIdentity]) -> CameraIdentity:
-    """Refuse all hardware access unless the one approved camera is attached."""
-    attached = list(identities)
+def require_unique_raw_target(devices: Iterable[Any]) -> Any:
+    """Validate raw EnumV2 metadata before any SDK handle is opened."""
+
+    attached = list(devices)
     if len(attached) != 1:
         raise RuntimeError(
             f"hardware tests require exactly one attached camera; found {len(attached)}"
         )
-    identity = attached[0]
-    if identity.serial != EXPECTED_SERIAL or identity.model != EXPECTED_MODEL:
+    device = attached[0]
+    raw_id = getattr(device, "id", None)
+    model = getattr(getattr(device, "model", None), "name", None)
+    display_name = getattr(device, "displayname", None)
+    if (
+        not isinstance(raw_id, str)
+        or not raw_id.strip()
+        or model != EXPECTED_MODEL
+        or display_name != EXPECTED_MODEL
+    ):
         raise RuntimeError(
             "attached device is not the approved target camera "
             f"{EXPECTED_MODEL}/{EXPECTED_SERIAL}"
         )
-    return identity
+    return device
+
+
+def open_verified_target(
+    sdk: ModuleType | Any,
+    evidence: "HardwareEvidence | None" = None,
+) -> CameraIdentity:
+    """Gate on EnumV2, then open only the approved serial selector."""
+
+    device = require_unique_raw_target(sdk.Toupcam.EnumV2())
+    selector = f"sn:{EXPECTED_SERIAL}"
+    if evidence is not None:
+        evidence.record(
+            "raw-enumeration-gate",
+            count=1,
+            raw_device_id_present=True,
+            model=device.model.name,
+            approved_selector=selector,
+        )
+    handle = sdk.Toupcam.Open(selector)
+    if handle is None:
+        raise RuntimeError("approved target camera could not be opened")
+    try:
+        identity = _identity_from_handle(device, handle)
+        if (
+            identity.serial != EXPECTED_SERIAL
+            or identity.model != EXPECTED_MODEL
+        ):
+            raise RuntimeError(
+                "opened device did not verify as the approved target camera"
+            )
+        return identity
+    finally:
+        handle.Close()
 
 
 @dataclass(frozen=True)
@@ -69,6 +120,8 @@ class HardwareSnapshot:
     hflip: bool
     vflip: bool
     trigger_cancel_mode: int | None
+    heater_level: int
+    heater_max_level: int
 
 
 class HardwareEvidence:
@@ -78,8 +131,12 @@ class HardwareEvidence:
         self.results_dir = results_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self._path = results_dir / "cases.jsonl"
-        self._lock = Lock()
-        self._path.write_text("", encoding="utf-8")
+        # SDK handle finalizers can run while an outer evidence payload is
+        # being JSON encoded.  Their instrumented Close call records another
+        # event on the same thread, so this lock must permit that re-entry.
+        self._lock = RLock()
+        if os.environ.get("TOUPTEK_HARDWARE_EVIDENCE_APPEND") != "1":
+            self._path.write_text("", encoding="utf-8")
 
     def record(self, case: str, **fields: Any) -> None:
         event = {
@@ -109,6 +166,7 @@ class HardwareSession:
         self._instrumented_handle: Any | None = None
         self._instrumented_handle_ids: set[int] = set()
         self._sdk_open_wrapped = False
+        self.native_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def connect_and_snapshot(self) -> None:
         self.camera.connect()
@@ -195,6 +253,9 @@ class HardwareSession:
             "put_Roi",
             "put_ExpoTime",
             "put_ExpoAGain",
+            "put_Temperature",
+            "put_HFlip",
+            "put_VFlip",
             "StartPullModeWithCallback",
             "TriggerSyncV4",
             "Stop",
@@ -214,8 +275,12 @@ class HardwareSession:
                     "put_Roi",
                     "put_ExpoTime",
                     "put_ExpoAGain",
+                    "put_Temperature",
+                    "put_HFlip",
+                    "put_VFlip",
                 }:
                     argument_summary = list(args)
+                self.native_calls.append((_name, tuple(args)))
                 effective_args = args
                 diagnostic_default = (
                     _name == "TriggerSyncV4"
@@ -301,6 +366,10 @@ class HardwareSession:
             trigger_cancel_mode=self._optional_option(
                 "TOUPCAM_OPTION_TRIGGER_CANCEL_MODE"
             ),
+            heater_level=handle.get_Option(self.sdk.TOUPCAM_OPTION_HEAT),
+            heater_max_level=handle.get_Option(
+                self.sdk.TOUPCAM_OPTION_HEAT_MAX
+            ),
         )
 
     def _optional_option(self, name: str) -> int | None:
@@ -338,6 +407,7 @@ class HardwareSession:
                 ("tec_target", lambda: handle.put_Temperature(initial.tec_target)),
                 ("tec", lambda: handle.put_Option(self.sdk.TOUPCAM_OPTION_TEC, initial.tec)),
                 ("fan", lambda: handle.put_Option(self.sdk.TOUPCAM_OPTION_FAN, initial.fan)),
+                ("heater_level", lambda: handle.put_Option(self.sdk.TOUPCAM_OPTION_HEAT, initial.heater_level)),
             )
             for name, restore in restorations:
                 try:
@@ -345,6 +415,10 @@ class HardwareSession:
                 except BaseException as error:
                     self.restoration_errors.append(f"{name}: {type(error).__name__}")
             final = self.read_snapshot()
+            if final.heater_max_level != initial.heater_max_level:
+                self.restoration_errors.append(
+                    "heater_max_level changed during the hardware session"
+                )
             self.evidence.record(
                 "restoration",
                 restored=final == initial,
@@ -391,7 +465,7 @@ def hardware_session(hardware_evidence: HardwareEvidence):
     if os.environ.get("TOUPTEK_HARDWARE_TEST") != "1":
         pytest.skip("set TOUPTEK_HARDWARE_TEST=1 to access attached hardware")
     sdk = load_toupcam_module(Path(__file__).resolve().parents[2])
-    identity = require_unique_target(enumerate_cameras(sdk))
+    identity = open_verified_target(sdk, hardware_evidence)
     session = HardwareSession(sdk, identity, hardware_evidence)
     session.connect_and_snapshot()
     try:

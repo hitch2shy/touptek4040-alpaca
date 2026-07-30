@@ -27,6 +27,7 @@ OPTION_TECTARGET = 0x0F
 OPTION_BINNING = 0x17
 OPTION_TEC_VOLTAGE = 0x20
 OPTION_TEC_VOLTAGE_MAX = 0x21
+OPTION_ROTATE = 0x18
 OPTION_HEAT = 0x2D
 OPTION_HEAT_MAX = 0x2E
 FLAG_HEAT = 0x40000000
@@ -96,6 +97,7 @@ class FakeToupCam:
             OPTION_TECTARGET: -100,
             OPTION_TEC_VOLTAGE: 50,
             OPTION_TEC_VOLTAGE_MAX: 60,
+            OPTION_ROTATE: 0,
             OPTION_HEAT: 2,
             OPTION_HEAT_MAX: 4,
         }
@@ -131,6 +133,13 @@ class FakeToupCam:
         self.frame_size_override: tuple[int, int] | None = None
         self.frame_info_size_override: tuple[int, int] | None = None
         self.started = False
+        self.hflip = False
+        self.vflip = False
+        self.get_option_errors: dict[int, Exception] = {}
+        self.put_option_errors: dict[int, Exception] = {}
+        self.put_hflip_error: Exception | None = None
+        self.put_vflip_error: Exception | None = None
+        self.put_temperature_error: Exception | None = None
 
     def SerialNumber(self) -> str:
         return "TP241025143218C92B01151AEC40CB7"
@@ -149,7 +158,7 @@ class FakeToupCam:
 
     def get_Resolution(self, index: int) -> tuple[int, int]:
         assert index == 0
-        return (4096, 4096)
+        return self.sdk.resolution
 
     def get_PixelSize(self, index: int) -> tuple[float, float]:
         assert index == 0
@@ -175,6 +184,8 @@ class FakeToupCam:
         self.put_option_entered.set()
         if self.block_put_option:
             self.put_option_release.wait(2)
+        if option in self.put_option_errors:
+            raise self.put_option_errors[option]
         self.options[option] = value
 
     def get_Option(self, option: int) -> int:
@@ -182,7 +193,29 @@ class FakeToupCam:
         self.option_entered.set()
         if self.block_option:
             self.option_release.wait(2)
+        if option in self.get_option_errors:
+            raise self.get_option_errors[option]
         return self.options[option]
+
+    def get_HFlip(self) -> bool:
+        self.sdk.calls.append(("get_HFlip",))
+        return self.hflip
+
+    def put_HFlip(self, value: bool) -> None:
+        self.sdk.calls.append(("put_HFlip", value))
+        if self.put_hflip_error is not None:
+            raise self.put_hflip_error
+        self.hflip = bool(value)
+
+    def get_VFlip(self) -> bool:
+        self.sdk.calls.append(("get_VFlip",))
+        return self.vflip
+
+    def put_VFlip(self, value: bool) -> None:
+        self.sdk.calls.append(("put_VFlip", value))
+        if self.put_vflip_error is not None:
+            raise self.put_vflip_error
+        self.vflip = bool(value)
 
     def put_Roi(self, x: int, y: int, width: int, height: int) -> None:
         self.sdk.calls.append(("put_Roi", x, y, width, height))
@@ -294,6 +327,8 @@ class FakeToupCam:
 
     def put_Temperature(self, value: int) -> None:
         self.sdk.calls.append(("put_Temperature", value))
+        if self.put_temperature_error is not None:
+            raise self.put_temperature_error
         self.options[OPTION_TECTARGET] = value
 
 
@@ -301,6 +336,7 @@ class FakeToupcamApi:
     def __init__(self, sdk: "FakeSdk") -> None:
         self.sdk = sdk
         self.handle = FakeToupCam(sdk)
+        self.handles = [self.handle]
 
     def EnumV2(self) -> list[FakeDevice]:
         return [FakeDevice()]
@@ -308,6 +344,13 @@ class FakeToupcamApi:
     def Open(self, device_id: str) -> FakeToupCam:
         assert device_id in {"usb:1-2", "sn:TP241025143218C92B01151AEC40CB7"}
         self.sdk.calls.append(("Open", device_id))
+        if self.sdk.fresh_handles:
+            self.handle = FakeToupCam(self.sdk)
+            self.handles.append(self.handle)
+            setup = self.sdk.next_open_setup
+            self.sdk.next_open_setup = None
+            if setup is not None:
+                setup(self.handle)
         self.handle.closed = False
         return self.handle
 
@@ -322,12 +365,16 @@ class FakeSdk:
     TOUPCAM_OPTION_BINNING = OPTION_BINNING
     TOUPCAM_OPTION_TEC_VOLTAGE = OPTION_TEC_VOLTAGE
     TOUPCAM_OPTION_TEC_VOLTAGE_MAX = OPTION_TEC_VOLTAGE_MAX
+    TOUPCAM_OPTION_ROTATE = OPTION_ROTATE
     TOUPCAM_OPTION_HEAT = OPTION_HEAT
     TOUPCAM_OPTION_HEAT_MAX = OPTION_HEAT_MAX
     TOUPCAM_FLAG_HEAT = FLAG_HEAT
     ToupcamFrameInfoV4 = FakeFrameInfoV4
     HRESULTException = FakeHResultError
 
-    def __init__(self) -> None:
+    def __init__(self, *, fresh_handles: bool = False) -> None:
         self.calls: list[tuple[Any, ...]] = []
+        self.fresh_handles = fresh_handles
+        self.next_open_setup: Any | None = None
+        self.resolution = (4096, 4096)
         self.Toupcam = FakeToupcamApi(self)

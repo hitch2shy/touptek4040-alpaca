@@ -4,9 +4,9 @@ Prerequisites are deliberately local-only:
 
 - the approved camera `sMAX16AM-U3-CL-GPS`,
   serial `TP241025143218C92B01151AEC40CB7`;
-- bundled SDK `G:\ToupTek_4040\toupcamsdk.20250623`;
-- ASCOM Conform Universal 2.0.0.16486 at
-  `C:\Program Files\ASCOM\ConformU\conformu.exe`.
+- bundled SDK `toupcamsdk.20250623/`;
+- ASCOM Conform Universal 2.0.0.16486, 64-bit, installed in its standard
+  Windows location.
 
 Run from the repository root:
 

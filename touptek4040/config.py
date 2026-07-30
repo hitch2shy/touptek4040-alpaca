@@ -33,6 +33,7 @@ class OwnerConfig:
     command_timeout_s: float = 5.0
     exposure_overhead_s: float = 10.0
     exposure_multiplier: float = 1.02
+    structural_reopen_settle_s: float = 0.5
     abort_timeout_s: float = 2.0
     disconnect_timeout_s: float = 10.0
 
@@ -65,6 +66,17 @@ class OwnerConfig:
                     f"owner.{field_name} must be a positive finite number"
                 )
             object.__setattr__(self, field_name, normalized)
+        value = self.structural_reopen_settle_s
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "owner.structural_reopen_settle_s must be a non-negative finite number"
+            )
+        object.__setattr__(self, "structural_reopen_settle_s", float(value))
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,7 @@ _JSON_SECTIONS = {
         "command_timeout_s",
         "exposure_overhead_s",
         "exposure_multiplier",
+        "structural_reopen_settle_s",
         "abort_timeout_s",
         "disconnect_timeout_s",
     },
@@ -211,6 +224,14 @@ def load_config(path: Path | None, overrides: Mapping[str, object]) -> AppConfig
             value("owner", "exposure_multiplier", OwnerConfig.exposure_multiplier),
             "owner.exposure_multiplier",
         ),
+        structural_reopen_settle_s=_nonnegative_float(
+            value(
+                "owner",
+                "structural_reopen_settle_s",
+                OwnerConfig.structural_reopen_settle_s,
+            ),
+            "owner.structural_reopen_settle_s",
+        ),
         abort_timeout_s=_positive_float(
             value("owner", "abort_timeout_s", OwnerConfig.abort_timeout_s),
             "owner.abort_timeout_s",
@@ -274,7 +295,13 @@ def _validate_json_section_values(section: str, values: dict[object, object]) ->
         for key, value in values.items():
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
                 raise ValueError(f"JSON value owner.{key} must be a finite number")
-            if value <= 0:
+            if key == "structural_reopen_settle_s":
+                if value < 0:
+                    raise ValueError(
+                        "JSON value owner.structural_reopen_settle_s "
+                        "must be non-negative"
+                    )
+            elif value <= 0:
                 raise ValueError(f"JSON value owner.{key} must be positive")
     if section in {"web", "security"}:
         key = "enabled" if section == "web" else "trusted_lan_only"
@@ -316,6 +343,18 @@ def _positive_float(value: object, name: str) -> float:
         raise ValueError(f"{name} must be a positive finite number") from error
     if not math.isfinite(result) or result <= 0:
         raise ValueError(f"{name} must be a positive finite number")
+    return result
+
+
+def _nonnegative_float(value: object, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-negative finite number") from error
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(f"{name} must be a non-negative finite number")
     return result
 
 

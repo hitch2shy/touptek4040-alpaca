@@ -11,9 +11,8 @@ from test.hardware.conftest import (
     EXPECTED_SERIAL,
     HardwareEvidence,
     HardwareSession,
-    require_unique_target,
+    open_verified_target,
 )
-from touptek4040.toupcam_camera import enumerate_cameras
 from touptek4040.toupcam_loader import load_toupcam_module
 
 
@@ -26,8 +25,8 @@ def main() -> int:
 
     root = Path(__file__).resolve().parents[2]
     sdk = load_toupcam_module(root)
-    identity = require_unique_target(enumerate_cameras(sdk))
     evidence = HardwareEvidence(root / "test" / "results" / "conformu")
+    identity = open_verified_target(sdk, evidence)
     guard = HardwareSession(sdk, identity, evidence)
     guard.connect_and_snapshot()
     guard.camera.disconnect()
@@ -75,4 +74,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,0 +1,11 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0 -- <repo>\.venv64\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: <repo>\test
+configfile: pytest.ini
+collecting ... collected 2 items
+
+test\hardware\test_hardware_identity.py::test_connected_camera_has_approved_identity PASSED [ 50%]
+test\hardware\test_hardware_acquisition.py::test_first_stage_raw12_16x16_exposure PASSED [100%]
+
+============================== 2 passed in 2.57s ==============================

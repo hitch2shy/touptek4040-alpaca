@@ -4,6 +4,8 @@ import math
 
 import pytest
 
+from touptek4040.camera_coordinator import CameraCoordinator
+
 
 @pytest.mark.hardware
 def test_temperature_and_cooler_are_readable_without_state_toggle(
@@ -47,3 +49,46 @@ def test_temperature_and_cooler_are_readable_without_state_toggle(
         toggled=False,
     )
 
+
+@pytest.mark.hardware
+def test_web_heater_level_round_trip_while_main_controller_is_connected(
+    real_camera,
+    hardware_session,
+    hardware_evidence,
+) -> None:
+    """Use the same coordinator path as Web control and restore in ``finally``."""
+
+    initial = hardware_session.initial
+    assert initial is not None
+    assert real_camera.heater_supported is True
+    assert real_camera.heater_max_level == initial.heater_max_level
+    assert real_camera.heater_level == initial.heater_level
+
+    maximum = initial.heater_max_level
+    if maximum == 0:
+        pytest.skip("device reports no alternate heater level")
+    alternate = 0 if initial.heater_level != 0 else 1
+    coordinator = CameraCoordinator(lambda _source: real_camera, "hardware")
+    coordinator.set_connected_sync(True)
+    try:
+        confirmed = coordinator.set_heater_level_confirmed_if_idle(alternate)
+        assert confirmed.level == alternate
+        assert real_camera.heater_level == alternate
+        hardware_evidence.record(
+            "web-heater",
+            main_controller_connected=True,
+            initial_level=initial.heater_level,
+            maximum_level=maximum,
+            requested_level=alternate,
+            confirmed_level=confirmed.level,
+        )
+    finally:
+        coordinator.set_heater_level_confirmed_if_idle(initial.heater_level)
+        restored = real_camera.heater_level
+        hardware_evidence.record(
+            "web-heater-restoration",
+            initial_level=initial.heater_level,
+            final_level=restored,
+            restored=restored == initial.heater_level,
+        )
+        assert restored == initial.heater_level

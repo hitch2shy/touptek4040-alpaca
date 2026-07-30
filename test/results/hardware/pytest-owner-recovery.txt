@@ -1,0 +1,10 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0 -- <repo>\.venv64\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: <repo>\test
+configfile: pytest.ini
+collecting ... collected 1 item
+
+test\hardware\test_owner_recovery.py::test_real_owner_termination_does_not_retry_or_publish_and_requires_reconnect PASSED [100%]
+
+============================== 1 passed in 6.00s ==============================

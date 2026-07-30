@@ -1,0 +1,10 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.1.1, pluggy-1.6.0 -- <repo>\.venv64\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: <repo>\test
+configfile: pytest.ini
+collecting ... collected 1 item
+
+test\packaging\test_distribution_assets.py::test_zip_matches_the_public_distribution_tree PASSED [100%]
+
+============================== 1 passed in 0.15s ==============================
