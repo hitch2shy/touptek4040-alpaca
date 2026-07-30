@@ -142,6 +142,19 @@ function Wait-OwnerChild {
     throw "Packaged owner child did not appear below PID $ParentPid."
 }
 
+function Get-OwnerChildPids {
+    param([int]$ParentPid)
+    return @(
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.ParentProcessId -eq $ParentPid -and
+                $_.CommandLine -like "*--multiprocessing-fork*"
+            } |
+            ForEach-Object { [int]$_.ProcessId } |
+            Sort-Object -Unique
+    )
+}
+
 $repositoryRoot = (& git rev-parse --show-toplevel).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repositoryRoot)) {
     throw "Could not resolve the Git repository root."
@@ -187,6 +200,22 @@ $logDirectory = [System.IO.Path]::Combine($resultsDirectory, "hardware-logs")
 $serverStdout = [System.IO.Path]::Combine($resultsDirectory, "packaged-hardware.stdout.txt")
 $serverStderr = [System.IO.Path]::Combine($resultsDirectory, "packaged-hardware.stderr.txt")
 $resultPath = [System.IO.Path]::Combine($resultsDirectory, "hardware.json")
+$registryPath = [System.IO.Path]::Combine(
+    $logDirectory,
+    "touptek4040-shared-frames.json"
+)
+$observerOutput = [System.IO.Path]::Combine(
+    $resultsDirectory,
+    "observed-shared-memory.json"
+)
+$observerStop = [System.IO.Path]::Combine(
+    $resultsDirectory,
+    "observe-shared-memory.stop"
+)
+$probeOutput = [System.IO.Path]::Combine(
+    $resultsDirectory,
+    "probed-shared-memory.json"
+)
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 
 $record = [ordered]@{
@@ -213,6 +242,7 @@ $record = [ordered]@{
     errors = @()
 }
 $server = $null
+$observer = $null
 
 try {
     if (-not $SkipRecovery) {
@@ -221,6 +251,35 @@ try {
             -Python $python `
             -Repository $repositoryRoot `
             -Results $resultsDirectory
+    }
+
+    if ($VerifyFormalContract) {
+        Remove-Item -LiteralPath @(
+            $registryPath,
+            $observerOutput,
+            $observerStop,
+            $probeOutput
+        ) -Force -ErrorAction SilentlyContinue
+        $observer = Start-Process `
+            -FilePath $python `
+            -ArgumentList @(
+                "test/scripts/observe_shared_memory.py",
+                "--registry", $registryPath,
+                "--output", $observerOutput,
+                "--stop-file", $observerStop
+            ) `
+            -WorkingDirectory $repositoryRoot `
+            -WindowStyle Hidden `
+            -PassThru
+        $observerDeadline = [System.DateTime]::UtcNow.AddSeconds(10)
+        while (
+            -not [System.IO.File]::Exists($observerOutput) -and
+            [System.DateTime]::UtcNow -lt $observerDeadline -and
+            -not $observer.HasExited
+        ) { Start-Sleep -Milliseconds 20 }
+        if (-not [System.IO.File]::Exists($observerOutput)) {
+            throw "Shared-memory registry observer did not become ready."
+        }
     }
 
     $port = Get-FreeTcpPort
@@ -274,10 +333,37 @@ try {
         $ownerChild = Wait-OwnerChild -ParentPid $server.Id
         $record.owner = [ordered]@{
             child_pid = [int]$ownerChild.ProcessId
+            child_pids_observed = @([int]$ownerChild.ProcessId)
             child_alive_while_connected = $true
             child_alive_after_disconnect = $null
+            child_pid_after_disconnect = $null
+            child_pid_after_reconnect = $null
+            child_pids_alive_after_package_shutdown = @()
             child_dead_after_package_shutdown = $false
         }
+        Invoke-WebJson `
+            -BaseUrl $baseUrl `
+            -Path "/web/v1/settings" `
+            -Body @{
+                binning = 1
+                readoutMode = "RAW 12-bit"
+                gain = 100
+                roi = @{ x = 0; y = 0; width = 4096; height = 4096 }
+            } | Out-Null
+        Invoke-WebJson `
+            -BaseUrl $baseUrl `
+            -Path "/web/v1/exposure" `
+            -Body @{ duration = 0.01 } | Out-Null
+        $observedState = Wait-WebState `
+            -BaseUrl $baseUrl `
+            -TimeoutSeconds 25 `
+            -Predicate {
+                param($current)
+                $null -ne $current.image -and
+                $current.image.width -eq 4096 -and
+                $current.image.height -eq 4096
+            }
+        $observedGeneration = [int]$observedState.generation
     }
 
     Invoke-WebJson `
@@ -298,7 +384,16 @@ try {
     $state = Wait-WebState `
         -BaseUrl $baseUrl `
         -TimeoutSeconds 25 `
-        -Predicate { param($current) $null -ne $current.image }
+        -Predicate {
+            param($current)
+            $null -ne $current.image -and
+            $current.image.width -eq 16 -and
+            $current.image.height -eq 16 -and
+            (
+                -not $VerifyFormalContract -or
+                [int]$current.generation -ne $observedGeneration
+            )
+        }
     if (
         $state.image.width -ne 16 -or
         $state.image.height -ne 16 -or
@@ -396,6 +491,14 @@ try {
         $record.owner.child_alive_after_disconnect = (
             $null -ne (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
         )
+        $afterDisconnectPids = @(Get-OwnerChildPids -ParentPid $server.Id)
+        if ($afterDisconnectPids.Count -gt 0) {
+            $record.owner.child_pid_after_disconnect = $afterDisconnectPids[0]
+            $record.owner.child_pids_observed = @(
+                $record.owner.child_pids_observed + $afterDisconnectPids |
+                    Sort-Object -Unique
+            )
+        }
         Invoke-WebJson `
             -BaseUrl $baseUrl `
             -Path "/web/v1/connection" `
@@ -404,6 +507,13 @@ try {
             -BaseUrl $baseUrl `
             -TimeoutSeconds 25 `
             -Predicate { param($current) $current.connected -eq $true }
+        $reconnectedOwner = Wait-OwnerChild -ParentPid $server.Id
+        $record.owner.child_pid_after_reconnect = [int]$reconnectedOwner.ProcessId
+        $record.owner.child_pids_observed = @(
+            $record.owner.child_pids_observed +
+                [int]$reconnectedOwner.ProcessId |
+                Sort-Object -Unique
+        )
         $restoredHeat = [int]$reconnectedState.heaterLevel
         $record.heater.restored = $restoredHeat
         $record.heater.restored_by_disconnect = ($restoredHeat -eq $initialHeat)
@@ -430,6 +540,18 @@ catch {
     $record.errors += $_.Exception.Message
 }
 finally {
+    if (
+        $VerifyFormalContract -and
+        $null -ne $server -and
+        -not $server.HasExited -and
+        $null -ne $record.owner
+    ) {
+        $record.owner.child_pids_observed = @(
+            $record.owner.child_pids_observed +
+                @(Get-OwnerChildPids -ParentPid $server.Id) |
+                Sort-Object -Unique
+        )
+    }
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
         if (-not $server.WaitForExit(10000)) {
@@ -439,29 +561,71 @@ finally {
     $record.exact_process_stopped = (
         $null -eq $server -or $server.HasExited
     )
+    if ($VerifyFormalContract -and $null -ne $observer) {
+        New-Item -ItemType File -Path $observerStop -Force | Out-Null
+        if (-not $observer.WaitForExit(10000)) {
+            Stop-Process -Id $observer.Id -Force -ErrorAction SilentlyContinue
+            $record.errors += "Shared-memory registry observer did not stop."
+        }
+    }
     if ($VerifyFormalContract -and $null -ne $record.owner) {
-        $ownerPid = [int]$record.owner.child_pid
-        $ownerDeadline = [System.DateTime]::UtcNow.AddSeconds(10)
-        while (
-            [System.DateTime]::UtcNow -lt $ownerDeadline -and
-            $null -ne (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
-        ) { Start-Sleep -Milliseconds 100 }
+        $aliveOwnerPids = @()
+        foreach ($ownerPid in @($record.owner.child_pids_observed)) {
+            $ownerDeadline = [System.DateTime]::UtcNow.AddSeconds(10)
+            while (
+                [System.DateTime]::UtcNow -lt $ownerDeadline -and
+                $null -ne (
+                    Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                )
+            ) { Start-Sleep -Milliseconds 100 }
+            if (
+                $null -ne (
+                    Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                )
+            ) { $aliveOwnerPids += [int]$ownerPid }
+        }
+        $record.owner.child_pids_alive_after_package_shutdown = @(
+            $aliveOwnerPids
+        )
         $record.owner.child_dead_after_package_shutdown = (
-            $null -eq (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+            $aliveOwnerPids.Count -eq 0
         )
-        $registryPath = [System.IO.Path]::Combine(
-            $logDirectory,
-            "touptek4040-shared-frames.json"
-        )
+        $observedNames = @()
+        if ([System.IO.File]::Exists($observerOutput)) {
+            $observation = Get-Content -LiteralPath $observerOutput -Raw |
+                ConvertFrom-Json
+            $observedNames = @($observation.observed_names)
+        }
         $registryNames = @()
         if ([System.IO.File]::Exists($registryPath)) {
             $registry = Get-Content -LiteralPath $registryPath -Raw |
                 ConvertFrom-Json
             $registryNames = @($registry.frames | ForEach-Object { $_.name })
         }
+        $probedNames = @()
+        $liveSegmentNames = @()
+        if ([System.IO.File]::Exists($observerOutput)) {
+            & $python "test/scripts/probe_shared_memory_names.py" `
+                --observed $observerOutput `
+                --result $probeOutput
+            if ($LASTEXITCODE -ne 0) {
+                $record.errors += "Shared-memory reopen probe failed."
+            }
+            elseif ([System.IO.File]::Exists($probeOutput)) {
+                $probe = Get-Content -LiteralPath $probeOutput -Raw |
+                    ConvertFrom-Json
+                $probedNames = @($probe.probed_names)
+                $liveSegmentNames = @($probe.live_segment_names)
+            }
+        }
+        else {
+            $record.errors += "Shared-memory observation evidence is missing."
+        }
         $record.shared_memory = [ordered]@{
+            observed_names = @($observedNames)
+            probed_names = @($probedNames)
             registry_names = @($registryNames)
-            live_segment_names = @()
+            live_segment_names = @($liveSegmentNames)
         }
     }
     if (-not $SkipRecovery) {
@@ -496,7 +660,14 @@ if (
         -not $record.heater.reconnect_confirmed_initial -or
         $record.heater.manual_restore_before_disconnect -or
         -not $record.heater.alternate_left_active -or
+        $record.owner.child_pids_observed.Count -eq 0 -or
+        $null -eq $record.owner.child_pid_after_reconnect -or
+        $record.owner.child_pids_alive_after_package_shutdown.Count -ne 0 -or
         -not $record.owner.child_dead_after_package_shutdown -or
+        $record.shared_memory.observed_names.Count -eq 0 -or
+        @(Compare-Object `
+            $record.shared_memory.observed_names `
+            $record.shared_memory.probed_names).Count -ne 0 -or
         $record.shared_memory.registry_names.Count -ne 0 -or
         $record.shared_memory.live_segment_names.Count -ne 0
     )) -or

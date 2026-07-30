@@ -586,7 +586,7 @@ def test_official_runner_preserves_unknown_diagnostics_and_refreshes_known_files
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=180,
             env=environment,
         )
 

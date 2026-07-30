@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "sdk_release": "toupcamsdk.20250623",
+  "files": [
+    {
+      "path": "python/toupcam.py",
+      "size": 171655,
+      "version": "59.28760.20250623",
+      "sha256": "b472d455d4506a3ca642a1df0b77986fea42d97f7deffe1ea33b6b1bb06f5520"
+    },
+    {
+      "path": "win/x64/toupcam.dll",
+      "size": 27495712,
+      "version": "59.28760.20250623",
+      "sha256": "f81d9705c1c6af3b5d5c07fedec2cf09a8a113dc6d6efebd58798e9b12c04460"
+    }
+  ]
+}

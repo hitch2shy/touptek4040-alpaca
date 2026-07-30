@@ -26,7 +26,15 @@ def test_real_package_evidence_proves_automatic_restore_and_owner_cleanup() -> N
     assert evidence["heater"]["restored_by_disconnect"] is True
     assert evidence["heater"]["reconnect_confirmed_initial"] is True
     assert evidence["owner"]["child_pid"] != evidence["process_id"]
-    assert evidence["owner"]["child_alive_after_disconnect"] is True
+    assert evidence["owner"]["child_pids_observed"]
+    assert evidence["owner"]["child_pid"] in evidence["owner"][
+        "child_pids_observed"
+    ]
+    assert evidence["owner"]["child_pid_after_reconnect"] in evidence["owner"][
+        "child_pids_observed"
+    ]
+    assert evidence["owner"]["child_pids_alive_after_package_shutdown"] == []
     assert evidence["owner"]["child_dead_after_package_shutdown"] is True
+    assert evidence["shared_memory"]["observed_names"]
     assert evidence["shared_memory"]["registry_names"] == []
     assert evidence["shared_memory"]["live_segment_names"] == []

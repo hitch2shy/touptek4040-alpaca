@@ -79,5 +79,28 @@ def test_frozen_executable_spawns_child_and_round_trips_shared_memory(
     assert result["ack_count"] == 1
     assert result["payload_round_trip"] is True
     assert result["child_dead"] is True
+    assert result["observed_names"] == [result["descriptor_name"]]
     assert result["registry_names"] == []
-    assert result["live_segment_names"] == []
+    assert result["live_names"] == []
+
+
+def test_registry_and_live_probe_report_a_forged_live_mapping(
+    tmp_path: Path,
+) -> None:
+    from multiprocessing import shared_memory
+
+    from touptek4040.release_probe import probe_live_names, read_registry_names
+
+    segment = shared_memory.SharedMemory(create=True, size=1)
+    try:
+        registry = tmp_path / "registry.json"
+        registry.write_text(
+            json.dumps({"frames": [{"name": segment.name}]}),
+            encoding="utf-8",
+        )
+        observed = read_registry_names(registry)
+        assert observed == [segment.name]
+        assert probe_live_names(observed) == [segment.name]
+    finally:
+        segment.close()
+        segment.unlink()

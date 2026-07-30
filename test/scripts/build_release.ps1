@@ -1,4 +1,6 @@
-param()
+param(
+    [string]$SdkRoot = ""
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -14,6 +16,7 @@ $guideFileName = (-join @(
 )) + ".txt"
 $releaseInputs = @(
     ".gitignore",
+    "official-touptek-sdk.lock.json",
     "ToupTek4040Control.spec",
     "assets/touptek4040.ico",
     "run_alpaca.py",
@@ -46,13 +49,100 @@ $mainRepository = [System.IO.Directory]::GetParent($commonGitDir).FullName
 $releaseWorktreesRoot = Join-Path $mainRepository ".release-worktrees"
 $cleanSource = Join-Path $releaseWorktreesRoot ("release-" + [guid]::NewGuid().ToString("N"))
 $sourceArchive = $cleanSource + ".zip"
-$sdkRoot = Join-Path $mainRepository "toupcamsdk.20250623"
-$sdkDll = Join-Path $sdkRoot "win\x64\toupcam.dll"
-foreach ($required in @($sdkDll, $python)) {
+$sdkLockPath = Join-Path $RepositoryRoot "official-touptek-sdk.lock.json"
+if ([string]::IsNullOrWhiteSpace($SdkRoot)) {
+    $SdkRoot = Join-Path $mainRepository "toupcamsdk.20250623"
+}
+$sdkRootPath = [System.IO.Path]::GetFullPath($SdkRoot)
+foreach ($required in @($sdkLockPath, $python)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required release input is missing: $required"
     }
 }
+
+function Get-TextSha256 {
+    param([string]$Text)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString(
+            $algorithm.ComputeHash($bytes)
+        )).Replace("-", "").ToLowerInvariant()
+    }
+    finally { $algorithm.Dispose() }
+}
+
+$sdkLock = Get-Content -LiteralPath $sdkLockPath -Raw | ConvertFrom-Json
+if (
+    $sdkLock.schema_version -ne 1 -or
+    $sdkLock.sdk_release -ne "toupcamsdk.20250623" -or
+    @($sdkLock.files).Count -ne 2
+) {
+    throw "Official SDK lock mismatch: invalid lock schema or release."
+}
+$expectedSdkPaths = @("python/toupcam.py", "win/x64/toupcam.dll")
+$sdkFiles = @()
+for ($index = 0; $index -lt $expectedSdkPaths.Count; $index++) {
+    $entry = @($sdkLock.files)[$index]
+    $relative = [string]$entry.path
+    if ($relative -cne $expectedSdkPaths[$index]) {
+        throw "Official SDK lock mismatch: unexpected path $relative."
+    }
+    $externalPath = [System.IO.Path]::GetFullPath(
+        (Join-Path $sdkRootPath $relative)
+    )
+    $sdkPrefix = $sdkRootPath.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    ) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $externalPath.StartsWith(
+        $sdkPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Official SDK lock mismatch: path escapes SDK root."
+    }
+    if (-not (Test-Path -LiteralPath $externalPath -PathType Leaf)) {
+        throw "Official SDK lock mismatch: missing $relative."
+    }
+    $actualSize = (Get-Item -LiteralPath $externalPath).Length
+    $actualHash = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $externalPath
+    ).Hash.ToLowerInvariant()
+    if (
+        $actualSize -ne [long]$entry.size -or
+        $actualHash -cne [string]$entry.sha256
+    ) {
+        throw "Official SDK lock mismatch: size or SHA-256 differs for $relative."
+    }
+    if ($relative -eq "python/toupcam.py") {
+        $firstLine = Get-Content -LiteralPath $externalPath -TotalCount 1
+        $actualVersion = if ($firstLine -match "Version:\s*([0-9.]+)") {
+            $Matches[1]
+        } else { "" }
+    }
+    else {
+        $actualVersion = (Get-Item -LiteralPath $externalPath).VersionInfo.FileVersion
+    }
+    if ($actualVersion -cne [string]$entry.version) {
+        throw "Official SDK lock mismatch: version differs for $relative."
+    }
+    $sdkFiles += [ordered]@{
+        path = $relative
+        size = [long]$actualSize
+        version = [string]$actualVersion
+        sha256 = $actualHash
+        source_path = $externalPath
+    }
+}
+$sdkAggregateText = (
+    $sdkFiles | ForEach-Object {
+        "$($_.path)|$($_.size)|$($_.version)|$($_.sha256)"
+    }
+) -join "`n"
+$sdkAggregateHash = Get-TextSha256 ($sdkAggregateText + "`n")
+$sdkLockHash = (
+    Get-FileHash -Algorithm SHA256 -LiteralPath $sdkLockPath
+).Hash.ToLowerInvariant()
 
 New-Item -ItemType Directory -Path $releaseWorktreesRoot -Force | Out-Null
 try {
@@ -62,6 +152,22 @@ try {
         $sourceCommit
     if ($LASTEXITCODE -ne 0) { throw "Could not archive the exact source commit." }
     Expand-Archive -LiteralPath $sourceArchive -DestinationPath $cleanSource
+    foreach ($entry in $sdkFiles) {
+        $stagedPath = Join-Path (
+            Join-Path $cleanSource "_release-sdk"
+        ) $entry.path
+        New-Item -ItemType Directory -Path (
+            Split-Path -Parent $stagedPath
+        ) -Force | Out-Null
+        Copy-Item -LiteralPath $entry.source_path -Destination $stagedPath
+        if (
+            (Get-Item -LiteralPath $stagedPath).Length -ne $entry.size -or
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedPath).
+                Hash.ToLowerInvariant() -cne $entry.sha256
+        ) {
+            throw "Official SDK staged copy mismatch: $($entry.path)."
+        }
+    }
 
     $trackedInputs = @(
         & git -c core.quotePath=false -C $RepositoryRoot `
@@ -112,7 +218,9 @@ try {
     if (-not (Test-Path -LiteralPath $distDirectory -PathType Container)) {
         throw "Formal distribution was not created: $distDirectory"
     }
-    Copy-Item -LiteralPath $sdkDll -Destination (
+    Copy-Item -LiteralPath (
+        Join-Path $cleanSource "_release-sdk\win\x64\toupcam.dll"
+    ) -Destination (
         Join-Path $distDirectory "toupcam.dll"
     ) -Force
     Copy-Item -LiteralPath (Join-Path $cleanSource "touptek4040.json") `
@@ -127,6 +235,21 @@ try {
         schema_version = 1
         source_commit = $sourceCommit
         files = $manifestFiles
+        external_sdk = [ordered]@{
+            lock_path = "official-touptek-sdk.lock.json"
+            lock_sha256 = $sdkLockHash
+            aggregate_sha256 = $sdkAggregateHash
+            files = @(
+                $sdkFiles | ForEach-Object {
+                    [ordered]@{
+                        path = $_.path
+                        size = $_.size
+                        version = $_.version
+                        sha256 = $_.sha256
+                    }
+                }
+            )
+        }
     }
     $manifestPath = Join-Path $distDirectory "RELEASE-INPUTS.json"
     $manifestText = ($manifest | ConvertTo-Json -Depth 8) + "`n"
@@ -143,6 +266,12 @@ try {
         "Designation: FORMAL RELEASE",
         "SourceCommit: $sourceCommit",
         "ReleaseInputsSHA256: $manifestHash",
+        "OfficialSdkLockSHA256: $sdkLockHash",
+        "OfficialSdkInputsSHA256: $sdkAggregateHash",
+        "OfficialSdkWrapperSize: $($sdkFiles[0].size)",
+        "OfficialSdkWrapperSHA256: $($sdkFiles[0].sha256)",
+        "OfficialSdkDllSize: $($sdkFiles[1].size)",
+        "OfficialSdkDllSHA256: $($sdkFiles[1].sha256)",
         "Built: $built"
     ) -join "`r`n"
     [System.IO.File]::WriteAllText(

@@ -4,11 +4,7 @@ from pathlib import Path
 
 
 root = Path(SPECPATH).resolve()
-sdk_candidates = (
-    root / "toupcamsdk.20250623",
-    root.parent.parent / "toupcamsdk.20250623",
-)
-sdk_root = next(path for path in sdk_candidates if path.is_dir())
+sdk_root = root / "_release-sdk"
 sdk_python = sdk_root / "python"
 icon = root / "assets" / "touptek4040.ico"
 
