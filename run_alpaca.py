@@ -8,6 +8,7 @@ import multiprocessing
 import signal
 import socket
 import threading
+import sys
 from logging.handlers import RotatingFileHandler
 from collections.abc import Sequence
 from dataclasses import replace
@@ -628,7 +629,14 @@ def _close_camera_supervisor(coordinator: CameraCoordinator) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     multiprocessing.freeze_support()
-    server = build_server(config_from_args(argv))
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv[:1] == ["--release-owner-probe"]:
+        if len(effective_argv) != 2:
+            raise SystemExit("--release-owner-probe requires exactly one result path")
+        from touptek4040.release_probe import run_release_owner_probe
+
+        return run_release_owner_probe(Path(effective_argv[1]))
+    server = build_server(config_from_args(effective_argv))
     restore_handlers = lambda: None
     termination = threading.Event()
     try:

@@ -8,3 +8,7 @@ build/
 dist/
 *.egg-info/
 logs/
+.release-worktrees/
+test/results/temporary-package/
+touptek4040/toupcam.dll
+touptek4040/toupcam.lib

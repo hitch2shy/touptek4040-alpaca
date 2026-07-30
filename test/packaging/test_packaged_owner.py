@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
 import subprocess
 import time
@@ -58,10 +59,25 @@ def test_packaged_simulator_never_spawns_camera_owner(tmp_path: Path) -> None:
         process.wait(timeout=10)
 
 
-def test_frozen_distribution_contains_owner_and_shared_memory_modules() -> None:
-    runtime = DIST_DIR / "_runtime"
-    names = {path.name.casefold() for path in runtime.rglob("*") if path.is_file()}
-    assert "python313.dll" in names
-    # Runtime behavior is exercised by the packaged real-camera smoke. This
-    # structural gate prevents accidentally producing the old in-process build.
-    assert (DIST_DIR / "ToupTek4040Alpaca.exe").stat().st_size > 100_000
+def test_frozen_executable_spawns_child_and_round_trips_shared_memory(
+    tmp_path: Path,
+) -> None:
+    executable = DIST_DIR / "ToupTek4040Alpaca.exe"
+    result_path = tmp_path / "owner-probe.json"
+    completed = subprocess.run(
+        [str(executable), "--release-owner-probe", str(result_path)],
+        cwd=DIST_DIR,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["parent_pid"] != result["child_pid"]
+    assert result["generation"] == 1
+    assert result["publication_count"] == 1
+    assert result["ack_count"] == 1
+    assert result["payload_round_trip"] is True
+    assert result["child_dead"] is True
+    assert result["registry_names"] == []
+    assert result["live_segment_names"] == []

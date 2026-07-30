@@ -25,6 +25,7 @@ common_hiddenimports = [
     "touptek4040.owner_backend",
     "touptek4040.owner_protocol",
     "touptek4040.shared_frames",
+    "touptek4040.release_probe",
     "multiprocessing",
     "multiprocessing.connection",
     "multiprocessing.popen_spawn_win32",

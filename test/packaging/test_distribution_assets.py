@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import zipfile
+import subprocess
 from pathlib import Path
 
 from touptek4040.config import load_config
@@ -21,6 +22,7 @@ REQUIRED_ROOT = {
     "touptek4040.json",
     "使用说明.txt",
     "BUILD-INFO.txt",
+    "RELEASE-INPUTS.json",
     "_runtime",
 }
 
@@ -77,7 +79,31 @@ def test_build_identity_labels_formal_release() -> None:
         ).splitlines()
     )
     assert fields["Designation"].strip() == "FORMAL RELEASE"
-    assert len(fields["Commit"].strip()) == 40
+    source_commit = fields["SourceCommit"].strip()
+    assert len(source_commit) == 40
+    manifest = DIST_DIR / "RELEASE-INPUTS.json"
+    assert fields["ReleaseInputsSHA256"].strip() == __import__(
+        "hashlib"
+    ).sha256(manifest.read_bytes()).hexdigest().upper()
+
+
+def test_release_input_manifest_matches_exact_committed_source() -> None:
+    manifest = json.loads((DIST_DIR / "RELEASE-INPUTS.json").read_text("utf-8"))
+    source_commit = manifest["source_commit"]
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{source_commit}^{{commit}}"],
+        cwd=ROOT,
+        check=False,
+    ).returncode == 0
+    assert manifest["files"]
+    for entry in manifest["files"]:
+        blob = subprocess.run(
+            ["git", "show", f"{source_commit}:{entry['path']}"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert __import__("hashlib").sha256(blob).hexdigest() == entry["sha256"]
 
 
 def test_formal_zip_exactly_matches_distribution() -> None:

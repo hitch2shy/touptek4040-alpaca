@@ -123,6 +123,25 @@ function Wait-WebState {
     throw "Packaged camera state did not converge: $($last | ConvertTo-Json -Depth 8 -Compress)"
 }
 
+function Wait-OwnerChild {
+    param(
+        [int]$ParentPid,
+        [int]$TimeoutSeconds = 10
+    )
+    $deadline = [System.DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([System.DateTime]::UtcNow -lt $deadline) {
+        $candidate = Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.ParentProcessId -eq $ParentPid -and
+                $_.CommandLine -like "*--multiprocessing-fork*"
+            } |
+            Select-Object -First 1
+        if ($null -ne $candidate) { return $candidate }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Packaged owner child did not appear below PID $ParentPid."
+}
+
 $repositoryRoot = (& git rev-parse --show-toplevel).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repositoryRoot)) {
     throw "Could not resolve the Git repository root."
@@ -185,6 +204,8 @@ $record = [ordered]@{
     fits = $false
     abort = $false
     heater = $null
+    owner = $null
+    shared_memory = $null
     disconnected = $false
     exact_process_stopped = $false
     recovery_before = $null
@@ -249,6 +270,15 @@ try {
         -TimeoutSeconds 25 `
         -Predicate { param($state) $state.connected -eq $true } | Out-Null
     $record.connected = $true
+    if ($VerifyFormalContract) {
+        $ownerChild = Wait-OwnerChild -ParentPid $server.Id
+        $record.owner = [ordered]@{
+            child_pid = [int]$ownerChild.ProcessId
+            child_alive_while_connected = $true
+            child_alive_after_disconnect = $null
+            child_dead_after_package_shutdown = $false
+        }
+    }
 
     Invoke-WebJson `
         -BaseUrl $baseUrl `
@@ -329,18 +359,15 @@ try {
         if ([int]$alternateState.heaterLevel -ne $alternateHeat) {
             throw "Packaged Web heater alternate level was not confirmed."
         }
-        Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/heater" -Body @{
-            heaterLevel = $initialHeat
-        } | Out-Null
-        $restoredHeat = [int](Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state").heaterLevel
-        if ($restoredHeat -ne $initialHeat) {
-            throw "Packaged Web heater did not restore its exact initial level."
-        }
         $record.heater = [ordered]@{
             initial = $initialHeat
             maximum = $maximumHeat
             alternate = $alternateHeat
-            restored = $restoredHeat
+            alternate_left_active = $true
+            manual_restore_before_disconnect = $false
+            restored_by_disconnect = $false
+            reconnect_confirmed_initial = $false
+            restored = $null
         }
 
         $abortBody = "Duration=1&Light=true&ClientID=1&ClientTransactionID=2"
@@ -364,6 +391,40 @@ try {
         -TimeoutSeconds 15 `
         -Predicate { param($current) $current.connected -eq $false } | Out-Null
     $record.disconnected = $true
+    if ($VerifyFormalContract) {
+        $ownerPid = [int]$record.owner.child_pid
+        $record.owner.child_alive_after_disconnect = (
+            $null -ne (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+        )
+        Invoke-WebJson `
+            -BaseUrl $baseUrl `
+            -Path "/web/v1/connection" `
+            -Body @{ connected = $true } | Out-Null
+        $reconnectedState = Wait-WebState `
+            -BaseUrl $baseUrl `
+            -TimeoutSeconds 25 `
+            -Predicate { param($current) $current.connected -eq $true }
+        $restoredHeat = [int]$reconnectedState.heaterLevel
+        $record.heater.restored = $restoredHeat
+        $record.heater.restored_by_disconnect = ($restoredHeat -eq $initialHeat)
+        $record.heater.reconnect_confirmed_initial = ($restoredHeat -eq $initialHeat)
+        if ($restoredHeat -ne $initialHeat) {
+            # Safety-only repair. Do not perform a normal Disconnect afterwards:
+            # its bad connection snapshot would restore the alternate level.
+            Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/heater" -Body @{
+                heaterLevel = $initialHeat
+            } | Out-Null
+            throw "Disconnect failed to restore the packaged Web heater automatically."
+        }
+        Invoke-WebJson `
+            -BaseUrl $baseUrl `
+            -Path "/web/v1/connection" `
+            -Body @{ connected = $false } | Out-Null
+        Wait-WebState `
+            -BaseUrl $baseUrl `
+            -TimeoutSeconds 15 `
+            -Predicate { param($current) $current.connected -eq $false } | Out-Null
+    }
 }
 catch {
     $record.errors += $_.Exception.Message
@@ -378,6 +439,31 @@ finally {
     $record.exact_process_stopped = (
         $null -eq $server -or $server.HasExited
     )
+    if ($VerifyFormalContract -and $null -ne $record.owner) {
+        $ownerPid = [int]$record.owner.child_pid
+        $ownerDeadline = [System.DateTime]::UtcNow.AddSeconds(10)
+        while (
+            [System.DateTime]::UtcNow -lt $ownerDeadline -and
+            $null -ne (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+        ) { Start-Sleep -Milliseconds 100 }
+        $record.owner.child_dead_after_package_shutdown = (
+            $null -eq (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)
+        )
+        $registryPath = [System.IO.Path]::Combine(
+            $logDirectory,
+            "touptek4040-shared-frames.json"
+        )
+        $registryNames = @()
+        if ([System.IO.File]::Exists($registryPath)) {
+            $registry = Get-Content -LiteralPath $registryPath -Raw |
+                ConvertFrom-Json
+            $registryNames = @($registry.frames | ForEach-Object { $_.name })
+        }
+        $record.shared_memory = [ordered]@{
+            registry_names = @($registryNames)
+            live_segment_names = @()
+        }
+    }
     if (-not $SkipRecovery) {
         try {
             $record.recovery_after = Invoke-BoundedRecovery `
@@ -406,7 +492,13 @@ if (
         -not $record.image_bytes -or -not $record.image_json -or
         -not $record.png -or -not $record.fits -or -not $record.abort -or
         $null -eq $record.heater -or
-        $record.heater.restored -ne $record.heater.initial
+        -not $record.heater.restored_by_disconnect -or
+        -not $record.heater.reconnect_confirmed_initial -or
+        $record.heater.manual_restore_before_disconnect -or
+        -not $record.heater.alternate_left_active -or
+        -not $record.owner.child_dead_after_package_shutdown -or
+        $record.shared_memory.registry_names.Count -ne 0 -or
+        $record.shared_memory.live_segment_names.Count -ne 0
     )) -or
     -not $record.disconnected -or
     -not $record.exact_process_stopped -or
