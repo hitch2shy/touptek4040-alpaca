@@ -144,15 +144,25 @@
           <p class="pane-index">Current generation</p>
           <h2 id="viewport-title">Scientific image</h2>
         </div>
-        <div class="viewport-meta" aria-live="polite">
-          <span id="generation-label">No generation</span>
-          <a id="fits-link" class="button quiet" aria-disabled="true">
-            <svg aria-hidden="true"><use href="/ui/icons.svg#download"></use></svg>
-            FITS
-          </a>
+        <div class="viewport-meta">
+          <div class="viewport-navigation" role="group" aria-label="Image view controls">
+            <button id="viewport-zoom-out" class="button quiet viewport-icon-control" type="button" aria-label="Zoom out">−</button>
+            <output id="viewport-zoom" aria-label="Current zoom" aria-live="polite">—</output>
+            <button id="viewport-zoom-in" class="button quiet viewport-icon-control" type="button" aria-label="Zoom in">+</button>
+            <button id="viewport-fit" class="button quiet" type="button" aria-label="Fit image to viewport">Fit</button>
+            <button id="viewport-one-to-one" class="button quiet" type="button" aria-label="View image at 100%">1:1</button>
+            <button id="viewport-box-zoom" class="button quiet" type="button" aria-label="Box zoom, view only" aria-pressed="false">Box zoom</button>
+          </div>
+          <div class="viewport-generation" aria-live="polite">
+            <span id="generation-label">No generation</span>
+            <a id="fits-link" class="button quiet" aria-disabled="true">
+              <svg aria-hidden="true"><use href="/ui/icons.svg#download"></use></svg>
+              FITS
+            </a>
+          </div>
         </div>
       </div>
-      <div id="image-stage" class="image-stage" tabindex="0" aria-label="Image viewport. Use arrow keys to move the pixel cursor and Enter to inspect.">
+      <div id="image-stage" class="image-stage" tabindex="0" aria-label="Image viewport. Click to activate. Use the mouse wheel, +, -, 0, and 1 to zoom; drag to pan; Shift-drag for view-only box zoom; arrow keys move the inspected pixel.">
         <div id="image-empty" class="viewport-state">
           <svg aria-hidden="true"><use href="/ui/icons.svg#sensor"></use></svg>
           <h3>No image generation</h3>
@@ -166,8 +176,12 @@
           <svg aria-hidden="true"><use href="/ui/icons.svg#warning"></use></svg>
           <h3>Image unavailable</h3>
           <p id="image-error-copy">Check camera state and retry.</p>
+          <button id="viewport-retry" class="button secondary" type="button" aria-label="Retry image">Retry</button>
         </div>
-        <img id="science-image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="Latest monochrome camera frame" hidden>
+        <div id="viewport-layer-host" class="viewport-layer-host" aria-label="Latest monochrome camera frame" role="img"></div>
+        <div id="viewport-selection" class="viewport-selection" hidden>
+          <span id="viewport-selection-label">View only</span>
+        </div>
         <div id="pixel-cursor" class="pixel-cursor" hidden></div>
       </div>
       <div class="viewport-footer">

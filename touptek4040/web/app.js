@@ -1,5 +1,9 @@
 import { eventStream, getJson, mutate } from "./api.js";
-import { bindImageViewer, setGeneration } from "./image-viewer.js";
+import {
+  bindImageViewer,
+  destroyImageViewer,
+  setGeneration,
+} from "./image-viewer.js";
 import { authoritativeReadout } from "./generation-contract.js";
 import { bindLogs, refreshLogs } from "./log-view.js";
 import {
@@ -12,6 +16,7 @@ import {
 const byId = (id) => document.getElementById(id);
 let currentState = null;
 let events;
+let refreshInterval;
 
 function toast(message, isError = false) {
   const item = document.createElement("div");
@@ -107,11 +112,25 @@ async function start() {
     applyState,
     () => setTimeout(() => refreshState().catch(() => {}), 1000),
   );
-  setInterval(() => {
+  refreshInterval = setInterval(() => {
     refreshState().catch(() => {});
     refreshLogs().catch(() => {});
   }, 5000);
 }
 
-window.addEventListener("beforeunload", () => events?.close());
-start();
+export function teardownApp({
+  destroyViewer = destroyImageViewer,
+  clearRefresh = () => clearInterval(refreshInterval),
+  eventSource = events,
+} = {}) {
+  destroyViewer();
+  clearRefresh();
+  eventSource?.close();
+  refreshInterval = undefined;
+  events = undefined;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", () => teardownApp());
+  start();
+}

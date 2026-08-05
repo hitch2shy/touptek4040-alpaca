@@ -69,6 +69,25 @@ export function visibleRect(view, imageWidth, imageHeight, viewportWidth, viewpo
   return { x, y, width: visibleWidth, height: visibleHeight };
 }
 
+export function displayRect(view, imageWidth, imageHeight, viewportWidth, viewportHeight) {
+  const bounded = clampView(view, imageWidth, imageHeight, viewportWidth, viewportHeight);
+  const visible = visibleRect(
+    bounded,
+    imageWidth,
+    imageHeight,
+    viewportWidth,
+    viewportHeight,
+  );
+  const width = visible.width * bounded.scale;
+  const height = visible.height * bounded.scale;
+  return {
+    left: Math.max(0, (viewportWidth - width) / 2),
+    top: Math.max(0, (viewportHeight - height) / 2),
+    width,
+    height,
+  };
+}
+
 export function screenToImage(
   view,
   screenX,
@@ -81,9 +100,16 @@ export function screenToImage(
   assertFinite(screenX, screenY);
   const bounded = clampView(view, imageWidth, imageHeight, viewportWidth, viewportHeight);
   const visible = visibleRect(bounded, imageWidth, imageHeight, viewportWidth, viewportHeight);
+  const display = displayRect(
+    bounded,
+    imageWidth,
+    imageHeight,
+    viewportWidth,
+    viewportHeight,
+  );
   return {
-    x: visible.x + screenX / bounded.scale,
-    y: visible.y + screenY / bounded.scale,
+    x: visible.x + (screenX - display.left) / bounded.scale,
+    y: visible.y + (screenY - display.top) / bounded.scale,
   };
 }
 
@@ -207,19 +233,27 @@ export function planCropSegments(
   const top = Math.floor(visible.y);
   const right = Math.ceil(visible.x + visible.width);
   const bottom = Math.ceil(visible.y + visible.height);
+  const display = displayRect(
+    bounded,
+    imageWidth,
+    imageHeight,
+    viewportWidth,
+    viewportHeight,
+  );
+  const sourceEdge = Math.max(1, Math.floor(maxEdge / bounded.scale));
   const segments = [];
 
-  for (let y = top; y < bottom; y += maxEdge) {
-    const height = Math.min(maxEdge, bottom - y);
-    for (let x = left; x < right; x += maxEdge) {
-      const width = Math.min(maxEdge, right - x);
+  for (let y = top; y < bottom; y += sourceEdge) {
+    const height = Math.min(sourceEdge, bottom - y);
+    for (let x = left; x < right; x += sourceEdge) {
+      const width = Math.min(sourceEdge, right - x);
       segments.push({
         x,
         y,
         width,
         height,
-        left: (x - visible.x) * bounded.scale,
-        top: (y - visible.y) * bounded.scale,
+        left: display.left + (x - visible.x) * bounded.scale,
+        top: display.top + (y - visible.y) * bounded.scale,
         displayWidth: width * bounded.scale,
         displayHeight: height * bounded.scale,
       });

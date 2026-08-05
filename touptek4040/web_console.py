@@ -52,6 +52,8 @@ _STATIC_ASSETS = {
     "api.js",
     "app.js",
     "image-viewer.js",
+    "image-viewport.js",
+    "viewport-math.js",
     "settings-sync.js",
     "log-view.js",
     "generation-contract.js",
