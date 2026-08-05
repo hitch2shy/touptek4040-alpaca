@@ -51,6 +51,41 @@ def test_math_fits_and_clamps_scale_while_preserving_pointer_coordinate():
     assert result["maximum"]["scale"] == 16
 
 
+def test_math_never_exceeds_max_scale_for_a_tiny_image():
+    """Catches tiny-image fits leaking a scale above the public maximum."""
+    result = run_math("""(() => {
+      const fit = math.fitView(10, 10, 1024, 768);
+      return {
+        fit,
+        zoomed: math.zoomAt(fit, 1, 160, 160, 10, 10, 1024, 768),
+        panned: math.panBy(fit, 100, 100, 10, 10, 1024, 768),
+        screen: math.screenToImage(fit, 160, 160, 10, 10, 1024, 768),
+        selection: math.selectionToImageRect(
+          fit, {x: 0, y: 0}, {x: 160, y: 160}, 10, 10, 1024, 768,
+        ),
+        segments: math.planCropSegments(fit, 10, 10, 1024, 768),
+      };
+    })()""")
+
+    assert result["fit"]["scale"] == 16
+    assert result["zoomed"]["scale"] == 16
+    assert result["panned"]["scale"] == 16
+    assert result["screen"] == {"x": 10, "y": 10}
+    assert result["selection"] == {"x": 0, "y": 0, "width": 10, "height": 10}
+    assert result["segments"] == [
+        {
+            "x": 0,
+            "y": 0,
+            "width": 10,
+            "height": 10,
+            "left": 0,
+            "top": 0,
+            "displayWidth": 160,
+            "displayHeight": 160,
+        },
+    ]
+
+
 def test_math_panning_stays_within_image_edges():
     """Catches panning that would reveal empty space beyond the image."""
     result = run_math("""(() => {

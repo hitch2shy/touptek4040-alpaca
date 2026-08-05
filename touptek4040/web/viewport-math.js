@@ -25,7 +25,7 @@ function clampView(view, imageWidth, imageHeight, viewportWidth, viewportHeight)
     viewportWidth / imageWidth,
     viewportHeight / imageHeight,
   );
-  const scale = Math.min(Math.max(MAX_SCALE, fitScale), Math.max(fitScale, view.scale));
+  const scale = Math.min(MAX_SCALE, Math.max(fitScale, view.scale));
   const visibleWidth = Math.min(imageWidth, viewportWidth / scale);
   const visibleHeight = Math.min(imageHeight, viewportHeight / scale);
   const minCenterX = visibleWidth / 2;
@@ -47,7 +47,7 @@ export function fitView(imageWidth, imageHeight, viewportWidth, viewportHeight) 
     viewportHeight / imageHeight,
   );
   return {
-    scale: fitScale,
+    scale: Math.min(MAX_SCALE, fitScale),
     centerX: imageWidth / 2,
     centerY: imageHeight / 2,
   };
@@ -113,7 +113,7 @@ export function zoomAt(
     viewportHeight / imageHeight,
   );
   const scale = Math.min(
-    Math.max(MAX_SCALE, fitScale),
+    MAX_SCALE,
     Math.max(fitScale, current.scale * 2 ** zoomSteps),
   );
   return clampView(
