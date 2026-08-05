@@ -1092,6 +1092,77 @@ def test_viewport_refits_and_disconnects_when_the_stage_resizes():
     }
 
 
+def test_viewport_resize_bounds_custom_scale_for_crop_zoom_and_marker():
+    """Catches rendering at the new fit scale while UI transforms retain the old scale."""
+    result = run_viewport("""\
+      let resizeCallback;
+      globalThis.ResizeObserver = class {
+        constructor(callback) { resizeCallback = callback; }
+        observe() {}
+        disconnect() {}
+      };
+      elements.stage.clientWidth = 512;
+      elements.stage.clientHeight = 384;
+      const requests = [];
+      const controller = viewport.createImageViewport({
+        elements,
+        fetchBlob: async (url) => { requests.push(url); return {id: requests.length}; },
+        makeObjectUrl: (blob) => `blob:${blob.id}`,
+        revokeObjectUrl: () => {},
+      });
+      controller.setGeneration(7, {width: 512, height: 384});
+      await controller.oneToOne();
+      elements.stage.dispatch("pointerdown", {
+        pointerId: 50, clientX: 100, clientY: 100,
+      });
+      await elements.stage.dispatch("pointerup", {
+        pointerId: 50, clientX: 100, clientY: 100,
+      }).result;
+      requests.length = 0;
+      elements.stage.clientWidth = 1024;
+      elements.stage.clientHeight = 768;
+      await resizeCallback();
+      const query = Object.fromEntries(new URL(`http://test${requests[0]}`).searchParams);
+      const layer = elements.layerHost.children[0];
+      process.stdout.write(JSON.stringify({
+        zoom: elements.zoomOutput.textContent,
+        crop: {
+          width: query.width,
+          height: query.height,
+          maxWidth: query.maxWidth,
+          maxHeight: query.maxHeight,
+        },
+        layer: {
+          left: layer.style.left,
+          top: layer.style.top,
+          width: layer.style.width,
+          height: layer.style.height,
+        },
+        marker: {
+          left: elements.pixelCursor.style.left,
+          top: elements.pixelCursor.style.top,
+        },
+      }));
+    """)
+
+    assert result == {
+        "zoom": "200%",
+        "crop": {
+            "width": "512",
+            "height": "384",
+            "maxWidth": "1024",
+            "maxHeight": "768",
+        },
+        "layer": {
+            "left": "0px",
+            "top": "0px",
+            "width": "1024px",
+            "height": "768px",
+        },
+        "marker": {"left": "201px", "top": "201px"},
+    }
+
+
 def test_viewport_space_drag_forces_pan_and_only_prevents_scroll_when_active():
     """Catches global Space interception or forced-pan gestures inspecting pixels."""
     result = run_viewport("""\

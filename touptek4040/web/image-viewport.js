@@ -210,6 +210,7 @@ export function createImageViewport({
 
   function normalizedView(nextView) {
     const size = viewportSize(elements.stage);
+    const fitted = fitView(dimensions.width, dimensions.height, size.width, size.height);
     const visible = visibleRect(
       nextView,
       dimensions.width,
@@ -218,7 +219,7 @@ export function createImageViewport({
       size.height,
     );
     return {
-      scale: Math.min(MAX_SCALE, nextView.scale),
+      scale: Math.min(MAX_SCALE, Math.max(fitted.scale, nextView.scale)),
       centerX: visible.x + visible.width / 2,
       centerY: visible.y + visible.height / 2,
     };
