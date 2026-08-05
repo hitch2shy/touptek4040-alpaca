@@ -28,7 +28,7 @@ from .errors import (
 )
 from .fits_io import stream_fits
 from .image_workspace import ImageGeneration
-from .png_stream import stream_viewport_png
+from .png_stream import ViewportCrop, stream_viewport_png
 
 WEB_CAPABILITIES = {
     "sensor": {
@@ -594,6 +594,7 @@ class ViewportResource:
     def on_get(self, request: falcon.Request, response: falcon.Response) -> None:
         try:
             generation = _require_generation(self._console, request)
+            crop = _viewport_crop(request, generation)
             max_adu = (
                 4095
                 if generation.frame.readout_mode is ReadoutMode.RAW12
@@ -610,7 +611,8 @@ class ViewportResource:
             response.content_type = "image/png"
             response.set_header(
                 "ETag",
-                f'"generation-{generation.generation_id}-b{black}-w{white}'
+                f'"generation-{generation.generation_id}'
+                f'{_viewport_crop_etag(crop)}-b{black}-w{white}'
                 f'-g{gamma:g}-{max_width}x{max_height}"',
             )
             response.set_header(
@@ -624,6 +626,7 @@ class ViewportResource:
                 gamma=gamma,
                 max_width=max_width,
                 max_height=max_height,
+                crop=crop,
             )
         except BaseException as error:
             _web_error(response, error)
@@ -936,6 +939,29 @@ def _require_generation(
     if generation.generation_id != requested:
         raise GenerationConflictError("Image generation changed")
     return generation
+
+
+def _viewport_crop(
+    request: falcon.Request,
+    generation: ImageGeneration,
+) -> ViewportCrop | None:
+    names = ("x", "y", "width", "height")
+    present = tuple(request.get_param(name) is not None for name in names)
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("viewport crop requires x, y, width and height")
+    x = _query_int(request, "x", None, 0, generation.width - 1)
+    y = _query_int(request, "y", None, 0, generation.height - 1)
+    width = _query_int(request, "width", None, 1, generation.width - x)
+    height = _query_int(request, "height", None, 1, generation.height - y)
+    return ViewportCrop(x, y, width, height)
+
+
+def _viewport_crop_etag(crop: ViewportCrop | None) -> str:
+    if crop is None:
+        return ""
+    return f"-c{crop.x}-{crop.y}-{crop.width}x{crop.height}"
 
 
 def _query_int(

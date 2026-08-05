@@ -6,6 +6,7 @@ import math
 import struct
 import zlib
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -13,6 +14,14 @@ from .image_workspace import ImageGeneration
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _MAX_VIEWPORT_EDGE = 2048
+
+
+@dataclass(frozen=True, slots=True)
+class ViewportCrop:
+    x: int
+    y: int
+    width: int
+    height: int
 
 
 def stream_viewport_png(
@@ -23,17 +32,19 @@ def stream_viewport_png(
     gamma: float,
     max_width: int,
     max_height: int,
+    crop: ViewportCrop | None = None,
 ) -> Iterable[bytes]:
     """Render an 8-bit display view without mutating scientific pixels."""
 
     _validate_stretch(black, white, gamma, max_width, max_height)
+    crop = _validate_crop(generation, crop)
     step = max(
         1,
-        math.ceil(generation.width / max_width),
-        math.ceil(generation.height / max_height),
+        math.ceil(crop.width / max_width),
+        math.ceil(crop.height / max_height),
     )
-    width = math.ceil(generation.width / step)
-    height = math.ceil(generation.height / step)
+    width = math.ceil(crop.width / step)
+    height = math.ceil(crop.height / step)
 
     yield _PNG_SIGNATURE
     yield _chunk(
@@ -43,8 +54,11 @@ def stream_viewport_png(
 
     compressor = zlib.compressobj(level=6)
     inverse_gamma = 1.0 / gamma
-    for y in range(0, generation.height, step):
-        source = generation.pixels[y, ::step][:width]
+    for source_y in range(0, crop.height, step):
+        source = generation.pixels[
+            crop.y + source_y,
+            crop.x : crop.x + crop.width : step,
+        ][:width]
         values = source.astype(np.float32, copy=True)
         values -= float(black)
         values /= float(white - black)
@@ -59,6 +73,34 @@ def stream_viewport_png(
     if tail:
         yield _chunk(b"IDAT", tail)
     yield _chunk(b"IEND", b"")
+
+
+def _validate_crop(
+    generation: ImageGeneration,
+    crop: ViewportCrop | None,
+) -> ViewportCrop:
+    if crop is None:
+        crop = ViewportCrop(0, 0, generation.width, generation.height)
+    if not isinstance(crop, ViewportCrop):
+        raise ValueError("crop must be a ViewportCrop")
+    for value, name in (
+        (crop.x, "crop x"),
+        (crop.y, "crop y"),
+        (crop.width, "crop width"),
+        (crop.height, "crop height"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if crop.x < 0 or crop.y < 0:
+        raise ValueError("crop origin must not be negative")
+    if crop.width <= 0 or crop.height <= 0:
+        raise ValueError("crop size must be positive")
+    if (
+        crop.x + crop.width > generation.width
+        or crop.y + crop.height > generation.height
+    ):
+        raise ValueError("crop is outside the image generation")
+    return crop
 
 
 def _validate_stretch(

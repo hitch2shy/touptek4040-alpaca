@@ -12,7 +12,7 @@ import pytest
 
 from touptek4040.camera_contract import Frame, ReadoutMode, Roi
 from touptek4040.image_workspace import ImageWorkspace
-from touptek4040.png_stream import stream_viewport_png
+from touptek4040.png_stream import ViewportCrop, stream_viewport_png
 from touptek4040.web_console import analyze_generation
 
 def _png_pixels(payload: bytes) -> tuple[int, int, bytes]:
@@ -52,6 +52,40 @@ def test_viewport_png_is_generation_cached_and_display_stretch_is_non_destructiv
     assert (width, height) == (8, 8)
     assert len(rows) == height * (width + 1)
     assert web_coordinator.image_generation.pixels.tobytes() == before
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "x=0",
+        "x=0&y=0",
+        "x=0&y=0&width=1",
+        "x=-1&y=0&width=1&height=1",
+        "x=15&y=15&width=2&height=2",
+        "x=0&y=0&width=0&height=1",
+    ],
+)
+def test_viewport_crop_rejects_incomplete_or_out_of_bounds_tuples(
+    web_client,
+    query,
+):
+    response = web_client.simulate_get(
+        f"/web/v1/viewport.png?generation=1&{query}"
+    )
+
+    assert response.status_code == 400
+
+
+def test_viewport_crop_etag_pins_crop_and_stretch(web_client):
+    response = web_client.simulate_get(
+        "/web/v1/viewport.png?generation=1&x=2&y=3&width=4&height=5"
+        "&black=10&white=2000&gamma=1.25&maxWidth=4&maxHeight=5"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["etag"] == (
+        '"generation-1-c2-3-4x5-b10-w2000-g1.25-4x5"'
+    )
 
 
 def test_statistics_histogram_and_fwhm_are_deterministic_and_bounded(web_client):
@@ -138,7 +172,11 @@ def test_image_services_return_stable_not_found_when_no_generation_exists(
     assert response.json == {"error": "No image generation is available"}
 
 
-def _generation_for(pixels: np.ndarray) -> object:
+def _generation_for(
+    pixels: np.ndarray,
+    *,
+    readout_mode: ReadoutMode = ReadoutMode.RAW8,
+) -> object:
     height, width = pixels.shape
     frame = Frame(
         pixels=pixels,
@@ -146,7 +184,7 @@ def _generation_for(pixels: np.ndarray) -> object:
         duration_s=1.0,
         binning=1,
         roi=Roi(0, 0, width, height),
-        readout_mode=ReadoutMode.RAW8,
+        readout_mode=readout_mode,
         gain=100,
     )
     return ImageWorkspace().publish(frame)
@@ -208,6 +246,201 @@ def test_png_common_step_preserves_sensor_orientation_and_pixel_mapping():
     width, height, rows = _png_pixels(payload)
     assert (width, height) == (2, 2)
     assert rows == bytes([0, 0, 20, 0, 80, 100])
+
+
+def test_viewport_crop_uses_exact_original_coordinates_without_mutation():
+    pixels = np.array(
+        [
+            [0, 10, 20, 30],
+            [40, 50, 60, 70],
+            [80, 90, 100, 110],
+            [120, 130, 140, 150],
+        ],
+        dtype=np.uint8,
+    )
+    generation = _generation_for(pixels)
+    before = pixels.tobytes()
+    payload = b"".join(
+        stream_viewport_png(
+            generation,
+            black=0,
+            white=255,
+            gamma=1.0,
+            max_width=2,
+            max_height=2,
+            crop=ViewportCrop(1, 1, 2, 2),
+        )
+    )
+
+    assert _png_pixels(payload) == (
+        2,
+        2,
+        bytes([0, 50, 60, 0, 90, 100]),
+    )
+    assert pixels.tobytes() == before
+
+
+@pytest.mark.parametrize(
+    ("pixels", "crop", "limits", "stretch", "expected"),
+    [
+        (
+            np.array(
+                [
+                    [0, 10, 20, 30],
+                    [40, 50, 60, 70],
+                    [80, 90, 100, 110],
+                    [120, 130, 140, 150],
+                ],
+                dtype=np.uint8,
+            ),
+            (0, 0, 2, 2),
+            (2, 2),
+            (0, 255),
+            (2, 2, bytes([0, 0, 10, 0, 40, 50])),
+        ),
+        (
+            np.array(
+                [
+                    [0, 10, 20, 30],
+                    [40, 50, 60, 70],
+                    [80, 90, 100, 110],
+                    [120, 130, 140, 150],
+                ],
+                dtype=np.uint8,
+            ),
+            (2, 2, 2, 2),
+            (2, 2),
+            (0, 255),
+            (2, 2, bytes([0, 100, 110, 0, 140, 150])),
+        ),
+        (
+            np.array(
+                [
+                    [0, 10, 20, 30],
+                    [40, 50, 60, 70],
+                    [80, 90, 100, 110],
+                    [120, 130, 140, 150],
+                ],
+                dtype=np.uint8,
+            ),
+            (3, 0, 1, 1),
+            (1, 1),
+            (0, 255),
+            (1, 1, bytes([0, 30])),
+        ),
+        (
+            np.arange(25, dtype=np.uint8).reshape(5, 5),
+            (1, 1, 3, 3),
+            (2, 2),
+            (0, 255),
+            (2, 2, bytes([0, 6, 8, 0, 16, 18])),
+        ),
+        (
+            np.array(
+                [
+                    [0, 0, 0, 0],
+                    [0, 0, 4095, 0],
+                    [0, 2048, 1024, 0],
+                    [0, 0, 0, 0],
+                ],
+                dtype=np.uint16,
+            ),
+            (1, 1, 2, 2),
+            (2, 2),
+            (0, 4095),
+            (2, 2, bytes([0, 0, 255, 0, 127, 63])),
+        ),
+        (
+            np.array(
+                [
+                    [0, 10, 20, 30],
+                    [40, 50, 60, 70],
+                    [80, 90, 100, 110],
+                    [120, 130, 140, 150],
+                ],
+                dtype=np.uint8,
+            ),
+            (0, 0, 4, 4),
+            (2, 2),
+            (0, 255),
+            (2, 2, bytes([0, 0, 20, 0, 80, 100])),
+        ),
+    ],
+)
+def test_viewport_crop_preserves_edges_raw_depth_and_common_step(
+    pixels,
+    crop,
+    limits,
+    stretch,
+    expected,
+):
+    generation = _generation_for(
+        pixels,
+        readout_mode=(
+            ReadoutMode.RAW12 if pixels.dtype == np.uint16 else ReadoutMode.RAW8
+        ),
+    )
+
+    payload = b"".join(
+        stream_viewport_png(
+            generation,
+            black=stretch[0],
+            white=stretch[1],
+            gamma=1.0,
+            max_width=limits[0],
+            max_height=limits[1],
+            crop=ViewportCrop(*crop),
+        )
+    )
+
+    assert _png_pixels(payload) == expected
+
+
+def test_viewport_crop_can_render_at_the_exact_2048_output_edges():
+    generation = _generation_for(np.zeros((2048, 2048), dtype=np.uint8))
+
+    payload = b"".join(
+        stream_viewport_png(
+            generation,
+            black=0,
+            white=255,
+            gamma=1.0,
+            max_width=2048,
+            max_height=2048,
+            crop=ViewportCrop(0, 0, 2048, 2048),
+        )
+    )
+
+    width, height, rows = _png_pixels(payload)
+    assert (width, height) == (2048, 2048)
+    assert len(rows) == 2048 * 2049
+
+
+@pytest.mark.parametrize(
+    "crop",
+    [
+        ViewportCrop(-1, 0, 1, 1),
+        ViewportCrop(0, 0, 0, 1),
+        ViewportCrop(0, 0, 1, 0),
+        ViewportCrop(3, 3, 2, 2),
+        ViewportCrop(True, 0, 1, 1),
+    ],
+)
+def test_viewport_crop_rejects_invalid_original_pixel_bounds_before_output(crop):
+    generation = _generation_for(np.zeros((4, 4), dtype=np.uint8))
+
+    with pytest.raises(ValueError):
+        next(
+            stream_viewport_png(
+                generation,
+                black=0,
+                white=255,
+                gamma=1.0,
+                max_width=2,
+                max_height=2,
+                crop=crop,
+            )
+        )
 
 
 def test_raw8_generation_publishes_8bit_limits_and_accepts_default_stretch(
