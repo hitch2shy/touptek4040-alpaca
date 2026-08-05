@@ -85,10 +85,23 @@ def test_complete_simulator_http_roundtrip() -> None:
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
         assert struct.unpack(">II", png[16:24]) == (32, 24)
 
-        status, headers, fits = base.request(
+        crop_status, crop_headers, crop_payload = base.request(
+            "GET",
+            f"/web/v1/viewport.png?generation={generation}"
+            "&x=3&y=5&width=7&height=9&maxWidth=7&maxHeight=9",
+        )
+        pixel_status, _pixel_headers, pixel_payload = base.request(
+            "GET",
+            f"/web/v1/pixel?generation={generation}&x=3&y=5",
+        )
+        fits_status, fits_headers, fits = base.request(
             "GET", f"/web/v1/image.fits?generation={generation}"
         )
-        assert status == 200 and "fits" in headers["content-type"]
+        assert crop_status == pixel_status == fits_status == 200
+        assert crop_headers["content-type"].startswith("image/png")
+        assert struct.unpack(">II", crop_payload[16:24]) == (7, 9)
+        assert json.loads(pixel_payload)["generation"] == generation
+        assert fits_headers["content-type"].startswith("image/fits")
         assert fits.startswith(b"SIMPLE")
         assert len(fits) % 2880 == 0
         header_end = next(

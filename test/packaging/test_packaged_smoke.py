@@ -43,6 +43,18 @@ class PackageServer:
         *,
         body: dict[str, object] | None = None,
     ) -> tuple[int, bytes, str]:
+        status, payload, content_type, _headers = self.request_with_headers(
+            path,
+            body=body,
+        )
+        return status, payload, content_type
+
+    def request_with_headers(
+        self,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, bytes, str, dict[str, str]]:
         payload = None if body is None else json.dumps(body).encode("utf-8")
         headers = {}
         method = "GET"
@@ -60,7 +72,12 @@ class PackageServer:
             method=method,
         )
         with urllib.request.urlopen(request, timeout=5) as response:
-            return response.status, response.read(), response.headers.get_content_type()
+            return (
+                response.status,
+                response.read(),
+                response.headers.get_content_type(),
+                {key.lower(): value for key, value in response.headers.items()},
+            )
 
     def json(
         self,
@@ -205,6 +222,11 @@ def test_packaged_alpaca_simulator_serves_management_and_ui(
     assert status == 200
     assert content_type == "text/html"
     assert b"ToupTek" in payload
+    for asset in ("/ui/viewport-math.js", "/ui/image-viewport.js"):
+        asset_status, asset_payload, asset_content_type = package_server.request(asset)
+        assert asset_status == 200
+        assert asset_content_type in {"text/javascript", "application/javascript"}
+        assert asset_payload
 
 
 def test_packaged_simulator_connects_and_returns_one_image(
@@ -230,12 +252,18 @@ def test_packaged_simulator_connects_and_returns_one_image(
     assert (image["width"], image["height"]) == (32, 32)
     generation = state["generation"]
     assert isinstance(generation, int)
-    status, payload, content_type = package_server.request(
+    status, payload, content_type, headers = package_server.request_with_headers(
         f"/web/v1/viewport.png?generation={generation}"
+        "&x=3&y=5&width=7&height=9&maxWidth=7&maxHeight=9"
     )
     assert status == 200
     assert content_type == "image/png"
     assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+    assert int.from_bytes(payload[16:20], "big") == 7
+    assert int.from_bytes(payload[20:24], "big") == 9
+    assert headers["etag"] == (
+        f'"generation-{generation}-c3-5-7x9-b0-w4095-g1-7x9"'
+    )
 
 
 def test_packaged_gui_simulator_starts_without_immediate_failure(

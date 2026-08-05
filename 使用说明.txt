@@ -45,7 +45,9 @@ Connect。模拟器始终在主进程中运行，不启动 owner。日志位于 
 ------------------------
 启动 ToupTek4040Alpaca.exe，在浏览器打开
 http://127.0.0.1:11111/ui/。可 Connect、设置 ROI/Bin/RAW/增益/制冷、
-单次曝光或预览，并下载 FITS。网页还提供防露加热 Off 和设备报告的
+单次曝光或预览，并下载 FITS。图像视图需先在图像区域单击激活，
+然后才响应下述视图快捷键；浏览器的 Ctrl、Alt、Meta 组合键及其他
+浏览器快捷键保留，本软件不拦截。网页还提供防露加热 Off 和设备报告的
 1..HEAT_MAX 整数档位；它是 Web 专用能力，不属于 Alpaca Camera V4，
 SupportedActions/Action 中没有加热扩展。N.I.N.A. 连接期间仍可从网页调节。
 
@@ -61,8 +63,19 @@ RAW 12-bit 使用 uint16 容器、有效范围 0..4095；RAW 8-bit 为 0..255。
 回退（例如 Bin 3 得到 1365）。结构变更会安全重开相机。暗场/偏置零曝光
 按硬件最短值处理；亮场曝光必须大于零。
 
-Alpaca 支持标准 JSON ImageArray、二进制 ImageBytes；网页提供 PNG 预览、
-FITS 下载和 JSON 状态。Camera API V12 的 PUT 参数大小写严格遵循规范，
+Alpaca 支持标准 JSON ImageArray、二进制 ImageBytes。网页中的 PNG 只是经拉伸和
+缩放的显示预览，用于导航，不代表原始 ADU；FITS 下载保留同一帧的科学
+像素数据。需精确检查时，在图像上单击像素，读取原始 ADU；方向键每次移动
+1 像素，Shift+方向键每次移动 10 像素。
+
+图像视图操作：滚轮或 + / - 以指针位置为中心缩放；0 恢复 Fit（适合窗口）；
+1 切换到 1:1；双击在 Fit 和 1:1 之间切换。直接拖动或按住 Space 后拖动
+可平移。Shift+拖动（或先启用 Box zoom 工具再拖动）只放大所选视图；
+这是纯显示操作，永远不会更改相机 ROI。Escape 取消当前框选或退出 Box zoom
+模式。若图像切片请求失败，视图显示错误和 Retry；点击 Retry 会对当前同一代
+图像和当前视图重试，成功后清除错误，不会启动新曝光或更改 ROI。
+
+Camera API V12 的 PUT 参数大小写严格遵循规范，
 例如 Connected、Duration、Light、BinX、BinY、StartX、StartY、NumX、
 NumY、Gain、SetCCDTemperature、CoolerOn。
 

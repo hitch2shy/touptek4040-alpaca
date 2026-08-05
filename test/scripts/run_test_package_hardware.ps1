@@ -142,6 +142,106 @@ function Wait-OwnerChild {
     throw "Packaged owner child did not appear below PID $ParentPid."
 }
 
+function Get-WebResponseBytes {
+    param([object]$Response)
+    if ($null -ne $Response.RawContentStream) {
+        $stream = $Response.RawContentStream
+        $originalPosition = $null
+        if ($stream.CanSeek) {
+            $originalPosition = $stream.Position
+            $stream.Position = 0
+        }
+        $copy = [System.IO.MemoryStream]::new()
+        try {
+            $stream.CopyTo($copy)
+            return ,$copy.ToArray()
+        }
+        finally {
+            $copy.Dispose()
+            if ($null -ne $originalPosition) {
+                $stream.Position = $originalPosition
+            }
+        }
+    }
+    if ($Response.Content -is [byte[]]) {
+        return ,([byte[]]$Response.Content)
+    }
+    throw "Web response did not expose binary content."
+}
+
+function Get-PngDimensions {
+    param([byte[]]$Bytes)
+    $signature = [byte[]](137, 80, 78, 71, 13, 10, 26, 10)
+    if ($Bytes.Length -lt 24) {
+        throw "PNG response was shorter than the IHDR header."
+    }
+    for ($index = 0; $index -lt $signature.Length; $index++) {
+        if ($Bytes[$index] -ne $signature[$index]) {
+            throw "PNG response had an invalid signature."
+        }
+    }
+    $width = (
+        ([uint32]$Bytes[16] -shl 24) -bor
+        ([uint32]$Bytes[17] -shl 16) -bor
+        ([uint32]$Bytes[18] -shl 8) -bor
+        [uint32]$Bytes[19]
+    )
+    $height = (
+        ([uint32]$Bytes[20] -shl 24) -bor
+        ([uint32]$Bytes[21] -shl 16) -bor
+        ([uint32]$Bytes[22] -shl 8) -bor
+        [uint32]$Bytes[23]
+    )
+    return [ordered]@{
+        width = [int]$width
+        height = [int]$height
+    }
+}
+
+function Get-BytesSha256 {
+    param([byte[]]$Bytes)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return -join @(
+            $sha256.ComputeHash($Bytes) |
+                ForEach-Object { $_.ToString("x2") }
+        )
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function New-ViewOnlyStateSnapshot {
+    param(
+        [object]$State,
+        [int]$OwnerPid
+    )
+    return [ordered]@{
+        connected = [bool]$State.connected
+        camera_state = [string]$State.cameraState
+        preview = [bool]$State.preview
+        owner_pid = $OwnerPid
+        heater = [ordered]@{
+            supported = [bool]$State.heaterSupported
+            level = [int]$State.heaterLevel
+            maximum = [int]$State.heaterMaxLevel
+            writable = [bool]$State.heaterWritable
+        }
+        settings = [ordered]@{
+            binning = [int]$State.settings.binning
+            readout_mode = [string]$State.settings.readoutMode
+            gain = [int]$State.settings.gain
+            roi = [ordered]@{
+                x = [int]$State.settings.roi.x
+                y = [int]$State.settings.roi.y
+                width = [int]$State.settings.roi.width
+                height = [int]$State.settings.roi.height
+            }
+        }
+    }
+}
+
 function Get-OwnerChildPids {
     param([int]$ParentPid)
     return @(
@@ -235,6 +335,7 @@ $record = [ordered]@{
     heater = $null
     owner = $null
     shared_memory = $null
+    view_only = $null
     disconnected = $false
     exact_process_stopped = $false
     recovery_before = $null
@@ -411,17 +512,99 @@ try {
 
     if ($VerifyFormalContract) {
         $generation = [int]$state.generation
+        $viewOwnerBefore = Wait-OwnerChild -ParentPid $server.Id
+        $viewStateBefore = Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state"
+        $viewBefore = New-ViewOnlyStateSnapshot `
+            -State $viewStateBefore `
+            -OwnerPid ([int]$viewOwnerBefore.ProcessId)
+        $cropQuery = (
+            "/web/v1/viewport.png?generation=$generation" +
+            "&x=3&y=5&width=7&height=9&maxWidth=7&maxHeight=9"
+        )
         $png = Invoke-WebRequest -UseBasicParsing -Uri (
-            "$baseUrl/web/v1/viewport.png?generation=$generation"
+            $baseUrl + $cropQuery
         ) -TimeoutSec 10
+        [byte[]]$pngBytes = Get-WebResponseBytes -Response $png
+        $pngDimensions = Get-PngDimensions -Bytes $pngBytes
+        $pixelQuery = "/web/v1/pixel?generation=$generation&x=3&y=5"
+        $pixel = Invoke-WebJson -BaseUrl $baseUrl -Path $pixelQuery
+        $fitsQuery = "/web/v1/image.fits?generation=$generation"
         $fits = Invoke-WebRequest -UseBasicParsing -Uri (
-            "$baseUrl/web/v1/image.fits?generation=$generation"
+            $baseUrl + $fitsQuery
         ) -TimeoutSec 10
+        [byte[]]$fitsBytes = Get-WebResponseBytes -Response $fits
         if (-not ($png.Headers["Content-Type"] -like "image/png*")) {
             throw "Packaged PNG response had unexpected content type."
         }
+        if ($pngDimensions.width -ne 7 -or $pngDimensions.height -ne 9) {
+            throw "Packaged crop dimensions were not 7 x 9."
+        }
+        $expectedCropEtag = (
+            '"generation-' + $generation +
+            '-c3-5-7x9-b0-w4095-g1-7x9"'
+        )
+        if ([string]$png.Headers["ETag"] -cne $expectedCropEtag) {
+            throw "Packaged crop ETag did not pin generation and crop."
+        }
+        if (
+            [int]$pixel.generation -ne $generation -or
+            [int]$pixel.x -ne 3 -or
+            [int]$pixel.y -ne 5
+        ) {
+            throw "Packaged raw-pixel response did not match the pinned crop origin."
+        }
         if (-not ($fits.Headers["Content-Type"] -like "image/fits*")) {
             throw "Packaged FITS response had unexpected content type."
+        }
+        if (
+            $fitsBytes.Length -eq 0 -or
+            $fitsBytes.Length % 2880 -ne 0 -or
+            [System.Text.Encoding]::ASCII.GetString($fitsBytes, 0, 8) -cne "SIMPLE  "
+        ) {
+            throw "Packaged FITS response was not a complete FITS file."
+        }
+        $viewOwnerAfter = Wait-OwnerChild -ParentPid $server.Id
+        $viewStateAfter = Invoke-WebJson -BaseUrl $baseUrl -Path "/web/v1/state"
+        $viewAfter = New-ViewOnlyStateSnapshot `
+            -State $viewStateAfter `
+            -OwnerPid ([int]$viewOwnerAfter.ProcessId)
+        $viewBeforeJson = $viewBefore | ConvertTo-Json -Depth 12 -Compress
+        $viewAfterJson = $viewAfter | ConvertTo-Json -Depth 12 -Compress
+        $viewStateEqual = $viewBeforeJson -ceq $viewAfterJson
+        $record.view_only = [ordered]@{
+            generation = $generation
+            crop = [ordered]@{
+                query = $cropQuery
+                origin_x = 3
+                origin_y = 5
+                requested_width = 7
+                requested_height = 9
+                decoded_width = [int]$pngDimensions.width
+                decoded_height = [int]$pngDimensions.height
+                etag = [string]$png.Headers["ETag"]
+                byte_length = $pngBytes.Length
+                sha256 = Get-BytesSha256 -Bytes $pngBytes
+            }
+            raw_pixel = [ordered]@{
+                query = $pixelQuery
+                generation = [int]$pixel.generation
+                x = [int]$pixel.x
+                y = [int]$pixel.y
+                adu = [int]$pixel.value
+            }
+            fits = [ordered]@{
+                query = $fitsQuery
+                generation = $generation
+                content_type = [string]$fits.Headers["Content-Type"]
+                byte_length = $fitsBytes.Length
+                sha256 = Get-BytesSha256 -Bytes $fitsBytes
+            }
+            state_before = $viewBefore
+            state_after = $viewAfter
+            exact_control_state_equal = $viewStateEqual
+        }
+        if (-not $viewStateEqual) {
+            throw "View-only crop, pixel, or FITS requests changed camera control state."
         }
         $record.png = $true
         $record.fits = $true
@@ -658,6 +841,12 @@ if (
         $null -eq $record.heater -or
         -not $record.heater.restored_by_disconnect -or
         -not $record.heater.reconnect_confirmed_initial -or
+        $null -eq $record.view_only -or
+        -not $record.view_only.exact_control_state_equal -or
+        [int]$record.view_only.crop.decoded_width -ne 7 -or
+        [int]$record.view_only.crop.decoded_height -ne 9 -or
+        [int]$record.view_only.raw_pixel.generation -ne [int]$record.view_only.generation -or
+        [int]$record.view_only.fits.generation -ne [int]$record.view_only.generation -or
         $record.heater.manual_restore_before_disconnect -or
         -not $record.heater.alternate_left_active -or
         $record.owner.child_pids_observed.Count -eq 0 -or
