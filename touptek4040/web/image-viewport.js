@@ -185,6 +185,7 @@ export function createImageViewport({
       clearLayers();
       view = null;
       elements.selection && (elements.selection.hidden = true);
+      elements.selectionLabel && (elements.selectionLabel.hidden = true);
       elements.retry.hidden = true;
       setZoomOutput();
       return;

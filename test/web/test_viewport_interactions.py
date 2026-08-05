@@ -521,3 +521,25 @@ def test_viewport_terminal_segment_failure_aborts_its_siblings():
     """)
 
     assert result == {"abortedSiblings": True}
+
+
+def test_viewport_null_generation_clears_the_selection_label():
+    """Catches a null generation leaving stale view-only selection text visible."""
+    result = run_viewport("""\
+      const controller = viewport.createImageViewport({
+        elements,
+        fetchBlob: async () => ({id: "unused"}),
+        makeObjectUrl: (blob) => `blob:${blob.id}`,
+        revokeObjectUrl: () => {},
+      });
+      controller.setGeneration(7, {width: 4096, height: 4096});
+      elements.selection.hidden = false;
+      elements.selectionLabel.hidden = false;
+      controller.setGeneration(null);
+      process.stdout.write(JSON.stringify({
+        selectionHidden: elements.selection.hidden,
+        selectionLabelHidden: elements.selectionLabel.hidden,
+      }));
+    """)
+
+    assert result == {"selectionHidden": True, "selectionLabelHidden": True}
